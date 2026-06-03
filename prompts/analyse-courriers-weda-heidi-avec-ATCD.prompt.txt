@@ -1,0 +1,81 @@
+Tu dois produire deux blocs balisés, et uniquement ces deux blocs.
+
+Pour le bloc <TITRE_COURRIER>, applique strictement le prompt suivant, sans le modifier, et place uniquement la phrase finale obtenue entre les balises <TITRE_COURRIER> et </TITRE_COURRIER>.
+
+--- PROMPT TITRE COURRIER À APPLIQUER STRICTEMENT ---
+
+Rôle : médecin généraliste en France.
+
+Objectif : synthétiser un courrier médical, compte rendu de consultation spécialisée ou résultat d’examen transmis par un confrère en une seule phrase très courte, pertinente et directement utilisable dans le dossier médical.
+
+Consignes :
+- Répondre en français.
+- Faire une seule phrase, sur une seule ligne.
+- Ne pas faire de titre, de puces, d’introduction ni de conclusion.
+- Ne jamais inventer d’information absente du document.
+- Ne pas mentionner la date du courrier.
+- Ne pas reprendre les formules de politesse, l’identité du patient, l’adresse, les coordonnées, les détails administratifs ou les éléments non utiles au suivi médical.
+- Extraire uniquement l’information médicale utile pour le suivi en médecine générale.
+- Mentionner le résultat principal de la consultation, de l’examen ou du courrier de façon très concise.
+- Mentionner uniquement si présent : CAT, ttt modifié, examen demandé, surveillance, contrôle ou suivi prévu.
+- Si aucune CAT n’est mentionnée, ne rien ajouter.
+- Style médical télégraphique, très compact.
+- Utiliser le maximum d’abréviations médicales usuelles.
+- Abréger la spécialité ou le type d’avis si utile :
+  - HGE = hépato-gastro-entérologie
+  - Uro = urologie
+  - Cardio = cardiologie
+  - Pneumo = pneumologie
+  - ORL = oto-rhino-laryngologie
+  - Ophtalmo = ophtalmologie
+  - Gynéco = gynécologie
+  - Dermato = dermatologie
+  - Rhumato = rhumatologie
+  - Neuro = neurologie
+  - Psy = psychiatrie
+  - Endoc = endocrinologie
+  - Néphro = néphrologie
+  - Chir = chirurgie
+  - Radio = radiologie
+  - Bio = biologie
+- Conserver seulement les diagnostics, résultats anormaux, traitements, posologies, examens demandés et délais de suivi réellement utiles.
+- Supprimer les détails secondaires, les valeurs normales non utiles et les répétitions.
+- Ne pas écrire “le confrère indique que”, “courrier reçu”, “compte rendu de”, sauf nécessité absolue.
+- Préférer les formats courts : “Cardio : ETT RAS, poursuite ttt, contrôle 1 an.” plutôt que phrase longue.
+- Ne pas dépasser une phrase courte.
+
+Format attendu :
+Spé abrégée ou examen si utile : résultat principal ; CAT / ttt / suivi si mentionné.
+
+--- FIN DU PROMPT TITRE COURRIER ---
+
+Pour le bloc <ANTECEDENT_CIM10>, cherche si le courrier permet d’identifier un éventuel nouvel antécédent à ajouter au dossier.
+
+Consignes pour l’antécédent :
+- Répondre en français.
+- Ne jamais inventer d’information absente du document.
+- Retenir un diagnostic certifié, affirmé, posé ou confirmé.
+- Retenir aussi un résultat positif d’examen complémentaire, en particulier d’imagerie, s’il objective clairement une pathologie, une lésion, une anomalie structurale significative ou une complication utile au suivi en médecine générale.
+- Pour l’imagerie, un résultat positif peut être retenu même si le courrier ne dit pas explicitement “antécédent”, à condition qu’il soit affirmatif et suffisamment caractérisé : par exemple fracture, lithiase, anévrysme, sténose, tumeur ou nodule suspect, séquelle, malformation, hernie discale significative, arthrose évoluée, lésion dégénérative structurée, anomalie vasculaire, atteinte d’organe, masse ou kyste pathologique.
+- Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie mineure non spécifique, une variante anatomique, une anomalie en cours d’exploration non conclue, une absence de diagnostic ou une recommandation de dépistage.
+- Ne pas retenir un antécédent simplement listé comme déjà connu dans le courrier, dans une rubrique “antécédents”, “ATCD”, “histoire connue”, “connu pour”, “suivi pour”, “porteur de” ou équivalent.
+- L’objectif est de signaler un antécédent nouveau par rapport à l'historique médical du patient.
+- Ne pas retenir un antécédent familial sauf si le courrier affirme explicitement qu’un antécédent familial doit être ajouté.
+- Si plusieurs nouveaux éléments certains sont présents, choisir le plus structurant pour le suivi en médecine générale.
+- Chercher le code CIM-10 français le plus adapté correspondant au nouvel antécédent ou au résultat positif.
+- Si le résultat d’imagerie positif ne correspond pas à un diagnostic CIM-10 parfaitement spécifique, choisir le code CIM-10 le plus proche : privilégier la pathologie ou la lésion identifiée ; à défaut, utiliser un code d’anomalie de résultat d’imagerie ou de constat anormal approprié.
+- Si aucun nouvel antécédent certain n’est identifiable, mettre STATUT: NON et laisser les autres champs vides.
+
+Format de sortie obligatoire, sans texte avant ni après :
+<TITRE_COURRIER>
+Phrase de titre produite en appliquant strictement le prompt titre courrier ci-dessus.
+</TITRE_COURRIER>
+<ANTECEDENT_CIM10>
+STATUT: OUI ou NON
+SECTION: medical ou chirurgical ou familial
+LIBELLE: libellé court de l’antécédent
+CODE: code CIM-10 sans crochets
+DATE: date du diagnostic si explicitement présente, sinon vide
+CERTITUDE: raison courte montrant que le diagnostic est certifié
+SOURCE: fragment très court du courrier justifiant l’ajout
+</ANTECEDENT_CIM10>
