@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF Heidi + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      1.5
+// @version      2.2
 // @description  Analyse les courriers PDF de Weda Échanges avec Heidi, renseigne le titre et prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @match        https://scribe.heidihealth.com/*
@@ -27,7 +27,7 @@
   const HEIDI_URL = "https://scribe.heidihealth.com/";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "1.5";
+  const SCRIPT_VERSION = "2.2";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
 
@@ -36,6 +36,7 @@
   const JOB_KEY = `${STORAGE_PREFIX}job`;
   const RESULT_KEY = `${STORAGE_PREFIX}result`;
   const WEDA_ATCD_JOB_KEY = `${STORAGE_PREFIX}wedaAtcdJob`;
+  const WEDA_ATCD_PENDING_OPEN_KEY = `${STORAGE_PREFIX}wedaAtcdPendingOpen`;
   const WEDA_ATCD_WORKER_LOCK_KEY = `${STORAGE_PREFIX}wedaAtcdWorkerLock`;
   const CANCEL_KEY = `${STORAGE_PREFIX}cancel`;
   const STATUS_KEY = `${STORAGE_PREFIX}status`;
@@ -48,8 +49,9 @@
   const HEIDI_COURRIER_SESSION_PHASE_KEY = `${STORAGE_PREFIX}heidiSessionPhase`;
   const SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY = `${STORAGE_PREFIX}wedaAtcdWorkerJobId`;
   const WEDA_ATCD_WORKER_HASH_PREFIX = "AUTO_HH_WEDA_WORKER=";
-  const WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND = false;
+  const WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND = true;
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
+  const WEDA_ATCD_PENDING_OPEN_MS = 90000;
   const WEDA_ATCD_WORKER_BADGE_ID = "weda-courrier-heidi-atcd-worker-badge";
 
   const PANEL_ID = "weda-courrier-heidi-atcd-panel";
@@ -78,9 +80,11 @@
     "#messageContainer > div.messageAttachment.flexColStart > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > input",
   ].join(", ");
   const DOC_TITLE_FALLBACK_SELECTOR = "input.docTitle";
+  const MESSAGE_BODY_TEXT_SELECTOR = "#messageContainer > div.messageBody.importing, #messageContainer div.messageBody.importing";
   const IMPORT_MESSAGE_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart.ng-star-inserted > div.flexColStart.mt10.width100.ng-star-inserted > div.mt5.flexRow.ng-star-inserted > div > table > tr.ng-star-inserted > td:nth-child(5) > a";
   const IMPORT_PATIENT_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart > div > div.btnImport.importPatient.targetSupprimer, #messageContainer .btnImport.importPatient.targetSupprimer";
   const PDF_PARSER_RESET_SELECTOR = "#pdfParserResetButton";
+  const SELECTOR_WEDA_HELPER_PATIENT_NAME = "#pdfParserPatientName";
   const POSTBACK_ANTECEDENTS_WEDA = "ctl00$ContentPlaceHolder1$ButtonGotoAntecedent";
   const POSTBACK_SEARCH_CIM10_WEDA = "ctl00$ContentPlaceHolder1$TextBoxFind";
   const SELECTOR_PATIENT_PANEL = "#ContentPlaceHolder1_PanelPatient";
@@ -115,7 +119,6 @@
   const PDF_FETCH_RETRY_INTERVAL_MS = 900;
   const HEIDI_ANSWER_STABLE_WITH_COPY_MS = 1000;
   const HEIDI_ANSWER_STABLE_WITHOUT_COPY_MS = 2800;
-  const HEIDI_ANSWER_STABLE_WITH_STUCK_THINKING_MS = 7000;
   const HEIDI_FOCUS_IF_HIDDEN_AFTER_MS = 5000;
   const HEIDI_RELAUNCH_IF_STUCK_AFTER_MS = 14000;
   const HEIDI_RELAUNCH_COOLDOWN_MS = 16000;
@@ -199,13 +202,16 @@ Pour le bloc <ANTECEDENT_CIM10>, cherche si le courrier permet d’identifier un
 Consignes pour l’antécédent :
 - Répondre en français.
 - Ne jamais inventer d’information absente du document.
-- Ne retenir qu’un diagnostic certifié, affirmé, posé ou confirmé.
-- Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie en cours d’exploration, une absence de diagnostic ou une recommandation de dépistage.
+- Retenir un diagnostic certifié, affirmé, posé ou confirmé.
+- Retenir aussi un résultat positif d’examen complémentaire, en particulier d’imagerie, s’il objective clairement une pathologie, une lésion, une anomalie structurale significative ou une complication utile au suivi en médecine générale.
+- Pour l’imagerie, un résultat positif peut être retenu même si le courrier ne dit pas explicitement “antécédent”, à condition qu’il soit affirmatif et suffisamment caractérisé : par exemple fracture, lithiase, anévrysme, sténose, tumeur ou nodule suspect, séquelle, malformation, hernie discale significative, arthrose évoluée, lésion dégénérative structurée, anomalie vasculaire, atteinte d’organe, masse ou kyste pathologique.
+- Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie mineure non spécifique, une variante anatomique, une anomalie en cours d’exploration non conclue, une absence de diagnostic ou une recommandation de dépistage.
 - Ne pas retenir un antécédent simplement listé comme déjà connu dans le courrier, dans une rubrique “antécédents”, “ATCD”, “histoire connue”, “connu pour”, “suivi pour”, “porteur de” ou équivalent.
-- L’objectif est de signaler un antécédent nouveau par rapport aux éléments déjà connus dans le courrier lui-même.
+- L’objectif est de signaler un antécédent nouveau par rapport à l'historique médical du patient.
 - Ne pas retenir un antécédent familial sauf si le courrier affirme explicitement qu’un antécédent familial doit être ajouté.
-- Si plusieurs nouveaux diagnostics certifiés sont présents, choisir le plus structurant pour le suivi en médecine générale.
-- Chercher le code CIM-10 français le plus adapté.
+- Si plusieurs nouveaux éléments certains sont présents, choisir le plus structurant pour le suivi en médecine générale.
+- Chercher le code CIM-10 français le plus adapté correspondant au nouvel antécédent ou au résultat positif.
+- Si le résultat d’imagerie positif ne correspond pas à un diagnostic CIM-10 parfaitement spécifique, choisir le code CIM-10 le plus proche : privilégier la pathologie ou la lésion identifiée ; à défaut, utiliser un code d’anomalie de résultat d’imagerie ou de constat anormal approprié.
 - Si aucun nouvel antécédent certain n’est identifiable, mettre STATUT: NON et laisser les autres champs vides.
 
 Format de sortie obligatoire, sans texte avant ni après :
@@ -2316,7 +2322,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       tableText: documentText,
       tableHtml: "",
       contentKey,
-      sourceType: extracted.pdfTextExtractionEmpty ? "pdf-attachment" : "pdf",
+      sourceType: extracted.sourceType || (extracted.pdfTextExtractionEmpty ? "pdf-attachment" : "pdf"),
       pdfUrl: extracted.displayed.pdfUrl,
       urlKey: extracted.displayed.urlKey,
       pdfAttachmentBase64: extracted.pdfAttachmentBase64 || "",
@@ -2368,10 +2374,6 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         lastError = error;
       }
 
-      if (!isRetryablePdfExtractionError(lastError)) {
-        throw lastError;
-      }
-
       emptyUrlKeys.add(displayed.urlKey || ("pdfurl-" + hashString(displayed.pdfUrl || "")));
 
       appendDebugLog("weda:pdf-text-empty-retry", {
@@ -2388,15 +2390,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         hasAnyPdfElement: Boolean(getDisplayedPdfEmbed()),
       });
 
-      const attachmentFallback = buildPdfAttachmentFallbackFromError(lastError, displayed);
-      if (attachmentFallback) {
-        appendDebugLog("weda:pdf-text-empty-attachment-fallback", {
+      const messageBodyFallback = buildMessageBodyFallbackFromPdfError(lastError, displayed);
+      if (messageBodyFallback) {
+        appendDebugLog("weda:pdf-text-empty-message-body-fallback", {
           attempt,
           urlKey: displayed.urlKey,
-          byteLength: attachmentFallback.pdfAttachmentByteLength,
-          fileNameHash: hashString(attachmentFallback.pdfAttachmentName),
+          bodyLength: messageBodyFallback.documentText.length,
+          bodyLines: countBiologyLinesForLog(messageBodyFallback.documentText, "message-body"),
         });
-        return attachmentFallback;
+        return messageBodyFallback;
+      }
+
+      if (!isRetryablePdfExtractionError(lastError)) {
+        throw lastError;
       }
 
       await sleep(PDF_EMPTY_TEXT_RETRY_INTERVAL_MS);
@@ -2421,40 +2427,58 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     throw lastError || new Error("texte du PDF vide ou illisible");
   }
 
-  function buildPdfAttachmentFallbackFromError(error, displayed) {
-    const byteLength = Number(error && error.pdfAttachmentByteLength) || 0;
+  function buildMessageBodyFallbackFromPdfError(error, displayed) {
+    const bodyText = extractWedaMessageBodyFallbackText();
 
-    if (!error || !error.pdfAttachmentBase64 || !byteLength) {
+    if (!bodyText) {
+      appendDebugLog("weda:pdf-text-empty-message-body-missing", {
+        urlKey: displayed && displayed.urlKey ? displayed.urlKey : "",
+        error: error && error.message ? error.message : "",
+        selector: MESSAGE_BODY_TEXT_SELECTOR,
+        bodyCandidates: document.querySelectorAll(MESSAGE_BODY_TEXT_SELECTOR).length,
+      });
       return null;
     }
 
     return {
-      documentText: buildPdfAttachmentFallbackText(displayed, error.pdfInfo),
+      documentText: truncateDocumentText(bodyText),
       displayed,
-      pdfAttachmentBase64: error.pdfAttachmentBase64,
-      pdfAttachmentName: error.pdfAttachmentName || buildPdfAttachmentFileName(displayed && displayed.pdfUrl),
-      pdfAttachmentMimeType: "application/pdf",
-      pdfAttachmentByteLength: byteLength,
-      pdfTextExtractionEmpty: true,
+      sourceType: "message-body",
+      pdfAttachmentBase64: "",
+      pdfAttachmentName: "",
+      pdfAttachmentMimeType: "",
+      pdfAttachmentByteLength: 0,
+      pdfTextExtractionEmpty: false,
+      pdfTextFallbackUsed: true,
     };
   }
 
-  function buildPdfAttachmentFallbackText(displayed, pdfInfo = {}) {
-    const urlKey = displayed && displayed.urlKey ? displayed.urlKey : "";
-    const pageCount = Number(pdfInfo && pdfInfo.pageCount) || 0;
-    const byteLength = Number(
-      (pdfInfo && pdfInfo.byteLength) ||
-      (pdfInfo && pdfInfo.fetchInfo && pdfInfo.fetchInfo.byteLength)
-    ) || 0;
+  function extractWedaMessageBodyFallbackText() {
+    const candidates = Array.from(document.querySelectorAll(MESSAGE_BODY_TEXT_SELECTOR))
+      .map((element) => normalizePdfText(element.innerText || element.textContent || ""))
+      .filter(isUsableWedaMessageBodyFallbackText)
+      .sort((left, right) => right.length - left.length);
 
-    return normalizePdfText([
-      "PDF original joint à Heidi.",
-      "Le texte de ce PDF n'a pas pu être extrait automatiquement par PDF.js.",
-      "Analyser directement la pièce jointe PDF pour produire le titre médical demandé.",
-      urlKey ? "Identifiant PDF : " + urlKey : "",
-      pageCount ? "Nombre de pages détecté : " + pageCount : "",
-      byteLength ? "Taille PDF détectée : " + byteLength + " octets" : "",
-    ].filter(Boolean).join("\n"));
+    return candidates[0] || "";
+  }
+
+  function isUsableWedaMessageBodyFallbackText(text) {
+    const normalized = normalizePdfText(text);
+    const comparable = normalizeForCompare(normalized);
+
+    if (!normalized || normalized.length < PDF_MIN_TEXT_LENGTH) {
+      return false;
+    }
+
+    if (!/[a-zA-ZÀ-ÖØ-öø-ÿ0-9]/.test(normalized)) {
+      return false;
+    }
+
+    if (/^(?:x+|test|aucun|vide|na|n\/a|ras)$/i.test(comparable)) {
+      return false;
+    }
+
+    return true;
   }
 
   function buildPdfAttachmentFileName(pdfUrl = "") {
@@ -2509,11 +2533,6 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         extractedLength: text.length,
         urlKey: "pdfurl-" + hashString(pdfUrl),
       };
-      if (originalBytes.length) {
-        error.pdfAttachmentBase64 = uint8ArrayToBase64(originalBytes);
-        error.pdfAttachmentByteLength = originalBytes.length;
-        error.pdfAttachmentName = buildPdfAttachmentFileName(pdfUrl);
-      }
       throw error;
     }
 
@@ -2866,6 +2885,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   async function applyRememberedTitleForSelectedRow(options = {}) {
     const state = getState();
+
+    if (state.running && state.phase === "savingTitle") {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-title-skip-saving-title", {
+          currentIndex: state.currentIndex,
+          currentJobId: state.currentJobId || "",
+        });
+      }
+      return;
+    }
+
     const item = getSelectedBiologyItem();
 
     if (item && !isDisplayedBiologyForRow(item)) {
@@ -4320,6 +4350,16 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           jobId: result.jobId,
           reason: result.antecedent.rejectionReason,
         });
+      } else if (result && result.antecedent) {
+        const code = normalizeCim10Code(result.antecedent.code);
+        appendDebugLog("weda:atcd-worker-skipped-unusable-antecedent", {
+          jobId: result.jobId,
+          status: result.antecedent.status || "",
+          section: result.antecedent.section || "",
+          hasLabel: Boolean(sanitizeAntecedentLabel(result.antecedent.label)),
+          code,
+          codeValid: isLikelyCim10Code(code),
+        });
       }
       return false;
     }
@@ -4329,36 +4369,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       : findWedaPatientContextForCurrentMessage();
 
     if (!context || !context.patientId || !context.patientUrl) {
+      const patientLauncher = findWedaHelperPatientNameLauncher();
+      if (patientLauncher) {
+        return openWedaAntecedentWorkerViaWedaHelperPatientName(result, title, item, patientLauncher, context);
+      }
+
       appendDebugLog("weda:atcd-worker-skipped-no-patient", {
         jobId: result && result.jobId,
         item,
         context,
+        hasWedaHelperPatientName: false,
       });
       setPanelStatus("Titre inséré. Antécédent détecté, mais patient WEDA introuvable : ajout CIM-10 non lancé.");
       return false;
     }
 
     const workerJobId = createId("weda-atcd");
-    const workerJob = {
-      id: workerJobId,
-      sourceJobId: result.jobId,
-      status: "PENDING_WEDA_WORKER",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      title: title || "",
-      rowIndex: result.rowIndex,
-      rowStableKey: result.rowStableKey || "",
-      rowIdentity: result.rowIdentity || "",
-      contentKey: result.contentKey || "",
-      urlKey: result.urlKey || "",
-      pdfUrl: result.pdfUrl || "",
-      patientId: context.patientId,
-      patientUrl: context.patientUrl,
-      patientContextSource: context.source || "",
-      sourceWedaUrl: location.href,
-      item,
-      rawHeidiAntecedent: result.antecedent || null,
-    };
+    const workerJob = buildWedaAntecedentWorkerJob(result, title, item, context, workerJobId);
 
     GM_setValue(WEDA_ATCD_JOB_KEY, workerJob);
 
@@ -4388,6 +4415,149 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       });
       setPanelStatus("Titre inséré. Échec ouverture worker WEDA pour l'antécédent : " + error.message);
       return false;
+    }
+  }
+
+  function openWedaAntecedentWorkerViaWedaHelperPatientName(result, title, item, patientLauncher, missingContext = {}) {
+    const workerJobId = createId("weda-atcd");
+    const patientLabel = getWedaHelperPatientNameLabel(patientLauncher);
+    const context = {
+      patientId: "",
+      patientUrl: "",
+      patientLabel,
+      source: "pdfParserPatientName",
+      openMode: "ctrl-click-antecedents",
+    };
+    const workerJob = buildWedaAntecedentWorkerJob(result, title, item, context, workerJobId);
+    const now = Date.now();
+
+    GM_setValue(WEDA_ATCD_JOB_KEY, workerJob);
+    GM_setValue(WEDA_ATCD_PENDING_OPEN_KEY, {
+      workerJobId,
+      sourceJobId: result && result.jobId ? result.jobId : "",
+      sourceWedaUrl: location.href,
+      patientLabel,
+      itemCode: item.code,
+      itemLabel: item.label,
+      createdAt: now,
+      expiresAt: now + WEDA_ATCD_PENDING_OPEN_MS,
+    });
+
+    const clicked = clickWedaHelperPatientNameForAntecedents(patientLauncher);
+    appendDebugLog(clicked ? "weda:atcd-worker-opened-via-pdf-parser-patient" : "weda:atcd-worker-pdf-parser-patient-click-failed", {
+      jobId: result && result.jobId,
+      workerJobId,
+      item,
+      missingContext,
+      patientLabel,
+      launcher: patientLauncher,
+      pendingOpenMs: WEDA_ATCD_PENDING_OPEN_MS,
+    });
+
+    if (!clicked) {
+      GM_deleteValue(WEDA_ATCD_PENDING_OPEN_KEY);
+      setPanelStatus("Titre inséré. Antécédent détecté, mais le raccourci patient Weda-Helper n'a pas pu être cliqué.");
+      return false;
+    }
+
+    setPanelStatus(`Titre inséré. Ouverture Weda-Helper pour préparer l'antécédent : ${item.label} [${item.code}].`);
+    return true;
+  }
+
+  function buildWedaAntecedentWorkerJob(result, title, item, context = {}, workerJobId = createId("weda-atcd")) {
+    return {
+      id: workerJobId,
+      sourceJobId: result && result.jobId ? result.jobId : "",
+      status: "PENDING_WEDA_WORKER",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      title: title || "",
+      rowIndex: result ? result.rowIndex : null,
+      rowStableKey: result && result.rowStableKey ? result.rowStableKey : "",
+      rowIdentity: result && result.rowIdentity ? result.rowIdentity : "",
+      contentKey: result && result.contentKey ? result.contentKey : "",
+      urlKey: result && result.urlKey ? result.urlKey : "",
+      pdfUrl: result && result.pdfUrl ? result.pdfUrl : "",
+      patientId: context.patientId || "",
+      patientUrl: context.patientUrl || "",
+      patientLabel: context.patientLabel || "",
+      patientContextSource: context.source || "",
+      patientOpenMode: context.openMode || "",
+      sourceWedaUrl: location.href,
+      item,
+      rawHeidiAntecedent: result && result.antecedent ? result.antecedent : null,
+    };
+  }
+
+  function findWedaHelperPatientNameLauncher() {
+    const candidates = Array.from(document.querySelectorAll(SELECTOR_WEDA_HELPER_PATIENT_NAME));
+    return candidates.find((element) => isElementVisible(element)) || candidates[0] || null;
+  }
+
+  function getWedaHelperPatientNameLabel(element) {
+    return normalizeText(String(element && element.textContent || "").replace(/^Vers dossier\s*:\s*/i, ""));
+  }
+
+  function clickWedaHelperPatientNameForAntecedents(element) {
+    if (!element) {
+      return false;
+    }
+
+    try {
+      element.scrollIntoView({ block: "center", inline: "center" });
+    } catch (_error) {
+      // Le raccourci peut rester cliquable même si le scroll échoue.
+    }
+
+    try {
+      element.focus();
+    } catch (_error) {
+      // Le span Weda-Helper n'est pas toujours focusable.
+    }
+
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((eventName) => {
+      dispatchModifiedMouseEvent(element, eventName, {
+        ctrlKey: true,
+        button: 0,
+        buttons: eventName.endsWith("down") ? 1 : 0,
+      });
+    });
+
+    return true;
+  }
+
+  function dispatchModifiedMouseEvent(element, eventName, options = {}) {
+    try {
+      const EventConstructor = eventName.startsWith("pointer") && typeof PointerEvent === "function"
+        ? PointerEvent
+        : MouseEvent;
+
+      element.dispatchEvent(new EventConstructor(eventName, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        button: Number(options.button) || 0,
+        buttons: Number(options.buttons) || 0,
+        ctrlKey: Boolean(options.ctrlKey),
+        shiftKey: Boolean(options.shiftKey),
+        altKey: Boolean(options.altKey),
+        metaKey: Boolean(options.metaKey),
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+      }));
+      return true;
+    } catch (_error) {
+      try {
+        element.dispatchEvent(new Event(eventName, {
+          bubbles: true,
+          cancelable: true,
+        }));
+        return true;
+      } catch (_nestedError) {
+        return false;
+      }
     }
   }
 
@@ -4580,10 +4750,93 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     try {
-      return sessionStorage.getItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY) || "";
+      const fromSession = sessionStorage.getItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY) || "";
+      if (fromSession) {
+        return fromSession;
+      }
     } catch (_error) {
+      // Si sessionStorage est indisponible, on tente quand même l'adoption du job en attente.
+    }
+
+    return adoptPendingWedaAtcdWorkerJobForThisTab();
+  }
+
+  function adoptPendingWedaAtcdWorkerJobForThisTab() {
+    if (!isLikelyWedaAtcdPendingOpenTargetPage()) {
       return "";
     }
+
+    const pending = GM_getValue(WEDA_ATCD_PENDING_OPEN_KEY, null);
+    const now = Date.now();
+    if (!pending || !pending.workerJobId) {
+      return "";
+    }
+
+    if (Number(pending.expiresAt || 0) <= now) {
+      GM_deleteValue(WEDA_ATCD_PENDING_OPEN_KEY);
+      appendDebugLog("weda-atcd-worker:pending-open-expired", {
+        workerJobId: pending.workerJobId || "",
+        sourceWedaUrl: pending.sourceWedaUrl || "",
+      });
+      return "";
+    }
+
+    const job = GM_getValue(WEDA_ATCD_JOB_KEY, null);
+    if (!job || job.id !== pending.workerJobId) {
+      appendDebugLog("weda-atcd-worker:pending-open-job-missing", {
+        pending,
+        currentJobId: job && job.id ? job.id : "",
+      });
+      return "";
+    }
+
+    const currentPatientId = extractWedaPatDkFromUrl(location.href);
+    const patch = {
+      patientContextSource: job.patientContextSource || "pdfParserPatientName",
+      patientOpenMode: job.patientOpenMode || "pending-open-adopted",
+      workerUrl: location.href,
+      adoptedFromPendingOpen: true,
+    };
+
+    if (currentPatientId && !job.patientId) {
+      patch.patientId = currentPatientId;
+      patch.patientUrl = buildWedaPatientUrlFromPatDk(currentPatientId, location.href);
+    }
+
+    updateWedaAtcdWorkerJob(pending.workerJobId, patch);
+
+    try {
+      sessionStorage.setItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY, pending.workerJobId);
+    } catch (_error) {
+      // sessionStorage peut être indisponible.
+    }
+
+    GM_deleteValue(WEDA_ATCD_PENDING_OPEN_KEY);
+    appendDebugLog("weda-atcd-worker:pending-open-adopted", {
+      workerJobId: pending.workerJobId,
+      path: location.pathname,
+      search: location.search,
+      currentPatientId,
+      patientLabel: pending.patientLabel || job.patientLabel || "",
+      itemCode: pending.itemCode || "",
+      itemLabel: pending.itemLabel || "",
+    });
+
+    return pending.workerJobId;
+  }
+
+  function isLikelyWedaAtcdPendingOpenTargetPage() {
+    if (location.hostname !== WEDA_HOST) {
+      return false;
+    }
+
+    if (location.pathname.toLowerCase().startsWith(WEDA_PATH_PREFIX.toLowerCase())) {
+      return false;
+    }
+
+    return /\/foldermedical\/(?:patientviewform|antecedentform)\.aspx/i.test(location.pathname) ||
+      Boolean(document.querySelector(SELECTOR_PATIENT_PANEL)) ||
+      Boolean(document.querySelector(SELECTOR_WEDA_ANTECEDENT_UPDATE_PANEL));
   }
 
   async function initWedaAtcdWorker() {
@@ -4618,7 +4871,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function runWedaAtcdWorker(workerJobId) {
-    const job = await waitFor(() => {
+    let job = await waitFor(() => {
       const current = GM_getValue(WEDA_ATCD_JOB_KEY, null);
       return current && current.id === workerJobId ? current : null;
     }, {
@@ -4636,12 +4889,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     try {
-      updateWedaAtcdWorkerJob(workerJobId, {
+      job = updateWedaAtcdWorkerJob(workerJobId, {
         status: "RUNNING_WEDA_WORKER",
         workerUrl: location.href,
-      });
+      }) || job;
+      job = refreshWedaAtcdWorkerJobPatientFromCurrentUrl(workerJobId) || job;
 
       await ensureWedaAntecedentPageForAtcdWorker(job);
+      job = refreshWedaAtcdWorkerJobPatientFromCurrentUrl(workerJobId) || job;
       assertWedaAtcdWorkerPatientMatches(job, "after_open_antecedents");
 
       const root = await waitForWedaAntecedentRootForAtcd();
@@ -4682,6 +4937,24 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     } finally {
       releaseWedaAtcdWorkerLock(job);
     }
+  }
+
+  function refreshWedaAtcdWorkerJobPatientFromCurrentUrl(workerJobId) {
+    const current = GM_getValue(WEDA_ATCD_JOB_KEY, null);
+    if (!current || current.id !== workerJobId) {
+      return current;
+    }
+
+    const currentPatientId = extractWedaPatDkFromUrl(location.href);
+    if (!currentPatientId || current.patientId) {
+      return current;
+    }
+
+    return updateWedaAtcdWorkerJob(workerJobId, {
+      patientId: currentPatientId,
+      patientUrl: buildWedaPatientUrlFromPatDk(currentPatientId, location.href),
+      patientContextSource: current.patientContextSource || "worker-current-url",
+    }) || current;
   }
 
   function updateWedaAtcdWorkerJob(workerJobId, patch) {
@@ -4747,10 +5020,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
   }
 
-  function isPatientAccueilWeda() {
+  function isPatientViewUrlWeda() {
     return location.hostname === WEDA_HOST &&
-      /\/foldermedical\/patientviewform\.aspx/i.test(location.pathname) &&
-      /(?:\?|&)PatDk=/i.test(location.search) &&
+      /\/foldermedical\/patientviewform\.aspx/i.test(location.pathname);
+  }
+
+  function isPatientAccueilWeda() {
+    return isPatientViewUrlWeda() &&
       Boolean(document.querySelector(SELECTOR_PATIENT_PANEL));
   }
 
@@ -4784,6 +5060,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       if (job && job.patientUrl && !sameWedaPatDk(extractWedaPatDkFromUrl(location.href), job.patientId)) {
         location.assign(buildWedaAtcdWorkerUrl(job.patientUrl, job.id));
         await sleep(2500);
+      }
+
+      if (!isPatientAccueilWeda() && isPatientViewUrlWeda()) {
+        await waitFor(() => isPatientAccueilWeda(), {
+          timeout: 10000,
+          interval: 400,
+          description: "l'accueil patient WEDA",
+        }).catch(() => null);
       }
 
       if (!isPatientAccueilWeda()) {
@@ -4859,6 +5143,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function assertWedaAtcdWorkerPatientMatches(job, phase) {
     const expected = normalizeText(job && job.patientId);
     const current = extractWedaPatDkFromUrl(location.href);
+
+    if (!expected && job && job.patientContextSource === "pdfParserPatientName") {
+      appendDebugLog("weda-atcd-worker:patient-guard-skipped-no-patdk", {
+        phase,
+        current,
+        patientLabel: job.patientLabel || "",
+        source: job.patientContextSource,
+        openMode: job.patientOpenMode || "",
+      });
+      return;
+    }
 
     if (!expected || !current || !sameWedaPatDk(expected, current)) {
       throw new Error(`sécurité patient (${phase}) : attendu ${expected || "inconnu"}, onglet ${current || "inconnu"}`);
@@ -5991,10 +6286,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const askEditor = await waitForHeidiAskEditor(job.id);
     abortIfHeidiJobCancelled(job.id);
 
-    if (job.pdfAttachmentBase64) {
+    if (job.pdfAttachmentBase64 && !job.pdfTextExtractionEmpty) {
       updateHeidiStatus(job.id, "Ajout du PDF original dans Heidi...");
       job.pdfAttachmentInserted = await attachHeidiPdfIfNeeded(job, askEditor);
       abortIfHeidiJobCancelled(job.id);
+    } else if (job.pdfAttachmentBase64) {
+      appendDebugLog("heidi:pdf-attachment-skipped-empty-extraction", {
+        jobId: job.id,
+        sourceType: job.sourceType || "",
+        pdfTextExtractionEmpty: Boolean(job.pdfTextExtractionEmpty),
+        byteLength: job.pdfAttachmentByteLength || 0,
+      });
     }
 
     const promptText = buildHeidiPromptText(job.prompt, job.tableText, job);
@@ -6060,6 +6362,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       jobId: job.id,
       answerLength: answer.length,
       titleLength: title.length,
+      hasTaggedTitle: Boolean(extractTaggedBlock(answer, "TITRE_COURRIER")),
+      hasTaggedAtcd: Boolean(extractTaggedBlock(answer, "ANTECEDENT_CIM10")),
+      antecedentStatus: parsedAnswer.antecedent ? parsedAnswer.antecedent.status : "",
       hasAntecedent: Boolean(parsedAnswer.antecedent && parsedAnswer.antecedent.status === "OUI"),
     });
 
@@ -7016,17 +7321,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function buildHeidiPromptText(prompt, _tableText = "", job = {}) {
     const basePrompt = stripTrailingBiologySignal(prompt);
-
-    if (!job || !job.pdfTextExtractionEmpty) {
-      return basePrompt;
-    }
-
-    return basePrompt + "\n\n" + [
-      "Important : le PDF original est joint à cette demande.",
-      "Son texte n'a pas pu être extrait automatiquement par Weda/PDF.js.",
-      "Analyse directement la pièce jointe PDF pour produire uniquement la phrase médicale courte demandée.",
-      job.pdfAttachmentInserted ? "" : "Si la pièce jointe n'est pas visible dans Heidi, réponds seulement que le PDF joint est inaccessible.",
-    ].filter(Boolean).join("\n");
+    return basePrompt;
   }
 
   function buildHeidiPromptVerificationMarkers(promptText) {
@@ -7537,30 +7832,150 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
   }
 
-  function extractHeidiAnswerFromAskContent() {
-    const directAnswer = extractHeidiAnswerFromDirectBlock();
-    if (directAnswer) {
-      return directAnswer;
-    }
+  function extractHeidiAnswerFromAskContent(copyButton = null) {
+    return extractHeidiAnswerStateFromAskContent(copyButton).answer;
+  }
 
-    const content = document.querySelector("#ask-ai-content");
+  function extractHeidiAnswerStateFromAskContent(copyButton = null) {
+    const textCandidates = collectHeidiAnswerTextCandidates(copyButton);
+    const answer = extractBestHeidiAnswerFromTextCandidates(textCandidates);
 
-    if (content) {
-      const answer = extractAnswerFromText(getVisibleText(content));
-      if (answer) {
-        return answer;
+    return {
+      answer,
+      profile: buildHeidiAnswerCandidateProfile(textCandidates, copyButton),
+    };
+  }
+
+  function collectHeidiAnswerTextCandidates(copyButton = null) {
+    const textCandidates = [];
+    const seenTexts = new Set();
+    const addCandidate = (text) => addHeidiAnswerTextCandidate(textCandidates, seenTexts, text);
+
+    collectHeidiAnswerAncestorTextCandidates(copyButton, addCandidate);
+
+    const selectors = [
+      '#ask-ai-content',
+      '#ask-ai-container',
+      '[data-testid="ask-ai-block-editor"] [contenteditable="false"]',
+      '[data-testid="ask-ai-block-editor"] .ProseMirror',
+      '[data-testid="ask-ai-block-editor"]',
+      '#ask-ai-content [contenteditable="false"]',
+      '#ask-ai-content .ProseMirror',
+      '[data-testid="template-block-editor-content"] [contenteditable="false"]',
+      '[data-testid*="ask-ai"]',
+      '[data-testid*="message"]',
+      '[data-message-author-role="assistant"]',
+      '[role="article"]',
+      'article',
+      '.markdown',
+      '.prose',
+      '[class*="markdown"]',
+      '[class*="assistant"]',
+    ];
+
+    selectors.forEach((selector) => {
+      Array.from(document.querySelectorAll(selector)).slice(0, 80).forEach((node) => {
+        if (!isElementVisibleEnough(node)) {
+          return;
+        }
+
+        addCandidate(getVisibleText(node));
+        addCandidate(extractTaggedHeidiOutputFromDomNode(node));
+      });
+    });
+
+    return textCandidates;
+  }
+
+  function collectHeidiAnswerAncestorTextCandidates(copyButton, addCandidate) {
+    let node = copyButton || findHeidiCopyTextButton();
+
+    for (let depth = 0; node && node !== document.body && depth < 12; depth += 1) {
+      if (isElementVisibleEnough(node)) {
+        addCandidate(getVisibleText(node));
+        addCandidate(extractTaggedHeidiOutputFromDomNode(node));
       }
+      node = node.parentElement;
+    }
+  }
+
+  function addHeidiAnswerTextCandidate(textCandidates, seenTexts, text) {
+    const normalized = normalizeMultilineText(text);
+
+    if (!normalized || isOnlyHeidiThinkingText(normalized)) {
+      return false;
     }
 
-    const fallbackContainer = document.querySelector("#ask-ai-container");
-    if (fallbackContainer) {
-      const answer = extractAnswerFromText(getVisibleText(fallbackContainer));
-      if (answer) {
-        return answer;
-      }
+    const structuredAnswer = extractStructuredHeidiAnswerFromText(normalized);
+    if (isHeidiPromptOrInputTextCandidate(normalized) && !structuredAnswer) {
+      return false;
     }
 
-    return "";
+    const candidate = structuredAnswer || normalized;
+    if (seenTexts.has(candidate)) {
+      return false;
+    }
+
+    seenTexts.add(candidate);
+    textCandidates.push(candidate);
+    return true;
+  }
+
+  function isHeidiPromptOrInputTextCandidate(text) {
+    const normalized = normalizeForCompare(text).replace(/['’]/g, " ");
+
+    return (
+      normalized.includes("courrier medical a synthetiser ci dessous") ||
+      normalized.includes("document fourni par weda") ||
+      normalized.includes("texte pdf extrait automatiquement") ||
+      normalized.includes("tu dois produire deux blocs balises") ||
+      normalized.includes("prompt titre courrier a appliquer strictement") ||
+      normalized.includes("format de sortie obligatoire") ||
+      normalized.includes("phrase de titre produite en appliquant strictement") ||
+      normalized.includes("statut: oui ou non") ||
+      normalized.includes("libelle: libelle court") ||
+      normalized.includes("code: code cim") ||
+      normalized.includes("source: fragment tres court")
+    );
+  }
+
+  function extractTaggedHeidiOutputFromDomNode(node) {
+    if (!node || typeof node.querySelector !== "function") {
+      return "";
+    }
+
+    const titleNode = node.querySelector("titre_courrier");
+    const atcdNode = node.querySelector("antecedent_cim10");
+
+    if (!titleNode || !atcdNode) {
+      return "";
+    }
+
+    return [
+      "<TITRE_COURRIER>",
+      getVisibleText(titleNode),
+      "</TITRE_COURRIER>",
+      "<ANTECEDENT_CIM10>",
+      getVisibleText(atcdNode),
+      "</ANTECEDENT_CIM10>",
+    ].join("\n");
+  }
+
+  function buildHeidiAnswerCandidateProfile(textCandidates, copyButton = null) {
+    const texts = (textCandidates || [])
+      .map((text) => normalizeMultilineText(text))
+      .filter(Boolean);
+    const aggregate = texts.join("\n");
+
+    return {
+      candidateCount: texts.length,
+      largestCandidateLength: texts.reduce((max, text) => Math.max(max, text.length), 0),
+      aggregateLength: aggregate.length,
+      aggregateHasTaggedTitle: Boolean(extractTaggedBlock(aggregate, "TITRE_COURRIER")),
+      aggregateHasTaggedAtcd: Boolean(extractTaggedBlock(aggregate, "ANTECEDENT_CIM10")),
+      aggregateHasUntaggedAtcd: Boolean(extractUntaggedHeidiCourrierAtcdOutput(aggregate)),
+      fromCopyButton: Boolean(copyButton),
+    };
   }
 
   function extractHeidiAnswerFromDirectBlock() {
@@ -7572,6 +7987,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       '#ask-ai-content .ProseMirror',
       '[data-testid="template-block-editor-content"] [contenteditable="false"]',
     ];
+    const textCandidates = [];
+    const seenTexts = new Set();
 
     for (const selector of selectors) {
       const nodes = Array.from(document.querySelectorAll(selector));
@@ -7585,14 +8002,43 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           continue;
         }
 
-        const answer = extractAnswerFromText(text);
-        if (answer) {
-          return answer;
+        if (!seenTexts.has(text)) {
+          seenTexts.add(text);
+          textCandidates.push(text);
         }
       }
     }
 
-    return "";
+    return extractBestHeidiAnswerFromTextCandidates(textCandidates);
+  }
+
+  function extractBestHeidiAnswerFromTextCandidates(textCandidates) {
+    const texts = (textCandidates || [])
+      .map((text) => normalizeMultilineText(text))
+      .filter(Boolean);
+
+    if (!texts.length) {
+      return "";
+    }
+
+    const aggregate = texts.join("\n");
+    const structuredAnswer = extractStructuredHeidiAnswerFromText(aggregate);
+    if (structuredAnswer) {
+      return structuredAnswer;
+    }
+
+    for (const text of texts.slice().reverse()) {
+      if (isHeidiPromptOrInputTextCandidate(text)) {
+        continue;
+      }
+
+      const answer = extractAnswerFromText(text);
+      if (answer) {
+        return answer;
+      }
+    }
+
+    return isHeidiPromptOrInputTextCandidate(aggregate) ? "" : extractAnswerFromText(aggregate);
   }
 
   function isElementVisibleEnough(element) {
@@ -7632,10 +8078,39 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     let lastRelaunchAt = 0;
     let relaunchCount = 0;
 
+    const maybeRelaunchIfStuck = (now, stillThinking) => {
+      if (!firstThinkingAt) {
+        firstThinkingAt = now;
+      }
+
+      const stuckLongEnough = now - firstThinkingAt >= HEIDI_RELAUNCH_IF_STUCK_AFTER_MS;
+      const cooldownOk = !lastRelaunchAt || now - lastRelaunchAt >= HEIDI_RELAUNCH_COOLDOWN_MS;
+
+      if (stuckLongEnough && cooldownOk && relaunchCount < HEIDI_MAX_RELAUNCHES) {
+        const sendButton = findHeidiSendButton();
+        if (sendButton) {
+          relaunchCount += 1;
+          lastRelaunchAt = now;
+          updateHeidiStatus(jobId, `Heidi bloqué sans réponse : relance ${relaunchCount}/${HEIDI_MAX_RELAUNCHES}...`);
+          appendDebugLog("heidi:answer-relaunch", {
+            jobId,
+            relaunchCount,
+            stillThinking,
+            hidden: document.hidden,
+            hasFocus: document.hasFocus(),
+            sendButton: describeDebugElement(sendButton),
+          });
+          focusCurrentHeidiWindow();
+          clickButtonLikeUser(sendButton);
+        }
+      }
+    };
+
     return waitFor(() => {
       abortIfHeidiJobCancelled(jobId);
-      const answer = extractHeidiAnswerFromAskContent();
       const copyButton = findHeidiCopyTextButton();
+      const answerState = extractHeidiAnswerStateFromAskContent(copyButton);
+      const answer = answerState.answer;
       const stillThinking = isHeidiStillThinking();
       const now = Date.now();
       const hiddenOrBlurred = document.hidden || !document.hasFocus();
@@ -7663,26 +8138,29 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           appendDebugLog("heidi:answer-candidate", {
             jobId,
             answerLength: answer.length,
+            hasTaggedTitle: Boolean(extractTaggedBlock(answer, "TITRE_COURRIER")),
+            hasTaggedAtcd: Boolean(extractTaggedBlock(answer, "ANTECEDENT_CIM10")),
             hasCopyButton: Boolean(copyButton),
             stillThinking,
+            candidateProfile: answerState.profile,
           });
+          if (stillThinking) {
+            maybeRelaunchIfStuck(now, stillThinking);
+          }
           return "";
         }
 
-        const stableDelay = stillThinking
-          ? HEIDI_ANSWER_STABLE_WITH_STUCK_THINKING_MS
-          : copyButton
-            ? HEIDI_ANSWER_STABLE_WITH_COPY_MS
-            : HEIDI_ANSWER_STABLE_WITHOUT_COPY_MS;
+        if (stillThinking) {
+          maybeRelaunchIfStuck(now, stillThinking);
+          return "";
+        }
+
+        firstThinkingAt = 0;
+        const stableDelay = copyButton
+          ? HEIDI_ANSWER_STABLE_WITH_COPY_MS
+          : HEIDI_ANSWER_STABLE_WITHOUT_COPY_MS;
 
         if (now - stableSince >= stableDelay) {
-          if (stillThinking) {
-            appendDebugLog("heidi:answer-accepted-with-thinking", {
-              jobId,
-              answerLength: answer.length,
-              stableMs: now - stableSince,
-            });
-          }
           return answer;
         }
 
@@ -7690,32 +8168,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       }
 
       if (stillThinking || !answer) {
-        if (!firstThinkingAt) {
-          firstThinkingAt = now;
-        }
-
-        const stuckLongEnough = now - firstThinkingAt >= HEIDI_RELAUNCH_IF_STUCK_AFTER_MS;
-        const cooldownOk = !lastRelaunchAt || now - lastRelaunchAt >= HEIDI_RELAUNCH_COOLDOWN_MS;
-
-        if (stuckLongEnough && cooldownOk && relaunchCount < HEIDI_MAX_RELAUNCHES) {
-          const sendButton = findHeidiSendButton();
-          if (sendButton) {
-            relaunchCount += 1;
-            lastRelaunchAt = now;
-            updateHeidiStatus(jobId, `Heidi bloqué sans réponse : relance ${relaunchCount}/${HEIDI_MAX_RELAUNCHES}...`);
-            appendDebugLog("heidi:answer-relaunch", {
-              jobId,
-              relaunchCount,
-              stillThinking,
-              hidden: document.hidden,
-              hasFocus: document.hasFocus(),
-              sendButton: describeDebugElement(sendButton),
-            });
-            focusCurrentHeidiWindow();
-            clickButtonLikeUser(sendButton);
-          }
-        }
-
+        maybeRelaunchIfStuck(now, stillThinking);
         return "";
       }
 
@@ -7821,7 +8274,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       .replace(/[ \t]+/g, " ")
       .trim();
 
-    const structuredAnswer = extractTaggedHeidiCourrierAtcdOutput(normalized);
+    const structuredAnswer = extractStructuredHeidiAnswerFromText(normalized);
     if (structuredAnswer) {
       return structuredAnswer;
     }
@@ -7832,6 +8285,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     return "";
+  }
+
+  function extractStructuredHeidiAnswerFromText(text) {
+    const normalized = stripHeidiPromptBlocksFromText(text)
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t]+/g, " ")
+      .trim();
+
+    return extractTaggedHeidiCourrierAtcdOutput(normalized) ||
+      extractUntaggedHeidiCourrierAtcdOutput(normalized);
   }
 
   function stripHeidiPromptBlocksFromText(text) {
@@ -7889,6 +8353,90 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     return lastUsableBlock;
+  }
+
+  function extractUntaggedHeidiCourrierAtcdOutput(text) {
+    const lines = String(text || "")
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .map((line) => normalizeMultilineText(line))
+      .filter(Boolean);
+    const statusLineIndexes = [];
+
+    lines.forEach((line, index) => {
+      if (/^\s*STATUT\s*:/i.test(line)) {
+        statusLineIndexes.push(index);
+      }
+    });
+
+    for (let index = statusLineIndexes.length - 1; index >= 0; index -= 1) {
+      const statusLineIndex = statusLineIndexes[index];
+      const atcdBlock = extractUntaggedAtcdBlockFromLines(lines, statusLineIndex);
+      const title = findUntaggedHeidiTitleBeforeAtcd(lines, statusLineIndex);
+
+      if (!atcdBlock || !title) {
+        continue;
+      }
+
+      const block = [
+        "<TITRE_COURRIER>",
+        title,
+        "</TITRE_COURRIER>",
+        "<ANTECEDENT_CIM10>",
+        atcdBlock,
+        "</ANTECEDENT_CIM10>",
+      ].join("\n");
+
+      if (isUsableTaggedHeidiCourrierAtcdBlock(block)) {
+        return block;
+      }
+    }
+
+    return "";
+  }
+
+  function extractUntaggedAtcdBlockFromLines(lines, statusLineIndex) {
+    const fields = [];
+    const fieldNames = "STATUT|SECTION|LIBELLE|CODE|DATE|CERTITUDE|SOURCE";
+
+    for (let index = statusLineIndex; index < lines.length && fields.length < 8; index += 1) {
+      const line = normalizeMultilineText(lines[index]);
+
+      if (!line) {
+        continue;
+      }
+
+      if (new RegExp(`^\\s*(?:${fieldNames})\\s*:`, "i").test(line)) {
+        fields.push(line);
+        continue;
+      }
+
+      if (fields.length && isExpectedTitleLine(line)) {
+        break;
+      }
+    }
+
+    const block = fields.join("\n");
+    const parsed = parseSimpleKeyValueBlock(block);
+    return parsed.STATUT ? block : "";
+  }
+
+  function findUntaggedHeidiTitleBeforeAtcd(lines, statusLineIndex) {
+    const start = Math.max(0, statusLineIndex - 14);
+
+    for (let index = statusLineIndex - 1; index >= start; index -= 1) {
+      const candidate = sanitizeTitle(
+        removeHeidiUiNoise(lines[index])
+          .replace(/^<?\/?TITRE_COURRIER>?\s*:?\s*/i, "")
+          .replace(/^titre\s*courrier\s*:?\s*/i, "")
+      );
+
+      if (isExpectedTitleLine(candidate)) {
+        return candidate;
+      }
+    }
+
+    return extractShortHeidiLine(lines.slice(0, statusLineIndex).join("\n"));
   }
 
   function isUsableTaggedHeidiCourrierAtcdBlock(block) {
@@ -7967,10 +8515,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function parseSimpleKeyValueBlock(blockText) {
     const fields = {};
+    const raw = String(blockText || "").replace(/\r/g, "\n");
 
-    String(blockText || "")
-      .replace(/\r/g, "\n")
-      .split("\n")
+    raw.split("\n")
       .forEach((line) => {
         const match = line.match(/^\s*([A-Z_À-ÖØ-Ý0-9 -]{2,40})\s*:\s*(.*?)\s*$/i);
         if (!match) {
@@ -7983,6 +8530,26 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           .toUpperCase();
         fields[key] = normalizeText(match[2] || "");
       });
+
+    const fieldRegex = /\b(STATUT|SECTION|LIBELLE|CODE|DATE|CERTITUDE|SOURCE)\s*:/gi;
+    const matches = [];
+    let match = null;
+
+    while ((match = fieldRegex.exec(raw)) !== null) {
+      matches.push({
+        key: normalizeForCompare(match[1]).toUpperCase(),
+        valueStart: fieldRegex.lastIndex,
+        labelStart: match.index,
+      });
+    }
+
+    matches.forEach((entry, index) => {
+      const next = matches[index + 1];
+      const value = normalizeText(raw.slice(entry.valueStart, next ? next.labelStart : raw.length));
+      if (value) {
+        fields[entry.key] = value;
+      }
+    });
 
     return fields;
   }
@@ -8117,8 +8684,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const normalized = normalizeForCompare(text).replace(/['’]/g, " ");
 
     return isPromptInstructionLine(text) ||
+      /^(?:page\s*\d+|copier|copy|envoyer|contexte|demande)$/i.test(normalized) ||
       /^(?:role|objectif|consignes|format attendu|format de sortie)\s*:/.test(normalized) ||
-      /(?:tu dois produire deux blocs|pour le bloc|prompt titre courrier|fin du prompt titre|courrier medical a synthetiser|titre_courrier|antecedent_cim10|statut\s*:|libelle\s*:|code\s*:|certitude\s*:|source\s*:|repondre en francais|faire une seule phrase|ne jamais|ne pas faire|extraire uniquement|mentionner de facon concise|utiliser un style|conserver les termes|eviter les details|format attendu|format de sortie obligatoire|une phrase unique du type|copier le texte|bientot termine|l ia est en train|demandez a l ia|nouvelle session|je ne peux pas|impossible d analyser|pdf joint est inaccessible|piece jointe non accessible|document inaccessible|aucun document accessible)/i.test(normalized);
+      /(?:tu dois produire deux blocs|pour le bloc|prompt titre courrier|fin du prompt titre|courrier medical a synthetiser|titre_courrier|antecedent_cim10|statut\s*:|libelle\s*:|code\s*:|certitude\s*:|source\s*:|repondre en francais|faire une seule phrase|ne jamais|ne pas faire|extraire uniquement|mentionner de facon concise|utiliser un style|conserver les termes|eviter les details|format attendu|format de sortie obligatoire|une phrase unique du type|copier le texte|bientot termine|l ia est en train|demandez a l ia|nouvelle session|je ne peux pas|impossible d analyser|analyse directement.*piece jointe|pdf original joint|texte.*pdf.*extrait automatiquement|pdf joint est inaccessible|piece jointe non accessible|document inaccessible|aucun document accessible)/i.test(normalized);
   }
 
   function isPromptInstructionLine(text) {
