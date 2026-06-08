@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WEDA - Titres et commentaires antecedents lisibles
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.1.3
 // @description  Souligne les titres et met en gras uniquement les commentaires des antecedents WEDA.
 // @match        https://secure.weda.fr/*
 // @all-frames   true
@@ -34,6 +34,7 @@
     const STYLE_ID = 'weda-atcd-commentaires-gras-style';
     const COMMENT_MARK_ATTR = 'data-weda-atcd-commentaire-gras';
     const TITLE_MARK_ATTR = 'data-weda-atcd-titre-souligne';
+    const TITLE_NO_COMMENT_MARK_ATTR = 'data-weda-atcd-titre-sans-commentaire';
     const LATERALITE_MARK_ATTR = 'data-weda-atcd-lateralite';
     const LOG_PREFIX = '[WEDA-ATCD-COMMENTAIRES-GRAS]';
 
@@ -303,7 +304,6 @@
 
         const tag = String(el.tagName || '').toLowerCase();
         if (!['div', 'td'].includes(tag)) return false;
-        if (!el.querySelector || !el.querySelector('br')) return false;
         if (!hasAntecedentItemShape(el)) return false;
         if (hasNestedAntecedentItemShape(el)) return false;
         if (!looksLikeAntecedentText(getElementText(el))) return false;
@@ -403,6 +403,15 @@
         return !/^\s*\[[A-Z][A-Z0-9]{0,3}(?:\.[A-Z0-9]+)?(?:-[A-Z][A-Z0-9]{0,3}(?:\.[A-Z0-9]+)?)?\]\s*$/i.test(text);
     }
 
+    function applyMarkAttr(el, markAttr) {
+        if (!el || !markAttr) return false;
+        if (markAttr === TITLE_MARK_ATTR) el.removeAttribute(TITLE_NO_COMMENT_MARK_ATTR);
+        if (markAttr === TITLE_NO_COMMENT_MARK_ATTR) el.removeAttribute(TITLE_MARK_ATTR);
+        if (el.hasAttribute(markAttr)) return false;
+        el.setAttribute(markAttr, '1');
+        return true;
+    }
+
     function wrapTextNode(node, markAttr, options = {}) {
         if (!markAttr || !textNodeLooksMeaningful(node) || node.parentElement && node.parentElement.hasAttribute(markAttr)) return 0;
         if (options.skipLateralite && isStandaloneLateraliteText(node.nodeValue || '')) {
@@ -418,7 +427,7 @@
 
         if (parts.length <= 1) {
             const span = doc.createElement('span');
-            span.setAttribute(markAttr, '1');
+            applyMarkAttr(span, markAttr);
             span.textContent = raw;
             node.parentNode.replaceChild(span, node);
             return 1;
@@ -432,7 +441,7 @@
                 fragment.appendChild(doc.createTextNode(part));
             } else {
                 const span = doc.createElement('span');
-                span.setAttribute(markAttr, '1');
+                applyMarkAttr(span, markAttr);
                 span.textContent = part;
                 fragment.appendChild(span);
                 count += 1;
@@ -484,9 +493,7 @@
         const text = normalizeSpaces(el.innerText || el.textContent || '');
         if (!text) return 0;
 
-        if (el.hasAttribute(markAttr)) return 0;
-        el.setAttribute(markAttr, '1');
-        return 1;
+        return applyMarkAttr(el, markAttr) ? 1 : 0;
     }
 
     function getFirstDirectBreak(container) {
@@ -498,18 +505,46 @@
         return null;
     }
 
+    function hasCommentContent(container) {
+        const firstBreak = getFirstDirectBreak(container);
+        if (!firstBreak) return false;
+
+        let inComment = false;
+        for (const node of Array.from(container.childNodes || [])) {
+            if (node === firstBreak) {
+                inComment = true;
+                continue;
+            }
+            if (!inComment) continue;
+
+            if (node.nodeType === Node.TEXT_NODE) {
+                const text = node.nodeValue || '';
+                if (textNodeLooksMeaningful(node) && !isStandaloneLateraliteText(text)) return true;
+                continue;
+            }
+
+            if (node.nodeType === Node.ELEMENT_NODE) {
+                if (shouldSkipCommentElement(node) || isLateraliteElement(node)) continue;
+                const text = normalizeSpaces(node.innerText || node.textContent || '');
+                if (text && !isStandaloneLateraliteText(text)) return true;
+            }
+        }
+
+        return false;
+    }
+
     function markTitlePart(container) {
         const firstBreak = getFirstDirectBreak(container);
-        if (!firstBreak) return 0;
+        const titleMarkAttr = hasCommentContent(container) ? TITLE_MARK_ATTR : TITLE_NO_COMMENT_MARK_ATTR;
 
         let count = 0;
         for (const node of Array.from(container.childNodes || [])) {
-            if (node === firstBreak) break;
+            if (firstBreak && node === firstBreak) break;
 
             if (node.nodeType === Node.TEXT_NODE) {
-                count += wrapTextNode(node, TITLE_MARK_ATTR, { skipLateralite: true });
+                count += wrapTextNode(node, titleMarkAttr, { skipLateralite: true });
             } else if (node.nodeType === Node.ELEMENT_NODE) {
-                count += markElement(node, TITLE_MARK_ATTR, { skipLateralite: true });
+                count += markElement(node, titleMarkAttr, { skipLateralite: true });
             }
         }
         return count;
@@ -573,12 +608,20 @@ ${SELECTOR_ANTECEDENT_ROOT} [${TITLE_MARK_ATTR}="1"] {
     text-decoration: underline !important;
     text-underline-offset: 2px !important;
 }
+${SELECTOR_ANTECEDENT_ROOT} [${TITLE_NO_COMMENT_MARK_ATTR}="1"] {
+    font-weight: 700 !important;
+    text-decoration: none !important;
+}
 ${patientSummaryCommentSelector} {
     font-weight: 700 !important;
 }
 ${patientSummaryTitleSelector} {
     text-decoration: underline !important;
     text-underline-offset: 2px !important;
+}
+${buildDescendantSelector(PATIENT_ANTECEDENTS_SUMMARY_SELECTORS, `[${TITLE_NO_COMMENT_MARK_ATTR}="1"]`)} {
+    font-weight: 700 !important;
+    text-decoration: none !important;
 }
 ${SELECTOR_ANTECEDENT_ROOT} [${LATERALITE_MARK_ATTR}="1"],
 ${buildDescendantSelector(PATIENT_ANTECEDENTS_SUMMARY_SELECTORS, `[${LATERALITE_MARK_ATTR}="1"]`)} {

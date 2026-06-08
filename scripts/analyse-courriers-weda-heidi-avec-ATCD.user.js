@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF Heidi + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      2.2
+// @version      2.3
 // @description  Analyse les courriers PDF de Weda Échanges avec Heidi, renseigne le titre et prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @match        https://scribe.heidihealth.com/*
@@ -27,7 +27,7 @@
   const HEIDI_URL = "https://scribe.heidihealth.com/";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "2.2";
+  const SCRIPT_VERSION = "2.3";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
 
@@ -52,6 +52,7 @@
   const WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND = true;
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
   const WEDA_ATCD_PENDING_OPEN_MS = 90000;
+  const WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS = 1500;
   const WEDA_ATCD_WORKER_BADGE_ID = "weda-courrier-heidi-atcd-worker-badge";
 
   const PANEL_ID = "weda-courrier-heidi-atcd-panel";
@@ -80,7 +81,11 @@
     "#messageContainer > div.messageAttachment.flexColStart > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > input",
   ].join(", ");
   const DOC_TITLE_FALLBACK_SELECTOR = "input.docTitle";
-  const MESSAGE_BODY_TEXT_SELECTOR = "#messageContainer > div.messageBody.importing, #messageContainer div.messageBody.importing";
+  const MESSAGE_BODY_TEXT_SELECTOR = [
+    "#messageContainer > div.messageBody",
+    "#messageContainer div.messageBody.importing",
+    "#messageContainer div.messageBody",
+  ].join(", ");
   const IMPORT_MESSAGE_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart.ng-star-inserted > div.flexColStart.mt10.width100.ng-star-inserted > div.mt5.flexRow.ng-star-inserted > div > table > tr.ng-star-inserted > td:nth-child(5) > a";
   const IMPORT_PATIENT_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart > div > div.btnImport.importPatient.targetSupprimer, #messageContainer .btnImport.importPatient.targetSupprimer";
   const PDF_PARSER_RESET_SELECTOR = "#pdfParserResetButton";
@@ -115,6 +120,8 @@
   const TITLE_STABILITY_CHECK_INTERVAL_MS = 500;
   const TITLE_STABILITY_REOPEN_INPUT_AFTER_MS = 1500;
   const NEXT_AFTER_TITLE_STABLE_MS = 450;
+  const TITLE_MANUAL_EDIT_COMMIT_DELAY_MS = 1200;
+  const TITLE_MANUAL_EDIT_SUPPRESS_MS = 10 * 60 * 1000;
   const PDF_FETCH_RETRY_MS = 15000;
   const PDF_FETCH_RETRY_INTERVAL_MS = 900;
   const HEIDI_ANSWER_STABLE_WITH_COPY_MS = 1000;
@@ -139,6 +146,8 @@
 
   let titleAutofillInterval = null;
   let titleAutofillInputOpening = false;
+  let titleManualEditState = null;
+  let titleManualEditCommitTimer = null;
   let autoRefreshTimer = null;
   let autoHeartbeatTimer = null;
   let currentHeidiTab = null;
@@ -1613,7 +1622,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return false;
     }
 
-    return Boolean(getDisplayedPdfUrl()) && (
+    return (Boolean(getDisplayedPdfUrl()) || Boolean(extractWedaMessageBodyFallbackText())) && (
       item.row.classList.contains("selected") ||
       getSelectedBiologyIndex() === item.index
     );
@@ -2268,47 +2277,67 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   async function waitForDisplayedBiology(item, previousContentKey, options = {}) {
     let pdfSeenSince = 0;
     const waitStartedAt = options.pdfPerformanceStartTime || Math.max(0, getCurrentPerformanceTime() - 500);
-    const displayed = await waitFor(() => {
-      abortIfWorkflowStopped();
-      const pdfUrl = getDisplayedPdfUrl({
-        includePerformance: getElapsedPerformanceMs(waitStartedAt) >= PDF_PERFORMANCE_FALLBACK_SETTLE_MS,
-        minPerformanceStartTime: waitStartedAt,
+    let displayed = null;
+
+    try {
+      displayed = await waitFor(() => {
+        abortIfWorkflowStopped();
+        const pdfUrl = getDisplayedPdfUrl({
+          includePerformance: getElapsedPerformanceMs(waitStartedAt) >= PDF_PERFORMANCE_FALLBACK_SETTLE_MS,
+          minPerformanceStartTime: waitStartedAt,
+        });
+        const urlKey = pdfUrl ? "pdfurl-" + hashString(pdfUrl) : "";
+        const selectedOk = item && item.row && (
+          item.row.classList.contains("selected") ||
+          getSelectedBiologyIndex() === item.index
+        );
+        const changedOk = !previousContentKey || urlKey !== previousContentKey;
+        const expectedPdfUrl = options.expectedPdfUrl || "";
+        const allowContentKey = options.allowContentKey || "";
+        const now = Date.now();
+
+        if (!pdfUrl) {
+          pdfSeenSince = 0;
+          return null;
+        }
+
+        pdfSeenSince = pdfSeenSince || now;
+
+        if (expectedPdfUrl && pdfUrl !== expectedPdfUrl) {
+          return null;
+        }
+
+        if (expectedPdfUrl || selectedOk || changedOk || urlKey === allowContentKey || now - pdfSeenSince >= 1200) {
+          return {
+            pdfUrl,
+            urlKey,
+            selectedOk,
+          };
+        }
+
+        return null;
+      }, {
+        timeout: PDF_DISPLAY_WAIT_MS,
+        interval: 350,
+        description: "le PDF correspondant à la ligne cliquée",
       });
-      const urlKey = pdfUrl ? "pdfurl-" + hashString(pdfUrl) : "";
-      const selectedOk = item && item.row && (
-        item.row.classList.contains("selected") ||
-        getSelectedBiologyIndex() === item.index
-      );
-      const changedOk = !previousContentKey || urlKey !== previousContentKey;
-      const expectedPdfUrl = options.expectedPdfUrl || "";
-      const allowContentKey = options.allowContentKey || "";
-      const now = Date.now();
-
-      if (!pdfUrl) {
-        pdfSeenSince = 0;
-        return null;
+    } catch (error) {
+      if (isWorkflowStopped() || /analyse arrêtée/i.test(error && error.message ? error.message : "")) {
+        throw error;
       }
 
-      pdfSeenSince = pdfSeenSince || now;
+      const fallbackDocument = buildDisplayedBiologyDocumentFromMessageBody("weda:pdf-missing-message-body-fallback", {
+        error,
+        item,
+      });
 
-      if (expectedPdfUrl && pdfUrl !== expectedPdfUrl) {
-        return null;
+      if (fallbackDocument) {
+        abortIfWorkflowStopped();
+        return fallbackDocument;
       }
 
-      if (expectedPdfUrl || selectedOk || changedOk || urlKey === allowContentKey || now - pdfSeenSince >= 1200) {
-        return {
-          pdfUrl,
-          urlKey,
-          selectedOk,
-        };
-      }
-
-      return null;
-    }, {
-      timeout: PDF_DISPLAY_WAIT_MS,
-      interval: 350,
-      description: "le PDF correspondant à la ligne cliquée",
-    });
+      throw error;
+    }
 
     abortIfWorkflowStopped();
     setPanelStatus("Extraction du texte du PDF...");
@@ -2450,6 +2479,62 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       pdfAttachmentByteLength: 0,
       pdfTextExtractionEmpty: false,
       pdfTextFallbackUsed: true,
+    };
+  }
+
+  function buildDisplayedBiologyDocumentFromMessageBody(logEvent, options = {}) {
+    const item = options.item || null;
+    const error = options.error || null;
+    const bodyText = extractWedaMessageBodyFallbackText();
+    const selectedOk = item && item.row && (
+      item.row.classList.contains("selected") ||
+      getSelectedBiologyIndex() === item.index
+    );
+
+    if (!bodyText) {
+      appendDebugLog("weda:pdf-missing-message-body-missing", {
+        error: error && error.message ? error.message : "",
+        rowIndex: item ? item.index : null,
+        selector: MESSAGE_BODY_TEXT_SELECTOR,
+        bodyCandidates: document.querySelectorAll(MESSAGE_BODY_TEXT_SELECTOR).length,
+      });
+      return null;
+    }
+
+    if (item && !selectedOk) {
+      appendDebugLog("weda:pdf-missing-message-body-ignored", {
+        error: error && error.message ? error.message : "",
+        rowIndex: item.index,
+        selectedIndex: getSelectedBiologyIndex(),
+        bodyLength: bodyText.length,
+      });
+      return null;
+    }
+
+    const documentText = truncateDocumentText(bodyText);
+    const urlKey = "messagebody-" + hashString(documentText);
+
+    appendDebugLog(logEvent || "weda:message-body-fallback", {
+      rowIndex: item ? item.index : null,
+      bodyLength: documentText.length,
+      bodyLines: countBiologyLinesForLog(documentText, "message-body"),
+      selector: MESSAGE_BODY_TEXT_SELECTOR,
+      bodyCandidates: document.querySelectorAll(MESSAGE_BODY_TEXT_SELECTOR).length,
+    });
+
+    return {
+      table: null,
+      tableText: documentText,
+      tableHtml: "",
+      contentKey: getDisplayedBiologyContentKey(documentText),
+      sourceType: "message-body",
+      pdfUrl: "",
+      urlKey,
+      pdfAttachmentBase64: "",
+      pdfAttachmentName: "",
+      pdfAttachmentMimeType: "",
+      pdfAttachmentByteLength: 0,
+      pdfTextExtractionEmpty: false,
     };
   }
 
@@ -2867,6 +2952,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const container = document.querySelector("#messageContainer") || document.body;
+    setupWedaTitleManualEditTracking(container);
+
     if (!container || typeof MutationObserver === "undefined") {
       return;
     }
@@ -2881,6 +2968,236 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       childList: true,
       subtree: true,
     });
+  }
+
+  function setupWedaTitleManualEditTracking(container) {
+    if (!container || container.__wbhTitleManualEditTracking) {
+      return;
+    }
+
+    try {
+      container.__wbhTitleManualEditTracking = true;
+    } catch (_error) {
+      // La protection anti-double listener reste best effort.
+    }
+
+    ["beforeinput", "input", "change", "keydown", "paste", "compositionstart"].forEach((eventName) => {
+      container.addEventListener(eventName, handleWedaTitleManualEditEvent, true);
+    });
+  }
+
+  function handleWedaTitleManualEditEvent(event) {
+    if (!event || event.isTrusted === false) {
+      return;
+    }
+
+    const input = getWedaTitleInputFromEvent(event);
+    if (!input) {
+      return;
+    }
+
+    const context = buildWedaTitleManualEditContext(input);
+    if (!context.keys.length) {
+      return;
+    }
+
+    const now = Date.now();
+    const previous = titleManualEditState;
+    const shouldLog = !previous ||
+      !haveSharedTitleKeys(previous.keys, context.keys) ||
+      now - Number(previous.loggedAt || 0) > 5000;
+
+    titleManualEditState = {
+      ...previous,
+      input,
+      keys: context.keys,
+      rowIndex: context.rowIndex,
+      rowStableKey: context.rowStableKey,
+      rowIdentity: context.rowIdentity,
+      pdfUrlHash: context.pdfUrlHash,
+      contentKey: context.contentKey,
+      urlKey: context.urlKey,
+      lastTitle: sanitizeTitle(input.value),
+      startedAt: previous && haveSharedTitleKeys(previous.keys, context.keys) ? previous.startedAt : now,
+      updatedAt: now,
+      eventType: event.type,
+      loggedAt: shouldLog ? now : Number(previous && previous.loggedAt) || 0,
+    };
+
+    if (shouldLog) {
+      appendDebugLog("weda:title-manual-edit-detected", {
+        rowIndex: context.rowIndex,
+        rowStableKey: context.rowStableKey,
+        keys: context.keys,
+        eventType: event.type,
+        currentLength: sanitizeTitle(input.value).length,
+      });
+    }
+
+    if (event.type === "input" || event.type === "change") {
+      scheduleRememberManualEditedWedaTitle();
+    }
+  }
+
+  function getWedaTitleInputFromEvent(event) {
+    const target = event && event.target;
+    if (isWedaTitleInputElement(target)) {
+      return target;
+    }
+
+    if (target && typeof target.closest === "function") {
+      const closest = target.closest("input.docTitle, textarea.docTitle, input[placeholder='Titre du document'], textarea[placeholder='Titre du document'], input[title*='titre'], textarea[title*='titre']");
+      return isWedaTitleInputElement(closest) ? closest : null;
+    }
+
+    return null;
+  }
+
+  function isWedaTitleInputElement(element) {
+    if (!element || !/^(?:input|textarea)$/i.test(element.tagName || "")) {
+      return false;
+    }
+
+    try {
+      return element.matches("input.docTitle, textarea.docTitle, input[placeholder='Titre du document'], textarea[placeholder='Titre du document'], input[title*='titre'], textarea[title*='titre']");
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function buildWedaTitleManualEditContext(input, rowOverride = null) {
+    const state = getState();
+    const item = rowOverride || getSelectedBiologyItem();
+    const urlKey = getDisplayedPdfUrlKey();
+    const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
+    const keys = [
+      urlKey,
+      item && item.key,
+      item && item.stableKey,
+      stateMatchesItem && state.currentContentKey,
+      stateMatchesItem && state.currentUrlKey,
+      stateMatchesItem && state.lastTitleKey,
+    ].filter(Boolean);
+
+    return {
+      keys: Array.from(new Set(keys)),
+      rowIndex: item ? item.index : state.currentIndex,
+      rowStableKey: item ? item.stableKey : state.currentStableKey,
+      rowIdentity: item ? item.identityLabel : "",
+      pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
+      contentKey: stateMatchesItem ? state.currentContentKey || "" : "",
+      urlKey: stateMatchesItem ? state.currentUrlKey || urlKey : urlKey,
+    };
+  }
+
+  function scheduleRememberManualEditedWedaTitle() {
+    window.clearTimeout(titleManualEditCommitTimer);
+    titleManualEditCommitTimer = window.setTimeout(() => {
+      rememberManualEditedWedaTitle();
+    }, TITLE_MANUAL_EDIT_COMMIT_DELAY_MS);
+  }
+
+  function rememberManualEditedWedaTitle() {
+    const edit = titleManualEditState;
+
+    if (!edit || !edit.keys || !edit.keys.length) {
+      return false;
+    }
+
+    const title = sanitizeTitle(edit.input && typeof edit.input.value !== "undefined" ? edit.input.value : edit.lastTitle);
+    const now = Date.now();
+    titleManualEditState = {
+      ...edit,
+      lastTitle: title,
+      updatedAt: now,
+    };
+
+    if (!title || !isRememberableManualTitleLine(title)) {
+      appendDebugLog("weda:title-manual-edit-not-remembered", {
+        rowIndex: edit.rowIndex,
+        rowStableKey: edit.rowStableKey,
+        keys: edit.keys,
+        titleLength: title.length,
+      });
+      return false;
+    }
+
+    if (edit.committedTitle === title) {
+      return true;
+    }
+
+    const metadata = {
+      rowStableKey: edit.rowStableKey || "",
+      rowIdentity: edit.rowIdentity || "",
+      pdfUrlHash: edit.pdfUrlHash || "",
+      contentKey: edit.contentKey || "",
+      urlKey: edit.urlKey || "",
+      manualOverride: true,
+      manualUpdatedAt: now,
+    };
+
+    edit.keys.forEach((key) => rememberTitle(key, title, metadata));
+    titleManualEditState = {
+      ...titleManualEditState,
+      committedTitle: title,
+      committedAt: now,
+    };
+
+    appendDebugLog("weda:title-manual-edit-remembered", {
+      rowIndex: edit.rowIndex,
+      rowStableKey: edit.rowStableKey,
+      keys: edit.keys,
+      titleLength: title.length,
+    });
+
+    return true;
+  }
+
+  function shouldRespectManualTitleEdit(input, rememberedEntry, item, currentTitle, rememberedTitle) {
+    const edit = titleManualEditState;
+    if (!edit || !edit.keys || !edit.keys.length) {
+      return false;
+    }
+
+    const comparisonKeys = buildWedaTitleManualEditComparisonKeys(input, rememberedEntry, item);
+    if (!haveSharedTitleKeys(edit.keys, comparisonKeys)) {
+      return false;
+    }
+
+    const cleanCurrent = sanitizeTitle(currentTitle);
+    const cleanManual = sanitizeTitle(edit.input && typeof edit.input.value !== "undefined" ? edit.input.value : edit.lastTitle);
+    const cleanRemembered = sanitizeTitle(rememberedTitle);
+    const activeElement = document.activeElement;
+    const active = Boolean(input && (activeElement === input || activeElement === edit.input));
+    const recent = Date.now() - Number(edit.updatedAt || 0) <= TITLE_MANUAL_EDIT_SUPPRESS_MS;
+    const matchesManualValue = cleanCurrent === cleanManual && (Boolean(cleanCurrent) || recent);
+
+    if (!active && !matchesManualValue) {
+      return false;
+    }
+
+    if (cleanCurrent && cleanCurrent !== cleanRemembered && isRememberableManualTitleLine(cleanCurrent)) {
+      rememberManualEditedWedaTitle();
+    }
+
+    return true;
+  }
+
+  function buildWedaTitleManualEditComparisonKeys(input, rememberedEntry = {}, item = null) {
+    const context = buildWedaTitleManualEditContext(input, item);
+    const rememberedKeys = rememberedEntry && rememberedEntry.keys ? rememberedEntry.keys : [];
+    return Array.from(new Set([
+      ...(Array.isArray(rememberedKeys) ? rememberedKeys : [rememberedKeys]),
+      rememberedEntry && rememberedEntry.key,
+      item && item.key,
+      item && item.stableKey,
+      ...context.keys,
+    ].filter(Boolean)));
+  }
+
+  function haveSharedTitleKeys(left, right) {
+    const leftSet = new Set((Array.isArray(left) ? left : [left]).filter(Boolean));
+    return (Array.isArray(right) ? right : [right]).some((key) => leftSet.has(key));
   }
 
   async function applyRememberedTitleForSelectedRow(options = {}) {
@@ -2996,6 +3313,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return true;
     }
 
+    if (shouldRespectManualTitleEdit(input, rememberedEntry, item, currentTitle, remembered)) {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-title-skip-manual-edit", {
+          rowIndex: item ? item.index : null,
+          rememberedKey: rememberedEntry.key,
+          currentLength: currentTitle.length,
+          titleLength: remembered.length,
+        });
+        setPanelStatus("Modification manuelle du titre détectée : le titre saisi est conservé.");
+      }
+      return false;
+    }
+
     if (currentTitle && !options.force && !enforcePriority && !isRememberedTitleFromAnotherBiology(currentTitle, rememberedEntry.keys)) {
       appendDebugLog("weda:remembered-title-skip-existing", {
         rowIndex: item ? item.index : null,
@@ -3057,11 +3387,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const cleanTitle = sanitizeTitle(title);
+    const manualOverride = Boolean(metadata && metadata.manualOverride);
 
-    if (!isExpectedTitleLine(cleanTitle)) {
+    if (!isRememberableTitleLine(cleanTitle, { manualOverride })) {
       appendDebugLog("weda:remember-title-rejected", {
         rowKey,
         titleLength: cleanTitle.length,
+        manualOverride,
       });
       return;
     }
@@ -3073,6 +3405,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       ...previous,
       title: cleanTitle,
       ...metadata,
+      manualOverride,
       createdAt: previous.createdAt || now,
       updatedAt: now,
       lastUsedAt: previous.lastUsedAt || now,
@@ -3090,7 +3423,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const entry = titles[rowKey];
     const title = entry ? sanitizeTitle(entry.title) : "";
 
-    if (title && !isExpectedTitleLine(title)) {
+    if (title && !isRememberableTitleLine(title, entry)) {
       delete titles[rowKey];
       GM_setValue(TITLES_KEY, titles);
       appendDebugLog("weda:remembered-title-dropped", {
@@ -3142,7 +3475,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function pruneRememberedTitles(titles) {
     const entries = Object.entries(titles || {})
-      .filter(([_key, entry]) => entry && isExpectedTitleLine(sanitizeTitle(entry.title)))
+      .filter(([_key, entry]) => entry && isRememberableTitleLine(sanitizeTitle(entry.title), entry))
       .sort((left, right) => getRememberedTitleSortTime(right[1]) - getRememberedTitleSortTime(left[1]))
       .slice(0, MAX_REMEMBERED_TITLES);
 
@@ -3177,7 +3510,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     return Object.entries(titles).some(([key, entry]) => {
       const rememberedTitle = sanitizeTitle(entry && entry.title);
-      return !currentKeySet.has(key) && isExpectedTitleLine(rememberedTitle) && rememberedTitle === currentTitle;
+      return !currentKeySet.has(key) && isRememberableTitleLine(rememberedTitle, entry) && rememberedTitle === currentTitle;
     });
   }
 
@@ -3799,9 +4132,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
             throw new Error("analyse arrêtée");
           }
 
-          const selectedOk = candidate.row.classList.contains("selected");
+          const selectedOk = candidate.row.classList.contains("selected") ||
+            getSelectedBiologyIndex() === candidate.index;
           const pdfUrl = getDisplayedPdfUrl();
-          return selectedOk && pdfUrl && (!targetPdfUrl || pdfUrl === targetPdfUrl) ? pdfUrl : null;
+          const messageBodyText = !targetPdfUrl ? extractWedaMessageBodyFallbackText() : "";
+          const hasExpectedDocument = targetPdfUrl ? pdfUrl === targetPdfUrl : Boolean(pdfUrl || messageBodyText);
+
+          return selectedOk && hasExpectedDocument ? (pdfUrl || messageBodyText) : null;
         }, {
           timeout: 25000,
           interval: 350,
@@ -3834,7 +4171,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       }
     }
 
-    throw new Error("le courrier affiché ne correspond pas au PDF envoyé à Heidi");
+    throw new Error("le courrier affiché ne correspond pas au document envoyé à Heidi");
   }
 
   async function fillAndSaveWedaTitle(title, result) {
@@ -4095,6 +4432,21 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       const currentTitle = sanitizeTitle(input.value);
 
       if (currentTitle !== title) {
+        if (shouldRespectManualTitleEdit(input, {
+          keys: buildWedaTitleManualEditContext(input, targetRow).keys,
+          title,
+        }, targetRow, currentTitle, title)) {
+          appendDebugLog("weda:title-stability-skip-manual-edit", {
+            jobId,
+            restoredCount,
+            currentLength: currentTitle.length,
+            titleLength: title.length,
+            targetRowIndex: targetRow.index,
+          });
+          setPanelStatus("Modification manuelle du titre détectée : le titre saisi est conservé.");
+          return false;
+        }
+
         restoredCount += 1;
         appendDebugLog("weda:title-restored-after-clear", {
           jobId,
@@ -4909,6 +5261,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           `Antécédent déjà présent ou très proche dans WEDA : ${job.item.label} [${job.item.code}].\nAucune fenêtre d'ajout n'a été ouverte.`,
           { sticky: true }
         );
+        closeWedaAtcdWorkerSoon(workerJobId, "already-known");
         return;
       }
 
@@ -5770,6 +6123,31 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     } catch (_error) {
       // Notification non critique.
     }
+  }
+
+  function closeWedaAtcdWorkerSoon(workerJobId = "", reason = "", delayMs = WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS) {
+    appendDebugLog("weda-atcd-worker:close-scheduled", {
+      workerJobId,
+      reason,
+      delayMs,
+    });
+
+    window.setTimeout(() => {
+      appendDebugLog("weda-atcd-worker:close", {
+        workerJobId,
+        reason,
+      });
+
+      try {
+        window.close();
+      } catch (error) {
+        appendDebugLog("weda-atcd-worker:close-failed", {
+          workerJobId,
+          reason,
+          error: error && error.message ? error.message : String(error),
+        });
+      }
+    }, Math.max(0, Number(delayMs) || 0));
   }
 
   async function initHeidi() {
@@ -8662,6 +9040,34 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     if (text.length < 4 || text.length > 260) {
+      return false;
+    }
+
+    if (/[\n\r•]/.test(text)) {
+      return false;
+    }
+
+    if (hasForbiddenHeidiLineText(text)) {
+      return false;
+    }
+
+    if (!/[a-zA-ZÀ-ÖØ-öø-ÿ0-9]/.test(text)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function isRememberableTitleLine(value, options = {}) {
+    return options && options.manualOverride
+      ? isRememberableManualTitleLine(value)
+      : isExpectedTitleLine(value);
+  }
+
+  function isRememberableManualTitleLine(value) {
+    const text = sanitizeTitle(value);
+
+    if (!text || text.length > 260) {
       return false;
     }
 
