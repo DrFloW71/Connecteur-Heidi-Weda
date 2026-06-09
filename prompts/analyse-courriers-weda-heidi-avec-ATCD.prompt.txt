@@ -54,16 +54,13 @@ Pour le bloc <ANTECEDENT_CIM10>, cherche si le courrier permet d’identifier un
 Consignes pour l’antécédent :
 - Répondre en français.
 - Ne jamais inventer d’information absente du document.
-- Retenir un diagnostic certifié, affirmé, posé ou confirmé.
-- Retenir aussi un résultat positif d’examen complémentaire, en particulier d’imagerie, s’il objective clairement une pathologie, une lésion, une anomalie structurale significative ou une complication utile au suivi en médecine générale.
-- Pour l’imagerie, un résultat positif peut être retenu même si le courrier ne dit pas explicitement “antécédent”, à condition qu’il soit affirmatif et suffisamment caractérisé : par exemple fracture, lithiase, anévrysme, sténose, tumeur ou nodule suspect, séquelle, malformation, hernie discale significative, arthrose évoluée, lésion dégénérative structurée, anomalie vasculaire, atteinte d’organe, masse ou kyste pathologique.
-- Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie mineure non spécifique, une variante anatomique, une anomalie en cours d’exploration non conclue, une absence de diagnostic ou une recommandation de dépistage.
+- Ne retenir qu’un diagnostic certifié, affirmé, posé ou confirmé.
+- Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie en cours d’exploration, une absence de diagnostic ou une recommandation de dépistage.
 - Ne pas retenir un antécédent simplement listé comme déjà connu dans le courrier, dans une rubrique “antécédents”, “ATCD”, “histoire connue”, “connu pour”, “suivi pour”, “porteur de” ou équivalent.
 - L’objectif est de signaler un antécédent nouveau par rapport à l'historique médical du patient.
 - Ne pas retenir un antécédent familial sauf si le courrier affirme explicitement qu’un antécédent familial doit être ajouté.
-- Si plusieurs nouveaux éléments certains sont présents, choisir le plus structurant pour le suivi en médecine générale.
-- Chercher le code CIM-10 français le plus adapté correspondant au nouvel antécédent ou au résultat positif.
-- Si le résultat d’imagerie positif ne correspond pas à un diagnostic CIM-10 parfaitement spécifique, choisir le code CIM-10 le plus proche : privilégier la pathologie ou la lésion identifiée ; à défaut, utiliser un code d’anomalie de résultat d’imagerie ou de constat anormal approprié.
+- Si plusieurs nouveaux diagnostics certifiés sont présents, choisir le plus structurant pour le suivi en médecine générale.
+- Chercher le code CIM-10 français le plus adapté correspondant au nouvel antécédent.
 - Si aucun nouvel antécédent certain n’est identifiable, mettre STATUT: NON et laisser les autres champs vides.
 
 Format de sortie obligatoire, sans texte avant ni après :

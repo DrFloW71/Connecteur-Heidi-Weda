@@ -53,6 +53,7 @@
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
   const WEDA_ATCD_PENDING_OPEN_MS = 90000;
   const WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS = 1500;
+  const WEDA_ATCD_WORKER_STARTUP_WATCHDOG_MS = 10000;
   const WEDA_ATCD_WORKER_BADGE_ID = "weda-courrier-heidi-atcd-worker-badge";
 
   const PANEL_ID = "weda-courrier-heidi-atcd-panel";
@@ -239,8 +240,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   const HEIDI_PROMPT = HEIDI_PROMPT_ACTIVE;
 
   const isWedaPage = location.hostname === WEDA_HOST && location.pathname.toLowerCase().startsWith(WEDA_PATH_PREFIX.toLowerCase());
-  const isWedaAtcdWorkerPage = location.hostname === WEDA_HOST && Boolean(getWedaAtcdWorkerJobIdForThisTab());
   const isHeidiPage = location.hostname === HEIDI_HOST;
+  const isWedaAtcdWorkerPage = location.hostname === WEDA_HOST && Boolean(getWedaAtcdWorkerJobIdForThisTab());
 
   if (isWedaPage) {
     initWeda();
@@ -4743,6 +4744,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     const workerUrl = buildWedaAtcdWorkerUrl(context.patientUrl, workerJobId);
     const background = WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND;
+    setPendingWedaAtcdWorkerOpen(workerJobId, result, item, context, "direct-patient-url");
 
     try {
       GM_openInTab(workerUrl, {
@@ -4750,6 +4752,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         insert: !background,
         setParent: true,
       });
+      scheduleWedaAtcdWorkerStartupWatchdog(workerJobId, workerUrl, 1);
       setPanelStatus(`Titre inséré. Worker WEDA ouvert pour préparer l'antécédent : ${item.label} [${item.code}].`);
       appendDebugLog("weda:atcd-worker-opened", {
         jobId: result.jobId,
@@ -4765,6 +4768,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         workerJobId,
         error: error.message,
       });
+      clearPendingWedaAtcdWorkerOpen(workerJobId);
       setPanelStatus("Titre inséré. Échec ouverture worker WEDA pour l'antécédent : " + error.message);
       return false;
     }
@@ -4784,15 +4788,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const now = Date.now();
 
     GM_setValue(WEDA_ATCD_JOB_KEY, workerJob);
-    GM_setValue(WEDA_ATCD_PENDING_OPEN_KEY, {
-      workerJobId,
-      sourceJobId: result && result.jobId ? result.jobId : "",
-      sourceWedaUrl: location.href,
+    setPendingWedaAtcdWorkerOpen(workerJobId, result, item, context, "pdf-parser-patient-name", {
       patientLabel,
-      itemCode: item.code,
-      itemLabel: item.label,
       createdAt: now,
-      expiresAt: now + WEDA_ATCD_PENDING_OPEN_MS,
     });
 
     const clicked = clickWedaHelperPatientNameForAntecedents(patientLauncher);
@@ -4839,6 +4837,86 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       item,
       rawHeidiAntecedent: result && result.antecedent ? result.antecedent : null,
     };
+  }
+
+  function setPendingWedaAtcdWorkerOpen(workerJobId, result, item, context = {}, source = "", extra = {}) {
+    const now = Number(extra.createdAt || 0) || Date.now();
+    const pending = {
+      workerJobId,
+      sourceJobId: result && result.jobId ? result.jobId : "",
+      sourceWedaUrl: location.href,
+      source,
+      patientId: context.patientId || "",
+      patientUrl: context.patientUrl || "",
+      patientLabel: extra.patientLabel || context.patientLabel || "",
+      itemCode: item && item.code ? item.code : "",
+      itemLabel: item && item.label ? item.label : "",
+      createdAt: now,
+      expiresAt: now + WEDA_ATCD_PENDING_OPEN_MS,
+    };
+
+    GM_setValue(WEDA_ATCD_PENDING_OPEN_KEY, pending);
+    appendDebugLog("weda:atcd-worker-pending-open-set", {
+      workerJobId,
+      source,
+      patientId: pending.patientId,
+      hasPatientUrl: Boolean(pending.patientUrl),
+      itemCode: pending.itemCode,
+      itemLabel: pending.itemLabel,
+      expiresInMs: WEDA_ATCD_PENDING_OPEN_MS,
+    });
+    return pending;
+  }
+
+  function clearPendingWedaAtcdWorkerOpen(workerJobId = "") {
+    const pending = GM_getValue(WEDA_ATCD_PENDING_OPEN_KEY, null);
+    if (!pending || (workerJobId && pending.workerJobId !== workerJobId)) {
+      return false;
+    }
+
+    GM_deleteValue(WEDA_ATCD_PENDING_OPEN_KEY);
+    return true;
+  }
+
+  function scheduleWedaAtcdWorkerStartupWatchdog(workerJobId, workerUrl, attempt = 1) {
+    window.setTimeout(() => {
+      const job = GM_getValue(WEDA_ATCD_JOB_KEY, null);
+      if (!job || job.id !== workerJobId) {
+        return;
+      }
+
+      if (job.status && job.status !== "PENDING_WEDA_WORKER") {
+        return;
+      }
+
+      appendDebugLog("weda:atcd-worker-startup-timeout", {
+        workerJobId,
+        attempt,
+        status: job.status || "",
+        workerUrlHash: hashString(workerUrl || ""),
+      });
+
+      if (attempt > 1 || !workerUrl) {
+        setPanelStatus("Antécédent détecté, mais le worker WEDA ne démarre pas. Onglet patient ouvert à vérifier.");
+        return;
+      }
+
+      try {
+        GM_openInTab(workerUrl, {
+          active: true,
+          insert: true,
+          setParent: true,
+        });
+        setPanelStatus("Le worker ATCD ne démarrait pas en arrière-plan : réouverture au premier plan...");
+        scheduleWedaAtcdWorkerStartupWatchdog(workerJobId, workerUrl, attempt + 1);
+      } catch (error) {
+        appendDebugLog("weda:atcd-worker-startup-reopen-failed", {
+          workerJobId,
+          attempt,
+          error: error && error.message ? error.message : String(error),
+        });
+      }
+    }, WEDA_ATCD_WORKER_STARTUP_WATCHDOG_MS);
   }
 
   function findWedaHelperPatientNameLauncher() {
@@ -5098,6 +5176,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       } catch (_error) {
         // sessionStorage peut être indisponible.
       }
+      clearPendingWedaAtcdWorkerOpen(fromHash);
       return fromHash;
     }
 
@@ -5143,6 +5222,21 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const currentPatientId = extractWedaPatDkFromUrl(location.href);
+    if (
+      pending.patientId &&
+      currentPatientId &&
+      !sameWedaPatDk(pending.patientId, currentPatientId)
+    ) {
+      appendDebugLog("weda-atcd-worker:pending-open-patient-mismatch", {
+        workerJobId: pending.workerJobId,
+        expectedPatientId: pending.patientId,
+        currentPatientId,
+        path: location.pathname,
+        search: location.search,
+      });
+      return "";
+    }
+
     const patch = {
       patientContextSource: job.patientContextSource || "pdfParserPatientName",
       patientOpenMode: job.patientOpenMode || "pending-open-adopted",
@@ -5431,24 +5525,106 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     assertWedaAtcdWorkerPatientMatches(job, "before_click_antecedents");
     showWedaAtcdWorkerBadge("Ouverture de la page Antécédents WEDA...", { sticky: true });
 
-    const clicked = clickGotoAntecedentsWeda();
+    const clicked = clickGotoAntecedentsWeda(job);
     if (!clicked) {
       throw new Error("bouton Antécédents WEDA introuvable");
     }
 
-    await waitForWedaAntecedentRootForAtcd(20000);
+    try {
+      await waitForWedaAntecedentRootForAtcd(12000);
+    } catch (error) {
+      if (isAntecedentPageWeda()) {
+        throw error;
+      }
+
+      appendDebugLog("weda-atcd-worker:goto-antecedents-wait-retry", {
+        workerJobId: job && job.id,
+        error: error && error.message ? error.message : String(error),
+        path: location.pathname,
+        search: location.search,
+      });
+
+      const fallbackClicked = callWedaPostBack(POSTBACK_ANTECEDENTS_WEDA, "");
+      appendDebugLog(fallbackClicked ? "weda-atcd-worker:goto-antecedents-postback-retry" : "weda-atcd-worker:goto-antecedents-postback-retry-missing", {
+        workerJobId: job && job.id,
+      });
+
+      if (!fallbackClicked) {
+        throw error;
+      }
+
+      await waitForWedaAntecedentRootForAtcd(20000);
+    }
+
     await waitForWedaIdleForAtcd();
     return true;
   }
 
-  function clickGotoAntecedentsWeda() {
-    const clickable = document.querySelector(SELECTOR_WEDA_GOTO_ANTECEDENTS);
+  function clickGotoAntecedentsWeda(job = null) {
+    const candidates = getWedaAntecedentsNavigationCandidates();
+    const clickable = candidates.find((element) => isElementVisible(element)) || candidates[0] || null;
+    appendDebugLog("weda-atcd-worker:goto-antecedents-candidates", {
+      workerJobId: job && job.id,
+      count: candidates.length,
+      first: candidates[0] || null,
+      visibleFirst: clickable || null,
+      hasPostBack: typeof ((typeof unsafeWindow !== "undefined" && unsafeWindow.__doPostBack) || window.__doPostBack) === "function",
+    });
+
     if (clickable) {
       clickButtonLikeUser(clickable);
+      appendDebugLog("weda-atcd-worker:goto-antecedents-click", {
+        workerJobId: job && job.id,
+        clickable,
+      });
       return true;
     }
 
-    return callWedaPostBack(POSTBACK_ANTECEDENTS_WEDA, "");
+    const posted = callWedaPostBack(POSTBACK_ANTECEDENTS_WEDA, "");
+    appendDebugLog(posted ? "weda-atcd-worker:goto-antecedents-postback" : "weda-atcd-worker:goto-antecedents-missing", {
+      workerJobId: job && job.id,
+    });
+    return posted;
+  }
+
+  function getWedaAntecedentsNavigationCandidates() {
+    const candidates = [];
+    const add = (element) => {
+      if (element && !candidates.includes(element)) {
+        candidates.push(element);
+      }
+    };
+
+    [
+      SELECTOR_WEDA_GOTO_ANTECEDENTS,
+      "#ContentPlaceHolder1_ButtonGotoAntecedent",
+      "[id$='ButtonGotoAntecedent']",
+      "[name='ctl00$ContentPlaceHolder1$ButtonGotoAntecedent']",
+    ].forEach((selector) => {
+      try {
+        Array.from(document.querySelectorAll(selector)).forEach(add);
+      } catch (_error) {
+        // Sélecteur best effort.
+      }
+    });
+
+    Array.from(document.querySelectorAll("a, button, input, [role='button'], [onclick]"))
+      .filter((element) => {
+        const text = normalizeForCompare([
+          element.innerText || element.textContent || "",
+          element.getAttribute("value") || "",
+          element.getAttribute("title") || "",
+          element.getAttribute("aria-label") || "",
+          element.id || "",
+          element.name || "",
+          element.getAttribute("onclick") || "",
+        ].join(" "));
+
+        return /antecedent/.test(text) && !/famil|chirurg/.test(text);
+      })
+      .forEach(add);
+
+    return candidates;
   }
 
   function callWedaPostBack(target, argument = "") {
