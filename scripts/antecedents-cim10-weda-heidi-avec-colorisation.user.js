@@ -2,7 +2,7 @@
 // @name         Antécédents CIM-10 WEDA avec Heidi AVEC colorisation
 // @namespace    http://tampermonkey.net/
 // @version      6.2
-// @description  Touche Début/Home : exporte les antécédents WEDA non codés vers Heidi Ask AI, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement.
+// @description  Touche Début/Home : exporte les antécédents WEDA non codés vers Heidi Ask AI, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @match        https://scribe.heidihealth.com/*
 // @all-frames   true
