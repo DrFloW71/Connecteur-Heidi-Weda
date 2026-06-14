@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF Heidi + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      2.3
-// @description  Analyse les courriers PDF de Weda Échanges avec Heidi, renseigne le titre et prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
+// @version      2.7
+// @description  Analyse les courriers PDF de Weda Échanges avec Heidi, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @match        https://scribe.heidihealth.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
+// @grant        GM_closeTab
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      secure.weda.fr
@@ -27,7 +28,7 @@
   const HEIDI_URL = "https://scribe.heidihealth.com/";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "2.3";
+  const SCRIPT_VERSION = "2.7";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
 
@@ -42,6 +43,7 @@
   const STATUS_KEY = `${STORAGE_PREFIX}status`;
   const DEBUG_LOG_KEY = `${STORAGE_PREFIX}debugLog.v1`;
   const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v1`;
+  const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v1`;
   const AUTO_SEEN_ROWS_KEY = `${STORAGE_PREFIX}autoSeenRows.v1`;
   const HEIDI_COURRIER_TAB_ROLE_KEY = `${STORAGE_PREFIX}heidiTabRole`;
   const HEIDI_COURRIER_SESSION_ID_KEY = `${STORAGE_PREFIX}heidiSessionId`;
@@ -51,8 +53,10 @@
   const WEDA_ATCD_WORKER_HASH_PREFIX = "AUTO_HH_WEDA_WORKER=";
   const WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND = true;
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
-  const WEDA_ATCD_PENDING_OPEN_MS = 90000;
-  const WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS = 1500;
+  const WEDA_ATCD_PENDING_OPEN_MS = 0; // 0 = pas d'expiration : le job ATCD reste récupérable jusqu'à validation humaine ou abandon manuel.
+  const WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS = 3000;
+  const WEDA_ATCD_WORKER_CLOSE_RETRY_MS = 700;
+  const WEDA_ATCD_WORKER_CLOSE_MAX_ATTEMPTS = 8;
   const WEDA_ATCD_WORKER_STARTUP_WATCHDOG_MS = 10000;
   const WEDA_ATCD_WORKER_BADGE_ID = "weda-courrier-heidi-atcd-worker-badge";
 
@@ -81,6 +85,20 @@
     "#messageContainer > div.messageAttachment.flexColStart.ng-star-inserted > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > input",
     "#messageContainer > div.messageAttachment.flexColStart > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > input",
   ].join(", ");
+  const DOC_SPECIALTY_PRIMARY_SELECTOR = [
+    "#messageContainer > div.messageAttachment.flexColStart.ng-star-inserted > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > select",
+    "#messageContainer > div.messageAttachment.flexColStart > we-doc-import > div > div:nth-child(1) > div.flexCol.ml10.flex1 > select",
+  ].join(", ");
+  const DOC_SPECIALTY_SELECTORS = [
+    DOC_SPECIALTY_PRIMARY_SELECTOR,
+    "#messageContainer select[title*='classification' i]",
+    "#messageContainer select.entry",
+    "#messageContainer > div.messageAttachment.flexColStart > we-doc-import select",
+    "#messageContainer we-doc-import select",
+    "we-doc-import select[title*='classification' i]",
+    "select[title*='Attribuer une classification' i]",
+    "#messageContainer select",
+  ].join(", ");
   const DOC_TITLE_FALLBACK_SELECTOR = "input.docTitle";
   const MESSAGE_BODY_TEXT_SELECTOR = [
     "#messageContainer > div.messageBody",
@@ -101,7 +119,7 @@
   const SELECTOR_WEDA_COMMENT = "#ContentPlaceHolder1_TextBoxAntecedentCommentaire";
   const SELECTOR_WEDA_DATE_PONCTUELLE = "#ContentPlaceHolder1_TextBoxAntecedentDatePonctuel";
   const SELECTOR_WEDA_VALID = "#ContentPlaceHolder1_ButtonValid";
-  const AUTO_INTERVAL_MS = 15 * 60 * 1000;
+  const AUTO_INTERVAL_MS = 5 * 60 * 1000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -141,6 +159,7 @@
   const HEIDI_CONTEXT_VISIBLE_SETTLE_MS = 1800;
   const HEIDI_CONTEXT_HIDDEN_SETTLE_MS = 8000;
   const MAX_REMEMBERED_TITLES = 5000;
+  const MAX_REMEMBERED_SPECIALTIES = 5000;
   const REMEMBERED_TITLE_TOUCH_INTERVAL_MS = 12 * 60 * 60 * 1000;
   const MAX_AUTO_SEEN_ROWS = 1000;
   const MAX_DEBUG_LOG_ENTRIES = 800;
@@ -156,7 +175,7 @@
   let patientImportBeforePdfStableKey = "";
   let lastPatientImportPerformanceStartTime = 0;
 
-  const HEIDI_PROMPT_ACTIVE = `Tu dois produire deux blocs balisés, et uniquement ces deux blocs.
+  const HEIDI_PROMPT_ACTIVE = `Tu dois produire trois blocs balisés, et uniquement ces trois blocs.
 
 Pour le bloc <TITRE_COURRIER>, applique strictement le prompt suivant, sans le modifier, et place uniquement la phrase finale obtenue entre les balises <TITRE_COURRIER> et </TITRE_COURRIER>.
 
@@ -207,6 +226,37 @@ Spé abrégée ou examen si utile : résultat principal ; CAT / ttt / suivi si m
 
 --- FIN DU PROMPT TITRE COURRIER ---
 
+Pour le bloc <SPECIALITE_COURRIER>, choisis la spécialité du courrier dans le menu WEDA.
+
+Réponds avec exactement une seule des catégories suivantes, sans phrase ni commentaire :
+- CARDIO/VASC (cardiologie, angiologie, chirurgie vasculaire)
+- GYNECO (gynécologie, obstétrique)
+- ORTHO/RHUMATO (traumatologie, rhumatologie, médecine du sport, neurochirurgie, chirurgie orthopédique)
+- ENDOC (endocrinologie, diabétologie, thyroïde)
+- HEPATO/GASTRO (gastro-entérologie, hépatologie, chirurgie digestive)
+- PNEUMO (pneumologie, sommeil, pathologie thoracique, bronchique, pleurale ou médiastinale)
+- NEURO (neurologie)
+- GERIA (gériatrie)
+- HEMATO (hématologie)
+- URO/NEPHRO (urologie, néphrologie)
+- ORL/STO (ORL, stomatologie)
+- DERMATO/ALLERGO (dermatologie, allergologie)
+- OPHTALMO (ophtalmologie)
+- THYMIE (psychiatrie, psychologie, thymie)
+- IMAGERIE (uniquement si le document est un compte rendu autonome d'imagerie/radiologie)
+- BIOLOGIE (résultat biologique, laboratoire, compte rendu d'analyses médicales)
+- Papier Administratif (MDPH, assurance, invalidité, administratif)
+
+Règles importantes pour <SPECIALITE_COURRIER> :
+- Une consultation ou un courrier de spécialiste contenant une échographie, radio, scanner ou IRM reste classé dans la spécialité clinique du courrier.
+- Choisir IMAGERIE uniquement si le document est lui-même un compte rendu d'imagerie autonome, sans consultation ni hospitalisation associée.
+- La spécialité doit suivre le problème médical principal, pas seulement la spécialité du signataire.
+- Si le motif principal est pulmonaire, thoracique, bronchique, pleural ou médiastinal, choisir PNEUMO même si le courrier provient d'un autre spécialiste.
+- Diabète ou endocrinologie : ENDOC.
+- Cancérologie : choisir la catégorie de l'organe d'origine.
+- Tumeur cérébrale/intracrânienne, méningiome, gliome, glioblastome : NEURO.
+- Métastases osseuses d'un cancer de la prostate : URO/NEPHRO.
+
 Pour le bloc <ANTECEDENT_CIM10>, cherche si le courrier permet d’identifier un éventuel nouvel antécédent à ajouter au dossier.
 
 Consignes pour l’antécédent :
@@ -228,6 +278,9 @@ Format de sortie obligatoire, sans texte avant ni après :
 <TITRE_COURRIER>
 Phrase de titre produite en appliquant strictement le prompt titre courrier ci-dessus.
 </TITRE_COURRIER>
+<SPECIALITE_COURRIER>
+Une seule catégorie parmi la liste autorisée ci-dessus.
+</SPECIALITE_COURRIER>
 <ANTECEDENT_CIM10>
 STATUT: OUI ou NON
 SECTION: medical ou chirurgical ou familial
@@ -301,7 +354,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     setupRememberedTitleAutofill();
-    window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 900);
+    window.setTimeout(() => applyRememberedDocumentFieldsForSelectedRow({ autoSave: true }), 900);
     setupAutoHeartbeat();
     handleAutoOnLoad();
   }
@@ -322,7 +375,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE COURRIERS PDF + ATCD</button>
-        <button type="button" id="wbh-auto">MODE AUTO 15 MIN</button>
+        <button type="button" id="wbh-auto">MODE AUTO 5 MIN</button>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-show-logs">Logs</button>
         <button type="button" id="wbh-copy-logs">Copier logs</button>
@@ -654,7 +707,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 15 MIN";
+      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 5 MIN";
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
     }
@@ -1295,14 +1348,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function clearRememberedTitles() {
-    const confirmed = window.confirm("Effacer tous les titres mémorisés par le script ?");
+    const confirmed = window.confirm("Effacer tous les titres et spécialités mémorisés par le script ?");
 
     if (!confirmed) {
       return;
     }
 
     GM_deleteValue(TITLES_KEY);
-    setPanelStatus("Mémoire des titres effacée.");
+    GM_deleteValue(SPECIALTIES_KEY);
+    setPanelStatus("Mémoire des titres et spécialités effacée.");
   }
 
   function resumeWedaWorkflow() {
@@ -2105,6 +2159,668 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       (targetPdfUrl && rootContainsPdfUrl(root, targetPdfUrl)) ||
       rootContainsAnyPdf(root)
     ));
+  }
+
+  function findWedaSpecialtySelect(options = {}) {
+    const titleInput = options.titleInput || null;
+    const targetPdfUrl = normalizePdfUrl(options.pdfUrl || options.targetPdfUrl || getDisplayedPdfUrl());
+    const displayedPdfElement = getDisplayedPdfEmbed();
+    const scopedRoot = options.root ||
+      (titleInput ? getWedaTitleAttachmentRoot(titleInput) : null) ||
+      findWedaPdfAttachmentRoot(targetPdfUrl, displayedPdfElement);
+    const container = scopedRoot || document.querySelector("#messageContainer") || document;
+    const candidates = [];
+
+    try {
+      candidates.push(...Array.from(document.querySelectorAll(DOC_SPECIALTY_PRIMARY_SELECTOR)));
+    } catch (_error) {
+      // Le sélecteur primaire reste un bonus, les fallbacks ci-dessous prennent le relais.
+    }
+
+    try {
+      candidates.push(...Array.from(container.querySelectorAll(scopedRoot ? "select" : DOC_SPECIALTY_SELECTORS)));
+    } catch (_error) {
+      // WEDA peut recréer le bloc d'import pendant la recherche.
+    }
+
+    const uniqueCandidates = candidates
+      .filter((select, index, list) => select && list.indexOf(select) === index)
+      .filter((select) => String(select.tagName || "").toLowerCase() === "select")
+      .filter((select) => !scopedRoot || scopedRoot.contains(select));
+
+    if (!uniqueCandidates.length) {
+      return null;
+    }
+
+    const scored = uniqueCandidates
+      .map((select, index) => ({
+        select,
+        index,
+        score: scoreWedaSpecialtySelect(select, {
+          ...options,
+          titleInput,
+          root: scopedRoot,
+        }),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return scored[0] ? scored[0].select : null;
+  }
+
+  function scoreWedaSpecialtySelect(select, options = {}) {
+    const optionText = Array.from(select.options || [])
+      .map((option) => option.textContent || option.label || option.value || "")
+      .join(" ");
+    const selectDescriptor = normalizeSpecialtyLabel([
+      select.getAttribute("title") || "",
+      select.getAttribute("name") || "",
+      select.id || "",
+      select.className || "",
+    ].join(" "));
+    const scopedRoot = options.root || null;
+    let score = isElementVisible(select) ? 1000 : 0;
+
+    if (scopedRoot && scopedRoot.contains(select)) {
+      score += 10000;
+    }
+
+    if (select.matches && select.matches(DOC_SPECIALTY_PRIMARY_SELECTOR)) {
+      score += 500;
+    }
+
+    if (/(classification|document|entry)/.test(selectDescriptor)) {
+      score += 650;
+    }
+
+    if (select.closest && select.closest("we-doc-import")) {
+      score += 250;
+    }
+
+    if (select.closest && select.closest("#messageContainer")) {
+      score += 100;
+    }
+
+    if (options.titleInput && document.contains(options.titleInput)) {
+      score += getWedaElementProximityScore(select, options.titleInput);
+      if (options.titleInput.compareDocumentPosition(select) & Node.DOCUMENT_POSITION_FOLLOWING) {
+        score += 350;
+      }
+
+      const titleRoot = getWedaTitleAttachmentRoot(options.titleInput);
+      if (titleRoot && titleRoot.contains(select)) {
+        score += 1000;
+      }
+
+      const titleColumn = options.titleInput.closest("div.flexCol.ml10.flex1, div.flexCol.flex1");
+      if (titleColumn && titleColumn.contains(select)) {
+        score += 450;
+      }
+    }
+
+    if (/(cardiologie|gynécologie|gynecologie|orthopédie|orthopedie|rhumatologie|neurologie|neurochirurgie|pneumologie|hématologie|hematologie|ophtalmologie|dermatologie|urologie|angiologie|chirurgie\s+vasculaire|gastro|hépato|hepato|proctologie|orl|dentiste|psychiatrie|psychologie|imagerie|administratif|biologie)/i.test(optionText)) {
+      score += 500;
+    }
+
+    return score;
+  }
+
+  function getWedaElementProximityScore(left, right) {
+    if (!left || !right || typeof left.getBoundingClientRect !== "function" || typeof right.getBoundingClientRect !== "function") {
+      return 0;
+    }
+
+    const leftRect = left.getBoundingClientRect();
+    const rightRect = right.getBoundingClientRect();
+    const distance = Math.abs((leftRect.top + leftRect.bottom) / 2 - (rightRect.top + rightRect.bottom) / 2);
+
+    return Math.max(0, 900 - Math.min(900, Math.round(distance)));
+  }
+
+  async function waitForWedaSpecialtySelect(timeoutMs = 5000, options = {}) {
+    try {
+      return await waitFor(() => findWedaSpecialtySelect(options), {
+        timeout: timeoutMs,
+        interval: 250,
+        description: "le menu spécialité Weda",
+      });
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function fillWedaSpecialtyFromHeidi(title, jobId = "", targetRow = null, options = {}, specialtyCode = "") {
+    const raw = options.raw || "";
+    const taggedSpecialtyCode = parseHeidiSpecialtyCode(extractTaggedBlock(raw, "SPECIALITE_COURRIER"));
+    const choice = resolveWedaSpecialtyChoice(title, specialtyCode || taggedSpecialtyCode, raw);
+
+    if (!choice) {
+      appendDebugLog("weda:specialty-skip-no-code", {
+        jobId,
+        specialtyCode,
+        taggedSpecialtyCode,
+        hasTaggedSpecialty: Boolean(extractTaggedBlock(raw, "SPECIALITE_COURRIER")),
+        titleLength: sanitizeTitle(title).length,
+      });
+      return null;
+    }
+
+    appendDebugLog("weda:specialty-choice-resolved", {
+      jobId,
+      specialtyCode,
+      taggedSpecialtyCode,
+      code: choice.code,
+      preferred: choice.optionNames,
+      reason: choice.reason,
+    });
+
+    const select = await waitForWedaSpecialtySelect(5000, options);
+
+    if (jobId && !isCurrentJobStillActive(jobId, ["savingTitle"])) {
+      appendDebugLog("weda:specialty-fill-cancelled-after-select-wait", {
+        jobId,
+        hasSelect: Boolean(select),
+        state: getState(),
+      });
+      return null;
+    }
+
+    if (!select) {
+      appendDebugLog("weda:specialty-select-missing", {
+        jobId,
+        code: choice.code,
+        preferred: choice.optionNames,
+      });
+      return null;
+    }
+
+    const selected = setWedaSpecialtySelectValue(select, choice);
+
+    if (!selected) {
+      appendDebugLog("weda:specialty-option-missing", {
+        jobId,
+        code: choice.code,
+        preferred: choice.optionNames,
+        availableOptions: Array.from(select.options || [])
+          .map((option) => normalizeText(option.textContent || option.label || option.value || ""))
+          .filter(Boolean)
+          .slice(0, 80),
+      });
+      return null;
+    }
+
+    appendDebugLog("weda:specialty-selected", {
+      jobId,
+      rowIndex: targetRow ? targetRow.index : null,
+      code: choice.code,
+      reason: choice.reason,
+      optionText: selected.optionText,
+      optionValue: selected.optionValue,
+    });
+
+    return {
+      ...choice,
+      ...selected,
+    };
+  }
+
+  function resolveWedaSpecialtyChoice(title = "", specialtyCode = "", raw = "") {
+    const source = `${title}\n${raw}`;
+    const detailSource = stripHeidiSpecialtyCodeLabels(source);
+    const explicitCode = parseHeidiSpecialtyCode(specialtyCode);
+    const detectedCode = detectHeidiSpecialtyCode(detailSource || source);
+    const pulmonaryEvidence = matchPulmonaryClinicalEvidence(source);
+    let code = pulmonaryEvidence ? "PNEUMO" : explicitCode || detectedCode;
+
+    if ((code === "IMAGERIE" || isWedaImagingDocument(source)) && isWedaStandaloneImagingDocument(source) && !isWedaClinicalDocument(source)) {
+      return buildWedaSpecialtyChoice("IMAGERIE", ["Imagerie"], "document-imagerie");
+    }
+
+    if (code === "IMAGERIE" && isWedaClinicalDocument(source)) {
+      code = detectedCode && detectedCode !== "IMAGERIE" ? detectedCode : "";
+    }
+
+    if (!code) {
+      return null;
+    }
+
+    if (code === "CARDIO/VASC") {
+      if (textMatchesSpecialtyPattern(detailSource, /\b(chirurgie\s+vasculaire|chirurgien\s+vasculaire|pontage|anevrysme|anévrysme|arteriopathie|artériopathie)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Chirurgie Vasculaire", "Angiologie", "Cardiologie - ECG"], "chirurgie-vasculaire");
+      }
+      if (textMatchesSpecialtyPattern(detailSource, /\b(angiologie|medecine\s+vasculaire|médecine\s+vasculaire|phlebologie|phlébologie|doppler|arteriel|artériel|arterielle|artérielle|veineux|veineuse)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Angiologie", "Chirurgie Vasculaire", "Cardiologie - ECG"], "angiologie");
+      }
+      return buildWedaSpecialtyChoice(code, ["Cardiologie - ECG", "Cardiologie", "Angiologie", "Chirurgie Vasculaire"], "cardiologie-par-defaut");
+    }
+
+    if (code === "ORTHO/RHUMATO") {
+      if (textMatchesSpecialtyPattern(detailSource, /\bneurochir(?:urgie|urgical|urgien)?\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Neurologie - Neurochirurgie", "Neurochirurgie", "Neurologie"], "neurochirurgie");
+      }
+      if (textMatchesSpecialtyPattern(detailSource, /\b(rhumato|polyarthrite|spondylarthrite|lupus|goutte|chondrocalcinose|connectivite|fibromyalgie|osteoporose|osteopenie)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Rhumatologie"], "rhumatologie");
+      }
+      return buildWedaSpecialtyChoice(code, ["Chirurgie Orthopédique", "Chirurgie orthopédique", "Chirurgie orthopedique", "Orthopédie", "Orthopedie"], "orthopedie-par-defaut");
+    }
+
+    if (code === "HEPATO/GASTRO") {
+      if (textMatchesSpecialtyPattern(detailSource, /\b(chirurgie\s+(?:digestive|viscerale|viscérale)|chirurgien\s+(?:digestif|visceral|viscéral))\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Chirurgie Viscérale", "Gastro Hépato Entérologie - Proctologie"], "chirurgie-digestive");
+      }
+      return buildWedaSpecialtyChoice(code, ["Gastro Hépato Entérologie - Proctologie", "Gastro Hépato Entérologie", "Gastro Hepato Enterologie", "Gastro entérologie"], "gastro-par-defaut");
+    }
+
+    if (code === "URO/NEPHRO") {
+      if (textMatchesSpecialtyPattern(detailSource, /\b(nephro|renal|renale|rein|reins|dialyse|hemodialyse|proteinurie|glomerulo|creatinine|insuffisance renale)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Urologie", "Néphrologie", "Nephrologie"], "nephrologie-via-urologie");
+      }
+      return buildWedaSpecialtyChoice(code, ["Urologie"], "urologie-par-defaut");
+    }
+
+    if (code === "ORL/STO") {
+      if (textMatchesSpecialtyPattern(detailSource, /\b(stomato|stomatologie|dentaire|dent|dents|buccal|bucco|mandibule|mandibulaire|maxillo|chirurgie orale)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Dentiste", "ORL", "Stomatologie"], "stomatologie-dentaire");
+      }
+      return buildWedaSpecialtyChoice(code, ["ORL", "O R L"], "orl-par-defaut");
+    }
+
+    if (code === "DERMATO/ALLERGO") {
+      if (textMatchesSpecialtyPattern(detailSource, /\b(allerg|allergologie|urticaire|anaphyl|prick|desensibilisation|immunotherapie|rhinite allergique)\b/)) {
+        return buildWedaSpecialtyChoice(code, ["Allergologie"], "allergologie");
+      }
+      return buildWedaSpecialtyChoice(code, ["Dermatologie"], "dermatologie-par-defaut");
+    }
+
+    const directChoices = {
+      GYNECO: ["Gynécologie", "Gynecologie"],
+      ENDOC: ["Endocrinologie"],
+      PNEUMO: ["Pneumologie"],
+      NEURO: ["Neurologie - Neurochirurgie", "Neurologie", "Neurochirurgie"],
+      GERIA: ["Gériatrie", "Geriatrie"],
+      HEMATO: ["Hématologie", "Hematologie"],
+      OPHTALMO: ["Ophtalmologie"],
+      THYMIE: ["Psychiatrie", "PSYCHOLOGIE", "Psychologie"],
+      IMAGERIE: ["Imagerie"],
+      BIOLOGIE: ["Biologie"],
+      "Papier Administratif": ["Administratif", "A.L.D.", "Arrêt / Accident de Travail", "Papier Administratif", "Document administratif", "Documents administratifs", "Médecine administrative"],
+    };
+
+    return directChoices[code] ? buildWedaSpecialtyChoice(code, directChoices[code], pulmonaryEvidence ? "probleme-clinique-pulmonaire-prioritaire" : "correspondance-directe") : null;
+  }
+
+  function buildWedaSpecialtyChoice(code, optionNames, reason) {
+    return {
+      code,
+      optionNames,
+      reason,
+    };
+  }
+
+  function parseHeidiSpecialtyCode(value = "") {
+    return detectHeidiSpecialtyCode(stripHeidiSpecialtyNoise(value));
+  }
+
+  function stripHeidiSpecialtyNoise(value = "") {
+    return String(value || "")
+      .replace(/<\/?SPECIALITE_COURRIER>/gi, "")
+      .replace(/^\s*(?:specialite|spécialité|specialite_courrier)\s*:?\s*/i, "")
+      .trim();
+  }
+
+  function isStandaloneHeidiSpecialtyCode(value = "") {
+    const compact = normalizeForCompare(stripHeidiSpecialtyNoise(value))
+      .replace(/[^a-z0-9/]+/g, "");
+    return [
+      "cardio/vasc",
+      "ortho/rhumato",
+      "hepato/gastro",
+      "uro/nephro",
+      "orl/sto",
+      "dermato/allergo",
+      "papieradministratif",
+      "imagerie",
+      "biologie",
+      "gyneco",
+      "endoc",
+      "pneumo",
+      "neuro",
+      "geria",
+      "hemato",
+      "ophtalmo",
+      "thymie",
+    ].includes(compact);
+  }
+
+  function detectHeidiSpecialtyCode(source = "") {
+    const text = normalizeForCompare(source).replace(/['’]/g, " ");
+    const compact = text.replace(/\s+/g, "");
+    const exactCodes = [
+      ["CARDIO/VASC", "cardio/vasc"],
+      ["ORTHO/RHUMATO", "ortho/rhumato"],
+      ["HEPATO/GASTRO", "hepato/gastro"],
+      ["URO/NEPHRO", "uro/nephro"],
+      ["ORL/STO", "orl/sto"],
+      ["DERMATO/ALLERGO", "dermato/allergo"],
+      ["Papier Administratif", "papieradministratif"],
+      ["IMAGERIE", "imagerie"],
+      ["BIOLOGIE", "biologie"],
+      ["GYNECO", "gyneco"],
+      ["ENDOC", "endoc"],
+      ["PNEUMO", "pneumo"],
+      ["NEURO", "neuro"],
+      ["GERIA", "geria"],
+      ["HEMATO", "hemato"],
+      ["OPHTALMO", "ophtalmo"],
+      ["THYMIE", "thymie"],
+    ];
+    const exact = exactCodes.find(([_code, marker]) => compact.includes(marker));
+
+    if (exact) {
+      return exact[0];
+    }
+
+    if (/^\s*(?:bio|biologie|laboratoire)\b/.test(text)) {
+      return "BIOLOGIE";
+    }
+
+    const keywordRules = [
+      ["CARDIO/VASC", /\b(cardio|cardiologie|angiologie|chirurgie\s+vasculaire|vasculaire|medecine\s+vasculaire|phlebologie|arterite|arteriel|arterielle|veineux|veineuse|coronar|rythmo|hta|holter|ecg)\b/],
+      ["GYNECO", /\b(gyneco|gynecologie|obstetrique|grossesse|uterus|uterin|endometre|ovaire|ovarien|pelvien|pelvienne|mammographie|mammaire|sein|senologie)\b/],
+      ["ORTHO/RHUMATO", /\b(ortho|orthopedie|chirurgie\s+orthopedique|rhumato|rhumatologie|traumato|traumatologie|medecine\s+du\s+sport|neurochir|neurochirurgie|fracture|arthrose|prothese|rachis|tendon|ligament|menisque)\b/],
+      ["ENDOC", /\b(endoc|endocrino|diabete|thyroide|dysthyroidie|surrenale)\b/],
+      ["HEPATO/GASTRO", /\b(hepato|gastro|gastroenterologie|digestif|digestive|chirurgie\s+digestive|foie|hepatique|colon|coloscopie|estomac|pancreas|biliaire)\b/],
+      ["PNEUMO", /\b(pneumo|pneumologie|sommeil|medecine\s+du\s+sommeil|apnee|bronche|bpco|asthme|spirometrie|polygraphie|polysomnographie)\b/],
+      ["NEURO", /\b(neurologie|neurologue|epilepsie|avc|parkinson|migraine|encephale|emg)\b/],
+      ["GERIA", /\b(geria|geriatrie|gerontologie|ehpad|fragilite)\b/],
+      ["HEMATO", /\b(hemato|hematologie|lymphome|leucemie|myelome|anemie|polyglobulie|thrombopenie|thrombocytopenie)\b/],
+      ["URO/NEPHRO", /\b(uro|urologie|nephro|nephrologie|prostate|vessie|rein|renal|sonde urinaire)\b/],
+      ["ORL/STO", /\b(orl|stomato|stomatologie|amygdale|amygdalectomie|otite|audition|sinus|larynx|dentaire)\b/],
+      ["DERMATO/ALLERGO", /\b(dermato|dermatologie|allergo|allergologie|allergies?|eczema|psoriasis|urticaire|naevus|melanome)\b/],
+      ["OPHTALMO", /\b(ophtalmo|ophtalmologie|retine|cataracte|glaucome|macula|oct)\b/],
+      ["IMAGERIE", /\b(scanner|irm|radiographie|radio(?:graphie)?|echographie|echocardiographie|mammographie|scintigraphie|tdm|tomodensitometrie|pet\s*scan|tep|osteodensitometrie|densitometrie|doppler|angioscanner|arthroscanner|cone\s*beam|panoramique\s+dentaire)\b/],
+      ["BIOLOGIE", /\b(biologie|bio|laboratoire|analyse(?:s)?\s+medicale(?:s)?|bilan\s+biologique|prise\s+de\s+sang|hemogramme|hémogramme|nfs|ionogramme|creatinine|créatinine|glycemie|glycémie|hba1c|tsh)\b/],
+      ["THYMIE", /\b(thymie|psychiatrie|psychiatre|psychologie|psychologue|depression|anxiete|bipolaire|psychose|sante\s+mentale)\b/],
+      ["Papier Administratif", /\b(administratif|mdph|assurance|invalidite|certificat|dossier\s+administratif)\b/],
+    ];
+    const keyword = keywordRules.find(([_code, pattern]) => pattern.test(text));
+
+    return keyword ? keyword[0] : "";
+  }
+
+  function matchPulmonaryClinicalEvidence(source = "") {
+    const text = normalizeForCompare(source).replace(/['’]/g, " ");
+    const patterns = [
+      /\b(lesion|lesions|nodule|nodules|masse|opacite|opacites|foyer|foyers|tumeur|tumoral|tumorale|neoplasie|cancer|adenocarcinome|carcinome)\s+(?:du\s+)?(?:poumon|pulmonaire|pulmonaires|bronchique|broncho\s*pulmonaire|pleural|pleurale|mediastinal|mediastinale|thoracique)\b/,
+      /\b(?:poumon|pulmonaire|pulmonaires|bronchique|broncho\s*pulmonaire|pleural|pleurale|mediastinal|mediastinale|thoracique)\s+(lesion|lesions|nodule|nodules|masse|opacite|opacites|foyer|foyers|tumeur|tumoral|tumorale|neoplasie|cancer|adenocarcinome|carcinome)\b/,
+      /\b(pathologie|atteinte|anomalie)\s+(?:du\s+)?(?:poumon|pulmonaire|pleurale|bronchique|thoracique|mediastinale)\b/,
+      /\b(pneumologue|pneumologie|oncopneumologie|chirurgie\s+thoracique|thoracoscopie|fibroscopie\s+bronchique|bronchoscopie)\b/,
+    ];
+    const matched = patterns.find((pattern) => pattern.test(text));
+    const match = matched ? text.match(matched) : null;
+
+    return match && match[0] ? normalizeText(match[0]).slice(0, 180) : "";
+  }
+
+  function textMatchesSpecialtyPattern(source = "", pattern) {
+    return pattern.test(normalizeForCompare(source).replace(/['’]/g, " "));
+  }
+
+  function isWedaImagingDocument(source = "") {
+    return isWedaStandaloneImagingDocument(source);
+  }
+
+  function isWedaStandaloneImagingDocument(source = "") {
+    const title = getWedaHeidiTitleLine(source);
+    if (!title || isWedaClinicalDocument(source)) {
+      return false;
+    }
+
+    return /^(?:cr\s+)?(?:compte\s+rendu\s+)?(?:d[' ]?)?(?:imagerie|radiologie|radiographie|radio|echographie|echocardiographie|scanner|irm|mammographie|scintigraphie|tdm|tomodensitometrie|pet\s*scan|tep|osteodensitometrie|densitometrie|doppler|angioscanner|arthroscanner|cone\s*beam|panoramique\s+dentaire)\b/.test(title) ||
+      /\b(?:compte\s+rendu|cr)\s+(?:d[' ]?)?(?:imagerie|radiologie|radiographie|echographie|scanner|irm|mammographie|doppler)\b/.test(title);
+  }
+
+  function isWedaClinicalDocument(source = "") {
+    const title = getWedaHeidiTitleLine(source);
+    if (!title) {
+      return false;
+    }
+
+    if (/\b(?:consultation|hospitalisation|sortie\s+d[' ]?hospitalisation|lettre\s+de\s+liaison|compte\s+rendu\s+de\s+consultation|cr\s+de\s+consultation|visite|avis\s+specialise|suivi)\b/.test(title)) {
+      return true;
+    }
+
+    return /\b(?:cardiologie|angiologie|rhumatologie|orthopedie|traumatologie|endocrinologie|gastro|pneumologie|neurologie|geriatrie|hematologie|urologie|nephrologie|orl|stomatologie|dermatologie|allergologie|ophtalmologie|psychiatrie)\b/.test(title) &&
+      /\b(?:consultation|compte\s+rendu|courrier|avis|suivi)\b/.test(title);
+  }
+
+  function getWedaHeidiTitleLine(source = "") {
+    return normalizeForCompare(String(source || "")
+      .split(/\n+/)
+      .map((line) => normalizeText(line))
+      .find(Boolean) || "")
+      .replace(/['’]/g, " ");
+  }
+
+  function stripHeidiSpecialtyCodeLabels(value = "") {
+    return String(value || "")
+      .replace(/\bCARDIO\s*\/\s*VASC\b/gi, " ")
+      .replace(/\bORTHO\s*\/\s*RHUMATO\b/gi, " ")
+      .replace(/\bHEPATO\s*\/\s*GASTRO\b/gi, " ")
+      .replace(/\bURO\s*\/\s*NEPHRO\b/gi, " ")
+      .replace(/\bORL\s*\/\s*STO\b/gi, " ")
+      .replace(/\bDERMATO\s*\/\s*ALLERGO\b/gi, " ")
+      .replace(/\bPAPIER\s+ADMINISTRATIF\b/gi, " ")
+      .replace(/\b(?:IMAGERIE|BIOLOGIE|GYNECO|ENDOC|PNEUMO|NEURO|GERIA|HEMATO|OPHTALMO|THYMIE)\b/gi, " ");
+  }
+
+  function setWedaSpecialtySelectValue(select, choice) {
+    const option = findWedaSpecialtyOption(select, choice);
+
+    if (!select || !option) {
+      return null;
+    }
+
+    try {
+      select.focus();
+    } catch (_error) {
+      // Les événements ci-dessous notifient quand même WEDA.
+    }
+
+    Array.from(select.options || []).forEach((candidate) => {
+      candidate.selected = candidate === option;
+    });
+
+    setNativeSelectValue(select, option.value);
+    dispatchWedaSelectValueEvents(select);
+
+    try {
+      select.blur();
+    } catch (_error) {
+      // Le changement est déjà transmis.
+    }
+
+    return {
+      optionText: normalizeText(option.textContent || option.label || option.value || ""),
+      optionValue: option.value,
+    };
+  }
+
+  function setNativeSelectValue(select, value) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+
+    if (descriptor && typeof descriptor.set === "function") {
+      descriptor.set.call(select, value);
+    } else {
+      select.value = value;
+    }
+  }
+
+  function dispatchWedaSelectValueEvents(select) {
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    select.dispatchEvent(new KeyboardEvent("keydown", enterKeyOptions()));
+    select.dispatchEvent(new KeyboardEvent("keyup", enterKeyOptions()));
+  }
+
+  function findWedaSpecialtyOption(select, choiceOrNames = []) {
+    if (!select) {
+      return null;
+    }
+
+    const choice = Array.isArray(choiceOrNames) ? { optionNames: choiceOrNames } : choiceOrNames || {};
+    const options = Array.from(select.options || [])
+      .filter((option) => option && !option.disabled);
+    const optionNames = Array.isArray(choice.optionNames) ? choice.optionNames : [];
+    const targets = optionNames
+      .concat(choice.optionText || "", choice.code || "", getWedaSpecialtyOptionAliasesForCode(choice.code || ""))
+      .map((name) => normalizeSpecialtyLabel(name))
+      .filter(Boolean);
+
+    if (choice.optionValue) {
+      const exactValue = options.find((option) => String(option.value || "") === String(choice.optionValue || ""));
+      if (exactValue) {
+        return exactValue;
+      }
+    }
+
+    for (const target of targets) {
+      const exact = options.find((option) => getWedaOptionLabels(option).some((label) => label === target));
+      if (exact) {
+        return exact;
+      }
+    }
+
+    for (const target of targets) {
+      const contained = options.find((option) => getWedaOptionLabels(option).some((label) => label && target && label.includes(target)));
+      if (contained) {
+        return contained;
+      }
+    }
+
+    const scored = options
+      .map((option, index) => ({
+        option,
+        index,
+        score: scoreWedaSpecialtyOption(option, targets),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    if (scored[0]) {
+      return scored[0].option;
+    }
+
+    return null;
+  }
+
+  function getWedaSpecialtyOptionAliasesForCode(code = "") {
+    const aliases = {
+      "CARDIO/VASC": ["Cardiologie - ECG", "Angiologie", "Chirurgie Vasculaire", "Cardiologie"],
+      GYNECO: ["Gynécologie", "Gynecologie"],
+      "ORTHO/RHUMATO": ["Chirurgie Orthopédique", "Rhumatologie", "Neurologie - Neurochirurgie"],
+      ENDOC: ["Endocrinologie"],
+      "HEPATO/GASTRO": ["Gastro Hépato Entérologie - Proctologie", "Chirurgie Viscérale"],
+      PNEUMO: ["Pneumologie"],
+      NEURO: ["Neurologie - Neurochirurgie", "Neurologie"],
+      GERIA: ["Gériatrie", "Geriatrie"],
+      HEMATO: ["Hématologie", "Hematologie"],
+      "URO/NEPHRO": ["Urologie"],
+      "ORL/STO": ["ORL", "Dentiste"],
+      "DERMATO/ALLERGO": ["Dermatologie", "Allergologie"],
+      OPHTALMO: ["Ophtalmologie"],
+      THYMIE: ["Psychiatrie", "PSYCHOLOGIE", "Psychologie"],
+      IMAGERIE: ["Imagerie"],
+      BIOLOGIE: ["Biologie"],
+      "Papier Administratif": ["Administratif", "A.L.D.", "Arrêt / Accident de Travail"],
+    };
+
+    return aliases[code] || [];
+  }
+
+  function scoreWedaSpecialtyOption(option, targets = []) {
+    if (!option) {
+      return 0;
+    }
+
+    const labels = getWedaOptionLabels(option);
+    let bestScore = 0;
+
+    labels.forEach((label) => {
+      if (!label || label === "0" || label === "...") {
+        return;
+      }
+
+      targets.forEach((target) => {
+        if (!target) {
+          return;
+        }
+
+        if (label === target) {
+          bestScore = Math.max(bestScore, 1000);
+          return;
+        }
+
+        if (label.includes(target)) {
+          bestScore = Math.max(bestScore, 850);
+          return;
+        }
+
+        if (target.includes(label) && label.length >= 4) {
+          bestScore = Math.max(bestScore, 700);
+          return;
+        }
+
+        const targetTokens = getSpecialtyMatchTokens(target);
+        const labelTokens = getSpecialtyMatchTokens(label);
+        const hits = targetTokens.filter((token) => labelTokens.includes(token)).length;
+        if (hits >= Math.min(2, targetTokens.length)) {
+          bestScore = Math.max(bestScore, 350 + hits * 90);
+        }
+      });
+    });
+
+    return bestScore;
+  }
+
+  function getSpecialtyMatchTokens(label = "") {
+    return normalizeSpecialtyLabel(label)
+      .split(/\s+/)
+      .filter((token) => token.length >= 4 && !["avec", "pour", "document", "papier"].includes(token));
+  }
+
+  function isWedaSpecialtySelectionPresent(select, selection) {
+    if (!select || !selection) {
+      return false;
+    }
+
+    if (selection.optionValue && select.value === selection.optionValue) {
+      return true;
+    }
+
+    const selectedOption = Array.from(select.options || []).find((option) => option.selected) || null;
+    const selectedLabels = selectedOption ? getWedaOptionLabels(selectedOption) : [];
+    const expectedLabels = (selection.optionNames || [])
+      .concat(selection.optionText || "", selection.code || "", getWedaSpecialtyOptionAliasesForCode(selection.code || ""))
+      .map((name) => normalizeSpecialtyLabel(name))
+      .filter(Boolean);
+
+    return expectedLabels.some((expected) => selectedLabels.some((label) => label === expected || label.includes(expected))) ||
+      scoreWedaSpecialtyOption(selectedOption, expectedLabels) > 0;
+  }
+
+  function getWedaOptionLabels(option) {
+    return [
+      option.textContent || "",
+      option.label || "",
+      option.value || "",
+    ].map((value) => normalizeSpecialtyLabel(value)).filter(Boolean);
+  }
+
+  function normalizeSpecialtyLabel(value) {
+    return normalizeForCompare(value)
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   function findImportMessageLink() {
@@ -2942,18 +3658,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const list = document.querySelector(MESSAGE_LIST_SELECTOR);
     if (list) {
       list.addEventListener("click", () => {
-        window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 1500);
+        window.setTimeout(() => applyRememberedDocumentFieldsForSelectedRow({ autoSave: true }), 1500);
       }, true);
     }
 
     if (!titleAutofillInterval) {
       titleAutofillInterval = window.setInterval(() => {
-        applyRememberedTitleForSelectedRow({ autoSave: true, silent: true, enforcePriority: true });
+        applyRememberedDocumentFieldsForSelectedRow({ autoSave: true, silent: true, enforcePriority: true });
       }, TITLE_PRIORITY_WATCH_INTERVAL_MS);
     }
 
     const container = document.querySelector("#messageContainer") || document.body;
     setupWedaTitleManualEditTracking(container);
+    setupWedaSpecialtyManualEditTracking(container);
 
     if (!container || typeof MutationObserver === "undefined") {
       return;
@@ -2962,13 +3679,165 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     let timer = null;
     const observer = new MutationObserver(() => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 500);
+      timer = window.setTimeout(() => applyRememberedDocumentFieldsForSelectedRow({ autoSave: true }), 500);
     });
 
     observer.observe(container, {
       childList: true,
       subtree: true,
     });
+  }
+
+  async function applyRememberedDocumentFieldsForSelectedRow(options = {}) {
+    await applyRememberedTitleForSelectedRow(options);
+    await sleep(80);
+    return applyRememberedSpecialtyForSelectedRow(options);
+  }
+
+  function setupWedaSpecialtyManualEditTracking(container) {
+    if (!container || container.__wbhSpecialtyManualEditTracking) {
+      return;
+    }
+
+    try {
+      container.__wbhSpecialtyManualEditTracking = true;
+    } catch (_error) {
+      // La protection anti-double listener reste best effort.
+    }
+
+    ["change", "input"].forEach((eventName) => {
+      container.addEventListener(eventName, handleWedaSpecialtyManualEditEvent, true);
+    });
+  }
+
+  function handleWedaSpecialtyManualEditEvent(event) {
+    if (!event || event.isTrusted === false) {
+      return;
+    }
+
+    const select = getWedaSpecialtySelectFromEvent(event);
+    if (!select) {
+      return;
+    }
+
+    rememberManualEditedWedaSpecialty(select, event.type);
+  }
+
+  function getWedaSpecialtySelectFromEvent(event) {
+    const target = event && event.target;
+    if (isWedaSpecialtySelectElement(target)) {
+      return target;
+    }
+
+    if (target && typeof target.closest === "function") {
+      const closest = target.closest("select");
+      return isWedaSpecialtySelectElement(closest) ? closest : null;
+    }
+
+    return null;
+  }
+
+  function isWedaSpecialtySelectElement(element) {
+    if (!element || String(element.tagName || "").toLowerCase() !== "select") {
+      return false;
+    }
+
+    const bestSelect = findWedaSpecialtySelect({
+      titleInput: findWedaTitleInput(),
+      pdfUrl: getDisplayedPdfUrl(),
+    });
+
+    if (bestSelect === element) {
+      return true;
+    }
+
+    const optionText = Array.from(element.options || [])
+      .map((option) => option.textContent || option.label || option.value || "")
+      .join(" ");
+    const descriptor = normalizeSpecialtyLabel([
+      element.getAttribute("title") || "",
+      element.getAttribute("name") || "",
+      element.id || "",
+      element.className || "",
+      optionText,
+    ].join(" "));
+
+    return Boolean(
+      element.closest &&
+      element.closest("#messageContainer, we-doc-import") &&
+      /(classification|attribuer une classification|cardiologie|gynécologie|gynecologie|imagerie|biologie|pneumologie|dermatologie|urologie|psychiatrie|psychologie|rhumatologie|ophtalmologie|gastro|hépato|hepato|orl)/i.test(descriptor)
+    );
+  }
+
+  function rememberManualEditedWedaSpecialty(select, eventType = "change") {
+    const item = getSelectedBiologyItem();
+    const context = buildWedaSpecialtyMemoryContext(select, item);
+
+    if (!context.keys.length) {
+      return false;
+    }
+
+    const selection = buildWedaSpecialtySelectionFromSelect(select);
+
+    if (!selection) {
+      forgetSpecialtyKeys(context.keys);
+      appendDebugLog("weda:specialty-manual-cleared", {
+        rowIndex: context.rowIndex,
+        rowStableKey: context.rowStableKey,
+        keys: context.keys,
+        eventType,
+      });
+      return false;
+    }
+
+    const metadata = {
+      rowStableKey: context.rowStableKey || "",
+      rowIdentity: context.rowIdentity || "",
+      pdfUrlHash: context.pdfUrlHash || "",
+      contentKey: context.contentKey || "",
+      urlKey: context.urlKey || "",
+      manualOverride: true,
+      manualUpdatedAt: Date.now(),
+    };
+
+    context.keys.forEach((key) => rememberSpecialty(key, selection, metadata));
+
+    appendDebugLog("weda:specialty-manual-remembered", {
+      rowIndex: context.rowIndex,
+      rowStableKey: context.rowStableKey,
+      keys: context.keys,
+      eventType,
+      optionText: selection.optionText || "",
+      optionValue: selection.optionValue || "",
+    });
+
+    return true;
+  }
+
+  function buildWedaSpecialtySelectionFromSelect(select) {
+    if (!select) {
+      return null;
+    }
+
+    const option = Array.from(select.options || []).find((candidate) => candidate.selected) ||
+      Array.from(select.options || []).find((candidate) => String(candidate.value || "") === String(select.value || ""));
+
+    if (!option || String(option.value || "") === "0") {
+      return null;
+    }
+
+    const optionText = normalizeText(option.textContent || option.label || option.value || "");
+    if (!optionText || optionText === "...") {
+      return null;
+    }
+
+    return {
+      code: detectHeidiSpecialtyCode(optionText) || "",
+      optionNames: [optionText],
+      optionText,
+      optionValue: String(option.value || ""),
+      reason: "selection-weda-manuelle",
+    };
   }
 
   function setupWedaTitleManualEditTracking(container) {
@@ -3515,6 +4384,330 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
   }
 
+  async function applyRememberedSpecialtyForSelectedRow(options = {}) {
+    const state = getState();
+
+    if (state.running && state.phase === "savingTitle") {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-specialty-skip-saving-title", {
+          currentIndex: state.currentIndex,
+          currentJobId: state.currentJobId || "",
+        });
+      }
+      return false;
+    }
+
+    const item = getSelectedBiologyItem();
+
+    if (item && !isDisplayedBiologyForRow(item)) {
+      return false;
+    }
+
+    const urlKey = getDisplayedPdfUrlKey();
+    const rememberedEntry = getRememberedSpecialtyForKeys([
+      urlKey,
+      item && item.key,
+      item && item.stableKey,
+    ]);
+    const remembered = rememberedEntry.selection;
+
+    if (!remembered) {
+      return false;
+    }
+
+    const titleInput = findWedaTitleInput();
+    const select = findWedaSpecialtySelect({
+      titleInput,
+      pdfUrl: getDisplayedPdfUrl(),
+      urlKey,
+    });
+
+    if (!select) {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-specialty-select-missing", {
+          rowIndex: item ? item.index : null,
+          rememberedKey: rememberedEntry.key,
+          lookupKeys: rememberedEntry.keys,
+        });
+      }
+      return false;
+    }
+
+    if (isWedaSpecialtySelectionPresent(select, remembered)) {
+      touchRememberedSpecialtyKeys(rememberedEntry.keys, remembered);
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-specialty-already-present", {
+          rowIndex: item ? item.index : null,
+          rememberedKey: rememberedEntry.key,
+          optionText: remembered.optionText || "",
+          optionValue: remembered.optionValue || "",
+        });
+      }
+      return true;
+    }
+
+    const selected = setWedaSpecialtySelectValue(select, remembered);
+
+    if (!selected) {
+      appendDebugLog("weda:remembered-specialty-option-missing", {
+        rowIndex: item ? item.index : null,
+        rememberedKey: rememberedEntry.key,
+        optionText: remembered.optionText || "",
+        optionValue: remembered.optionValue || "",
+        code: remembered.code || "",
+        availableOptions: Array.from(select.options || [])
+          .map((option) => normalizeText(option.textContent || option.label || option.value || ""))
+          .filter(Boolean)
+          .slice(0, 80),
+      });
+      return false;
+    }
+
+    touchRememberedSpecialtyKeys(rememberedEntry.keys, remembered);
+
+    appendDebugLog("weda:remembered-specialty-applied", {
+      rowIndex: item ? item.index : null,
+      rememberedKey: rememberedEntry.key,
+      optionText: selected.optionText || "",
+      optionValue: selected.optionValue || "",
+      code: remembered.code || "",
+    });
+
+    if (!options.noRetry) {
+      window.setTimeout(() => {
+        const freshSelect = findWedaSpecialtySelect({
+          titleInput: findWedaTitleInput(),
+          pdfUrl: getDisplayedPdfUrl(),
+          urlKey,
+        });
+
+        if (!freshSelect || isWedaSpecialtySelectionPresent(freshSelect, remembered)) {
+          return;
+        }
+
+        setWedaSpecialtySelectValue(freshSelect, remembered);
+        appendDebugLog("weda:remembered-specialty-retry-applied", {
+          rowIndex: item ? item.index : null,
+          rememberedKey: rememberedEntry.key,
+          optionText: remembered.optionText || "",
+          optionValue: remembered.optionValue || "",
+        });
+      }, 600);
+    }
+
+    if (!options.silent) {
+      const lineLabel = item ? " pour le courrier " + (item.index + 1) : "";
+      setPanelStatus("Spécialité mémorisée réaffichée" + lineLabel + ".");
+    }
+
+    return true;
+  }
+
+  function buildWedaSpecialtyMemoryContext(select = null, rowOverride = null) {
+    const state = getState();
+    const item = rowOverride || getSelectedBiologyItem();
+    const urlKey = getDisplayedPdfUrlKey();
+    const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
+    const keys = [
+      urlKey,
+      item && item.key,
+      item && item.stableKey,
+      stateMatchesItem && state.currentContentKey,
+      stateMatchesItem && state.currentUrlKey,
+      stateMatchesItem && state.lastTitleKey,
+    ].filter(Boolean);
+
+    return {
+      keys: Array.from(new Set(keys)),
+      rowIndex: item ? item.index : state.currentIndex,
+      rowStableKey: item ? item.stableKey : state.currentStableKey,
+      rowIdentity: item ? item.identityLabel : "",
+      pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
+      contentKey: stateMatchesItem ? state.currentContentKey || "" : "",
+      urlKey: stateMatchesItem ? state.currentUrlKey || urlKey : urlKey,
+      select,
+    };
+  }
+
+  function rememberSpecialty(rowKey, selection, metadata = {}) {
+    if (!rowKey || !selection) {
+      return;
+    }
+
+    const cleanSelection = sanitizeRememberedSpecialty(selection);
+
+    if (!cleanSelection) {
+      appendDebugLog("weda:remember-specialty-rejected", {
+        rowKey,
+        hasSelection: Boolean(selection),
+      });
+      return;
+    }
+
+    const specialties = GM_getValue(SPECIALTIES_KEY, {});
+    const previous = specialties[rowKey] || {};
+    const now = Date.now();
+    specialties[rowKey] = {
+      ...previous,
+      ...metadata,
+      selection: cleanSelection,
+      createdAt: previous.createdAt || now,
+      updatedAt: now,
+      lastUsedAt: previous.lastUsedAt || now,
+    };
+
+    GM_setValue(SPECIALTIES_KEY, pruneRememberedSpecialties(specialties));
+  }
+
+  function sanitizeRememberedSpecialty(selection = {}) {
+    const optionText = normalizeText(selection.optionText || "");
+    const optionValue = String(selection.optionValue || "").trim();
+    const code = parseHeidiSpecialtyCode(selection.code || "") || detectHeidiSpecialtyCode(optionText) || "";
+    const optionNames = Array.from(new Set((Array.isArray(selection.optionNames) ? selection.optionNames : [])
+      .concat(optionText || "")
+      .concat(getWedaSpecialtyOptionAliasesForCode(code))
+      .map((name) => normalizeText(name))
+      .filter(Boolean)));
+
+    if ((!optionText && !code && !optionNames.length) || optionValue === "0") {
+      return null;
+    }
+
+    return {
+      code,
+      optionNames,
+      optionText,
+      optionValue,
+      reason: normalizeText(selection.reason || "memoire-specialite"),
+    };
+  }
+
+  function getRememberedSpecialty(rowKey) {
+    if (!rowKey) {
+      return null;
+    }
+
+    const specialties = GM_getValue(SPECIALTIES_KEY, {});
+    const entry = specialties[rowKey];
+    const selection = sanitizeRememberedSpecialty(entry && entry.selection);
+
+    if (entry && !selection) {
+      delete specialties[rowKey];
+      GM_setValue(SPECIALTIES_KEY, specialties);
+      appendDebugLog("weda:remembered-specialty-dropped", {
+        rowKey,
+      });
+      return null;
+    }
+
+    return selection;
+  }
+
+  function getRememberedSpecialtyForKeys(keys) {
+    const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
+
+    for (const key of lookupKeys) {
+      const selection = getRememberedSpecialty(key);
+      if (selection) {
+        return { key, keys: lookupKeys, selection };
+      }
+    }
+
+    return { key: "", keys: lookupKeys, selection: null };
+  }
+
+  function touchRememberedSpecialtyKeys(keys, expectedSelection = null) {
+    const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
+    const cleanExpected = sanitizeRememberedSpecialty(expectedSelection || {});
+
+    if (!lookupKeys.length) {
+      return;
+    }
+
+    const specialties = GM_getValue(SPECIALTIES_KEY, {});
+    const now = Date.now();
+    let changed = false;
+
+    lookupKeys.forEach((key) => {
+      const entry = specialties[key];
+      const selection = sanitizeRememberedSpecialty(entry && entry.selection);
+
+      if (!selection) {
+        return;
+      }
+
+      if (cleanExpected && !areSameRememberedSpecialty(selection, cleanExpected)) {
+        return;
+      }
+
+      const lastUsedAt = Number(entry.lastUsedAt || 0);
+      if (lastUsedAt && now - lastUsedAt < REMEMBERED_TITLE_TOUCH_INTERVAL_MS) {
+        return;
+      }
+
+      specialties[key] = {
+        ...entry,
+        selection,
+        lastUsedAt: now,
+      };
+      changed = true;
+    });
+
+    if (changed) {
+      GM_setValue(SPECIALTIES_KEY, pruneRememberedSpecialties(specialties));
+    }
+  }
+
+  function areSameRememberedSpecialty(left, right) {
+    const cleanLeft = sanitizeRememberedSpecialty(left || {});
+    const cleanRight = sanitizeRememberedSpecialty(right || {});
+
+    if (!cleanLeft || !cleanRight) {
+      return false;
+    }
+
+    if (cleanLeft.optionValue && cleanRight.optionValue && cleanLeft.optionValue === cleanRight.optionValue) {
+      return true;
+    }
+
+    const leftText = normalizeSpecialtyLabel(cleanLeft.optionText || cleanLeft.optionNames[0] || cleanLeft.code || "");
+    const rightText = normalizeSpecialtyLabel(cleanRight.optionText || cleanRight.optionNames[0] || cleanRight.code || "");
+
+    return Boolean(leftText && rightText && leftText === rightText);
+  }
+
+  function pruneRememberedSpecialties(specialties) {
+    const entries = Object.entries(specialties || {})
+      .filter(([_key, entry]) => entry && sanitizeRememberedSpecialty(entry.selection))
+      .sort((left, right) => getRememberedTitleSortTime(right[1]) - getRememberedTitleSortTime(left[1]))
+      .slice(0, MAX_REMEMBERED_SPECIALTIES);
+
+    return Object.fromEntries(entries);
+  }
+
+  function forgetSpecialtyKeys(keys) {
+    const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
+    if (!lookupKeys.length) {
+      return false;
+    }
+
+    const specialties = GM_getValue(SPECIALTIES_KEY, {});
+    let changed = false;
+
+    lookupKeys.forEach((key) => {
+      if (specialties[key]) {
+        delete specialties[key];
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      GM_setValue(SPECIALTIES_KEY, specialties);
+    }
+
+    return changed;
+  }
+
   function getSeenRowMap() {
     return GM_getValue(AUTO_SEEN_ROWS_KEY, {});
   }
@@ -4032,10 +5225,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     closeCurrentHeidiTab();
 
-    const title = sanitizeTitle(result.title || result.raw || "");
+    const parsedResult = parseHeidiCourrierAtcdOutput(result.raw || result.title || "");
+    const title = sanitizeTitle(result.title || parsedResult.title || "");
+    const specialtyCode = parseHeidiSpecialtyCode(result.specialtyCode || parsedResult.specialtyCode || "");
     appendDebugLog("weda:title-sanitized", {
       jobId: result.jobId,
       titleLength: title.length,
+      specialtyCode,
       rasLike: isRasLikeHeidiTitle(title),
       hasAntecedent: Boolean(result.antecedent && result.antecedent.status === "OUI"),
     });
@@ -4064,7 +5260,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     try {
-      await fillAndSaveWedaTitle(title, result);
+      await fillAndSaveWedaTitle(title, {
+        ...result,
+        specialtyCode,
+      });
     } catch (error) {
       if (isWorkflowStopped()) {
         appendDebugLog("weda:title-insert-cancelled", {
@@ -4307,9 +5506,41 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     setNativeInputValue(input, title);
     triggerWedaTitleSave(input);
 
+    const specialtySelection = await fillWedaSpecialtyFromHeidi(title, result.jobId, targetRow, {
+      titleInput: input,
+      pdfUrl: titleInputTarget.pdfUrl,
+      urlKey: target.urlKey || displayedUrlKey,
+      raw: result.raw || "",
+    }, result.specialtyCode || "");
+
+    if (specialtySelection) {
+      const specialtyMetadata = {
+        rowStableKey: targetRow.stableKey,
+        rowIdentity: targetRow.identityLabel,
+        pdfUrlHash: hashString(target.pdfUrl || displayedPdfUrl || ""),
+        contentKey: target.contentKey,
+        urlKey: target.urlKey || displayedUrlKey,
+        title,
+      };
+      [
+        target.contentKey,
+        target.urlKey || displayedUrlKey,
+        targetRow.key,
+        targetRow.stableKey,
+      ].forEach((key) => rememberSpecialty(key, specialtySelection, specialtyMetadata));
+      appendDebugLog("weda:specialty-remembered", {
+        jobId: result.jobId,
+        targetRowIndex: targetRow.index,
+        optionText: specialtySelection.optionText || "",
+        optionValue: specialtySelection.optionValue || "",
+        code: specialtySelection.code || "",
+      });
+    }
+
     await guardWedaTitleStability({
       jobId: result.jobId,
       title,
+      specialtySelection,
       targetRow,
       targetPdfUrl: target.pdfUrl || displayedPdfUrl,
       urlKey: target.urlKey || displayedUrlKey,
@@ -4357,10 +5588,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   async function guardWedaTitleStability(options = {}) {
     const jobId = options.jobId || "";
     const title = sanitizeTitle(options.title || "");
+    const specialtySelection = options.specialtySelection || null;
     const targetRow = options.targetRow || null;
     const targetPdfUrl = options.targetPdfUrl || "";
     const startedAt = Date.now();
     let restoredCount = 0;
+    let specialtyRestoredCount = 0;
     let inputMissingSince = 0;
     let reopenAttemptedAt = 0;
 
@@ -4376,6 +5609,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       contentKey: options.contentKey || "",
       guardMs: TITLE_STABILITY_GUARD_MS,
       titleLength: title.length,
+      specialty: specialtySelection ? specialtySelection.optionText || specialtySelection.code || "" : "",
     });
 
     while (Date.now() - startedAt <= TITLE_STABILITY_GUARD_MS) {
@@ -4465,6 +5699,26 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         triggerWedaTitleSave(input);
       }
 
+      if (specialtySelection) {
+        const specialtySelect = findWedaSpecialtySelect({
+          titleInput: input,
+          pdfUrl: targetPdfUrl,
+          urlKey: options.urlKey || "",
+        });
+
+        if (specialtySelect && !isWedaSpecialtySelectionPresent(specialtySelect, specialtySelection)) {
+          specialtyRestoredCount += 1;
+          appendDebugLog("weda:specialty-restored-after-clear", {
+            jobId,
+            restoredCount: specialtyRestoredCount,
+            optionText: specialtySelection.optionText || "",
+            optionValue: specialtySelection.optionValue || "",
+            targetRowIndex: targetRow.index,
+          });
+          setWedaSpecialtySelectValue(specialtySelect, specialtySelection);
+        }
+      }
+
       await sleep(TITLE_STABILITY_CHECK_INTERVAL_MS);
     }
 
@@ -4474,14 +5728,31 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       triggerWedaTitleSave(finalInput);
     }
 
+    const finalSpecialtySelect = specialtySelection ? findWedaSpecialtySelect({
+      titleInput: finalInput,
+      pdfUrl: targetPdfUrl,
+      urlKey: options.urlKey || "",
+    }) : null;
+
+    if (specialtySelection && finalSpecialtySelect && !isWedaSpecialtySelectionPresent(finalSpecialtySelect, specialtySelection)) {
+      specialtyRestoredCount += 1;
+      setWedaSpecialtySelectValue(finalSpecialtySelect, specialtySelection);
+    }
+
+    const finalSpecialtyPresent = specialtySelection
+      ? !finalSpecialtySelect || isWedaSpecialtySelectionPresent(finalSpecialtySelect, specialtySelection)
+      : true;
+
     appendDebugLog("weda:title-stability-ok", {
       jobId,
       restoredCount,
+      specialtyRestoredCount,
       finalPresent: finalTitle === title,
+      finalSpecialtyPresent,
       finalLength: finalTitle.length,
       elapsedMs: Date.now() - startedAt,
     });
-    return finalTitle === title;
+    return finalTitle === title && finalSpecialtyPresent;
   }
 
   function isWedaTitleStabilityTargetStillDisplayed(targetRow, targetPdfUrl = "") {
@@ -4801,7 +6072,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       missingContext,
       patientLabel,
       launcher: patientLauncher,
-      pendingOpenMs: WEDA_ATCD_PENDING_OPEN_MS,
+      pendingOpenMs: 0,
+      persistentUntilAdopted: true,
     });
 
     if (!clicked) {
@@ -4836,6 +6108,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       sourceWedaUrl: location.href,
       item,
       rawHeidiAntecedent: result && result.antecedent ? result.antecedent : null,
+      expiresAt: 0,
+      validationExpiresAt: 0,
+      persistentUntilManualValidation: true,
     };
   }
 
@@ -4852,7 +6127,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       itemCode: item && item.code ? item.code : "",
       itemLabel: item && item.label ? item.label : "",
       createdAt: now,
-      expiresAt: now + WEDA_ATCD_PENDING_OPEN_MS,
+      expiresAt: 0,
+      persistentUntilAdopted: true,
     };
 
     GM_setValue(WEDA_ATCD_PENDING_OPEN_KEY, pending);
@@ -4863,7 +6139,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       hasPatientUrl: Boolean(pending.patientUrl),
       itemCode: pending.itemCode,
       itemLabel: pending.itemLabel,
-      expiresInMs: WEDA_ATCD_PENDING_OPEN_MS,
+      expiresInMs: 0,
+      persistentUntilAdopted: true,
     });
     return pending;
   }
@@ -5203,13 +6480,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return "";
     }
 
-    if (Number(pending.expiresAt || 0) <= now) {
-      GM_deleteValue(WEDA_ATCD_PENDING_OPEN_KEY);
-      appendDebugLog("weda-atcd-worker:pending-open-expired", {
+    if (Number(pending.expiresAt || 0) > 0) {
+      appendDebugLog("weda-atcd-worker:pending-open-expiration-ignored", {
         workerJobId: pending.workerJobId || "",
         sourceWedaUrl: pending.sourceWedaUrl || "",
+        legacyExpiresAt: Number(pending.expiresAt || 0),
+        ageMs: now - Number(pending.createdAt || 0),
       });
-      return "";
     }
 
     const job = GM_getValue(WEDA_ATCD_JOB_KEY, null);
@@ -5369,10 +6646,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         matchedLabel: found.matchedLabel,
         usedFallback: Boolean(found.usedFallback),
         workerUrl: location.href,
+        validationExpiresAt: 0,
+        persistentUntilManualValidation: true,
       });
 
       showWedaAtcdWorkerBadge(
-        `Fenêtre d'ajout préparée : ${job.item.label} [${found.matchedCode || job.item.code}].\nÀ vérifier puis valider manuellement dans WEDA.`,
+        `Fenêtre d'ajout préparée : ${job.item.label} [${found.matchedCode || job.item.code}].\nÀ vérifier puis valider manuellement dans WEDA.\nCette préparation reste active sans limite de durée côté script.`,
         { sticky: true }
       );
 
@@ -6301,29 +7580,80 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
   }
 
-  function closeWedaAtcdWorkerSoon(workerJobId = "", reason = "", delayMs = WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS) {
+  function closeWedaAtcdWorkerSoon(
+    workerJobId = "",
+    reason = "",
+    delayMs = WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS,
+    maxAttempts = WEDA_ATCD_WORKER_CLOSE_MAX_ATTEMPTS
+  ) {
+    const safeDelayMs = Math.max(0, Number(delayMs) || 0);
+    const safeMaxAttempts = Math.max(1, Number(maxAttempts) || WEDA_ATCD_WORKER_CLOSE_MAX_ATTEMPTS);
+
     appendDebugLog("weda-atcd-worker:close-scheduled", {
       workerJobId,
       reason,
-      delayMs,
+      delayMs: safeDelayMs,
+      maxAttempts: safeMaxAttempts,
     });
 
-    window.setTimeout(() => {
-      appendDebugLog("weda-atcd-worker:close", {
+    window.setTimeout(() => attemptCloseWedaAtcdWorker(workerJobId, reason, 1, safeMaxAttempts), safeDelayMs);
+  }
+
+  function attemptCloseWedaAtcdWorker(workerJobId = "", reason = "", attempt = 1, maxAttempts = WEDA_ATCD_WORKER_CLOSE_MAX_ATTEMPTS) {
+    appendDebugLog("weda-atcd-worker:close-attempt", {
+      workerJobId,
+      reason,
+      attempt,
+    });
+
+    try {
+      if (typeof GM_closeTab === "function") {
+        GM_closeTab();
+      }
+    } catch (error) {
+      appendDebugLog("weda-atcd-worker:gm-close-tab-failed", {
         workerJobId,
         reason,
+        attempt,
+        error: error && error.message ? error.message : String(error),
       });
+    }
 
-      try {
-        window.close();
-      } catch (error) {
-        appendDebugLog("weda-atcd-worker:close-failed", {
-          workerJobId,
-          reason,
-          error: error && error.message ? error.message : String(error),
-        });
+    try {
+      if (typeof GM !== "undefined" && GM && typeof GM.closeTab === "function") {
+        GM.closeTab();
       }
-    }, Math.max(0, Number(delayMs) || 0));
+    } catch (error) {
+      appendDebugLog("weda-atcd-worker:gm-close-tab-failed", {
+        workerJobId,
+        reason,
+        attempt,
+        api: "GM.closeTab",
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+
+    try {
+      window.close();
+    } catch (error) {
+      appendDebugLog("weda-atcd-worker:close-failed", {
+        workerJobId,
+        reason,
+        attempt,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+
+    if (attempt < maxAttempts) {
+      window.setTimeout(() => attemptCloseWedaAtcdWorker(workerJobId, reason, attempt + 1, maxAttempts), WEDA_ATCD_WORKER_CLOSE_RETRY_MS);
+      return;
+    }
+
+    appendDebugLog("weda-atcd-worker:close-attempts-ended", {
+      workerJobId,
+      reason,
+      attempts: maxAttempts,
+    });
   }
 
   async function initHeidi() {
@@ -6912,11 +8242,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     abortIfHeidiJobCancelled(job.id);
     const parsedAnswer = parseHeidiCourrierAtcdOutput(answer);
     const title = parsedAnswer.title;
+    const specialtyCode = parsedAnswer.specialtyCode || "";
     appendDebugLog("heidi:answer-received", {
       jobId: job.id,
       answerLength: answer.length,
       titleLength: title.length,
+      specialtyCode,
       hasTaggedTitle: Boolean(extractTaggedBlock(answer, "TITRE_COURRIER")),
+      hasTaggedSpecialty: Boolean(extractTaggedBlock(answer, "SPECIALITE_COURRIER")),
       hasTaggedAtcd: Boolean(extractTaggedBlock(answer, "ANTECEDENT_CIM10")),
       antecedentStatus: parsedAnswer.antecedent ? parsedAnswer.antecedent.status : "",
       hasAntecedent: Boolean(parsedAnswer.antecedent && parsedAnswer.antecedent.status === "OUI"),
@@ -6942,6 +8275,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       ok: true,
       raw: answer,
       title,
+      specialtyCode,
       antecedent: parsedAnswer.antecedent,
       rowIndex: job.rowIndex,
       rowStableKey: job.rowStableKey || "",
@@ -7880,12 +9214,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function buildHeidiPromptVerificationMarkers(promptText) {
     const markers = [
-      "Tu dois produire deux blocs balisés",
+      "Tu dois produire trois blocs balisés",
       "PROMPT TITRE COURRIER À APPLIQUER STRICTEMENT",
       "Rôle : médecin généraliste",
       "Objectif : synthétiser le courrier médical",
       "Format de sortie obligatoire",
       "<TITRE_COURRIER>",
+      "<SPECIALITE_COURRIER>",
     ].filter((marker) => String(promptText || "").includes(marker));
 
     return markers.length ? markers : ["Objectif"];
@@ -8483,9 +9818,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       normalized.includes("document fourni par weda") ||
       normalized.includes("texte pdf extrait automatiquement") ||
       normalized.includes("tu dois produire deux blocs balises") ||
+      normalized.includes("tu dois produire trois blocs balises") ||
       normalized.includes("prompt titre courrier a appliquer strictement") ||
       normalized.includes("format de sortie obligatoire") ||
       normalized.includes("phrase de titre produite en appliquant strictement") ||
+      normalized.includes("specialite_courrier") ||
       normalized.includes("statut: oui ou non") ||
       normalized.includes("libelle: libelle court") ||
       normalized.includes("code: code cim") ||
@@ -8499,20 +9836,34 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const titleNode = node.querySelector("titre_courrier");
+    const specialtyNode = node.querySelector("specialite_courrier");
     const atcdNode = node.querySelector("antecedent_cim10");
 
     if (!titleNode || !atcdNode) {
       return "";
     }
 
-    return [
+    const parts = [
       "<TITRE_COURRIER>",
       getVisibleText(titleNode),
       "</TITRE_COURRIER>",
+    ];
+
+    if (specialtyNode) {
+      parts.push(
+        "<SPECIALITE_COURRIER>",
+        getVisibleText(specialtyNode),
+        "</SPECIALITE_COURRIER>"
+      );
+    }
+
+    parts.push(
       "<ANTECEDENT_CIM10>",
       getVisibleText(atcdNode),
-      "</ANTECEDENT_CIM10>",
-    ].join("\n");
+      "</ANTECEDENT_CIM10>"
+    );
+
+    return parts.join("\n");
   }
 
   function buildHeidiAnswerCandidateProfile(textCandidates, copyButton = null) {
@@ -8526,6 +9877,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       largestCandidateLength: texts.reduce((max, text) => Math.max(max, text.length), 0),
       aggregateLength: aggregate.length,
       aggregateHasTaggedTitle: Boolean(extractTaggedBlock(aggregate, "TITRE_COURRIER")),
+      aggregateHasTaggedSpecialty: Boolean(extractTaggedBlock(aggregate, "SPECIALITE_COURRIER")),
       aggregateHasTaggedAtcd: Boolean(extractTaggedBlock(aggregate, "ANTECEDENT_CIM10")),
       aggregateHasUntaggedAtcd: Boolean(extractUntaggedHeidiCourrierAtcdOutput(aggregate)),
       fromCopyButton: Boolean(copyButton),
@@ -8862,7 +10214,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
       if (!skippingPrompt && (
         normalized.includes("tu dois produire deux blocs balises") ||
+        normalized.includes("tu dois produire trois blocs balises") ||
         normalized.includes("pour le bloc <titre_courrier>") ||
+        normalized.includes("pour le bloc <specialite_courrier>") ||
         normalized.includes("prompt titre courrier a appliquer strictement") ||
         normalized.includes("role : medecin generaliste") ||
         normalized.includes("objectif : synthetiser le courrier medical") ||
@@ -8985,7 +10339,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           .replace(/^titre\s*courrier\s*:?\s*/i, "")
       );
 
-      if (isExpectedTitleLine(candidate)) {
+      if (isExpectedTitleLine(candidate) && !isStandaloneHeidiSpecialtyCode(candidate)) {
         return candidate;
       }
     }
@@ -9024,8 +10378,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function parseHeidiCourrierAtcdOutput(rawAnswer) {
     const raw = String(rawAnswer || "").replace(/\r/g, "\n");
     const titleBlock = extractTaggedBlock(raw, "TITRE_COURRIER");
+    const specialtyBlock = extractTaggedBlock(raw, "SPECIALITE_COURRIER");
     const atcdBlock = extractTaggedBlock(raw, "ANTECEDENT_CIM10");
     const title = sanitizeTitle(titleBlock || extractShortHeidiLine(raw));
+    const specialtyCode = parseHeidiSpecialtyCode(specialtyBlock);
     const fields = parseSimpleKeyValueBlock(atcdBlock);
     const status = normalizeHeidiAtcdStatus(fields.STATUT);
     const code = normalizeCim10Code(fields.CODE);
@@ -9056,6 +10412,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     return {
       title,
+      specialtyCode,
       antecedent,
       raw,
     };
@@ -9268,7 +10625,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return isPromptInstructionLine(text) ||
       /^(?:page\s*\d+|copier|copy|envoyer|contexte|demande)$/i.test(normalized) ||
       /^(?:role|objectif|consignes|format attendu|format de sortie)\s*:/.test(normalized) ||
-      /(?:tu dois produire deux blocs|pour le bloc|prompt titre courrier|fin du prompt titre|courrier medical a synthetiser|titre_courrier|antecedent_cim10|statut\s*:|libelle\s*:|code\s*:|certitude\s*:|source\s*:|repondre en francais|faire une seule phrase|ne jamais|ne pas faire|extraire uniquement|mentionner de facon concise|utiliser un style|conserver les termes|eviter les details|format attendu|format de sortie obligatoire|une phrase unique du type|copier le texte|bientot termine|l ia est en train|demandez a l ia|nouvelle session|je ne peux pas|impossible d analyser|analyse directement.*piece jointe|pdf original joint|texte.*pdf.*extrait automatiquement|pdf joint est inaccessible|piece jointe non accessible|document inaccessible|aucun document accessible)/i.test(normalized);
+      /(?:tu dois produire (?:deux|trois) blocs|pour le bloc|prompt titre courrier|fin du prompt titre|courrier medical a synthetiser|titre_courrier|specialite_courrier|antecedent_cim10|statut\s*:|libelle\s*:|code\s*:|certitude\s*:|source\s*:|repondre en francais|faire une seule phrase|ne jamais|ne pas faire|extraire uniquement|mentionner de facon concise|utiliser un style|conserver les termes|eviter les details|format attendu|format de sortie obligatoire|une phrase unique du type|copier le texte|bientot termine|l ia est en train|demandez a l ia|nouvelle session|je ne peux pas|impossible d analyser|analyse directement.*piece jointe|pdf original joint|texte.*pdf.*extrait automatiquement|pdf joint est inaccessible|piece jointe non accessible|document inaccessible|aucun document accessible)/i.test(normalized);
   }
 
   function isPromptInstructionLine(text) {
@@ -9281,7 +10638,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     return /^(?:role|objectif|consignes|format attendu|format de sortie|tu dois|pour le bloc|statut|section|libelle|code|date|certitude|source|repondre|faire|ne jamais|ne pas|extraire|mentionner|si aucune|utiliser|conserver|eviter|une phrase unique|specialite ou examen|spe abregee)\b/.test(normalized) ||
-      /\b(?:prompt|consigne|format attendu|format de sortie obligatoire|source unique|titre_courrier|antecedent_cim10)\b/.test(normalized);
+      /\b(?:prompt|consigne|format attendu|format de sortie obligatoire|source unique|titre_courrier|specialite_courrier|antecedent_cim10)\b/.test(normalized);
   }
 
   function looksLikeBiologySummaryLine(text) {

@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Connecteur Madeformed - Weda
+// @name         Connecteur Madeformed - WEDA
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.51
 // @description  PageDown : copier/envoyer le SMS vers WEDA ; clic nom patient agenda : ouvrir dossier WEDA
 // @match        https://pro.madeformed.com/*
 // @match        https://secure.weda.fr/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.3-pagedown-click-patient';
+    const VERSION = '3.51';
 
     const JOB_KEY = 'TM_MADEFORMED_TO_WEDA_JOB_V31';
     const LOG_KEY = 'TM_MADEFORMED_TO_WEDA_LOG_V31';
@@ -33,6 +33,11 @@
 
     const SEL_WEDA_SEARCH_INPUT =
         '#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche';
+
+    const SEL_WEDA_SEARCH_MODE_SELECT =
+        '#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient';
+
+    const WEDA_SEARCH_MODE_PATIENT_NAME = 'Nom';
 
     const SEL_WEDA_SEARCH_BUTTON =
         '#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient';
@@ -1275,12 +1280,60 @@
         }, delayMs);
     }
 
+    async function ensureWedaSearchModePatientName() {
+        const select = await waitFor(() => document.querySelector(SEL_WEDA_SEARCH_MODE_SELECT), 7000);
+
+        if (!select) {
+            addLog('WARN', 'Menu déroulant de type de recherche WEDA introuvable, poursuite de la recherche par nom', {
+                selector: SEL_WEDA_SEARCH_MODE_SELECT
+            });
+            return true;
+        }
+
+        const currentValue = String(select.value || '');
+
+        if (currentValue === WEDA_SEARCH_MODE_PATIENT_NAME) {
+            addLog('INFO', 'Menu de recherche WEDA déjà sur Recherche d’une fiche patient', {
+                value: currentValue
+            });
+            return true;
+        }
+
+        addLog('INFO', 'Correction du menu de recherche WEDA avant saisie du nom', {
+            previousValue: currentValue,
+            nextValue: WEDA_SEARCH_MODE_PATIENT_NAME
+        });
+
+        try {
+            select.focus();
+        } catch (_) {}
+
+        select.value = WEDA_SEARCH_MODE_PATIENT_NAME;
+        select.dispatchEvent(new Event('input', { bubbles: true }));
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        /*
+         * WEDA déclenche normalement un __doPostBack sur ce changement.
+         * On ne colle pas le nom tout de suite pour éviter de saisir pendant le rechargement ASP.NET.
+         * Le job reste en open_search et wedaMain relancera la recherche après stabilisation.
+         */
+        scheduleWedaMainRetry('après correction du menu de recherche WEDA sur Nom', 1800);
+
+        return false;
+    }
+
     async function submitWedaSearch(job) {
         addLog('INFO', 'Étape WEDA : recherche patient', {
             patientName: job.patientName,
             dateOfBirth: job.dateOfBirth || '',
             action: job.action || ''
         });
+
+        const searchModeReady = await ensureWedaSearchModePatientName();
+
+        if (!searchModeReady) {
+            return;
+        }
 
         const input = await waitFor(() => document.querySelector(SEL_WEDA_SEARCH_INPUT), 15000);
 
