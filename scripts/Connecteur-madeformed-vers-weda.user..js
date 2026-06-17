@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Madeformed - WEDA
 // @namespace    http://tampermonkey.net/
-// @version      3.51
+// @version      3.55
 // @description  PageDown : copier/envoyer le SMS vers WEDA ; clic nom patient agenda : ouvrir dossier WEDA
 // @match        https://pro.madeformed.com/*
 // @match        https://secure.weda.fr/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.51';
+    const VERSION = '3.55';
 
     const JOB_KEY = 'TM_MADEFORMED_TO_WEDA_JOB_V31';
     const LOG_KEY = 'TM_MADEFORMED_TO_WEDA_LOG_V31';
@@ -38,6 +38,26 @@
         '#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient';
 
     const WEDA_SEARCH_MODE_PATIENT_NAME = 'Nom';
+
+    const SEL_MADEFORMED_MESSAGE_COUNTER =
+        'span.notif-badge-counter.msg-counter';
+
+    const SEL_MADEFORMED_PATIENT_HEADER =
+        '#infos > div.user-detail.panel.full-size.active > div.page-header.has-nav.sticky > div.flex.space-between.gap-1 > div > div > div.flex.flex-column.gap-1.space-between';
+
+    const SEL_MADEFORMED_PATIENT_HEADER_NAME =
+        `${SEL_MADEFORMED_PATIENT_HEADER} .user-name, ` +
+        '#infos .user-detail.panel.full-size.active .page-header.has-nav.sticky .user-name';
+
+    const SEL_MADEFORMED_PATIENT_PREVIEW =
+        '#users-result > div.user.preview.panel > div.panel-heading.patient-preview.flex.flex-column.gap-05';
+
+    const SEL_MADEFORMED_PATIENT_PREVIEW_NAME =
+        `${SEL_MADEFORMED_PATIENT_PREVIEW} .user-name, ` +
+        '#users-result .user.preview.panel .panel-heading.patient-preview .user-name';
+
+    const SEL_MADEFORMED_OPEN_PATIENT_NAME =
+        `${SEL_MADEFORMED_PATIENT_HEADER_NAME}, ${SEL_MADEFORMED_PATIENT_PREVIEW_NAME}`;
 
     const SEL_WEDA_SEARCH_BUTTON =
         '#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient';
@@ -57,6 +77,10 @@
     let currentWedaJobId = '';
     let currentWedaSavedSeenAt = 0;
     let madeformedClosePoller = null;
+    let madeformedMessageFaviconBaseHref = '';
+    let madeformedMessageFaviconLastCount = null;
+    let madeformedMessageFaviconObserver = null;
+    let madeformedMessageFaviconRefreshTimer = null;
 
     function isMadeformed() {
         return location.hostname === 'pro.madeformed.com';
@@ -797,12 +821,12 @@
         };
     }
 
-    function createOpenPatientJob(patientNameRaw, dateOfBirth) {
+    function createOpenPatientJob(patientNameRaw, dateOfBirth, source = 'madeformed_agenda') {
         const patientNameForWeda = formatPatientNameForWeda(patientNameRaw);
 
         return {
             id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
-            source: 'madeformed_agenda',
+            source,
             action: 'open_patient',
             patientNameRaw,
             patientName: patientNameForWeda,
@@ -908,6 +932,76 @@
         await closeMadeformedMessageWindow(textarea);
     }
 
+    function stripMadeformedPatientTitle(value) {
+        return cleanText(value)
+            .replace(/^(?:Mme|Madame|Mlle|Monsieur|Mr\.?|M\.?|Docteur|Dr\.?)\s+/i, '')
+            .trim();
+    }
+
+    function extractMadeformedDateOfBirth(value) {
+        const match = cleanText(value).match(/\b\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}\b/);
+
+        return match ? normalizeDateText(match[0]) : '';
+    }
+
+    function getMadeformedOpenPatientFromClickEvent(event) {
+        if (!event || event.button !== 0) return null;
+        if (!event.target || !event.target.closest) return null;
+
+        const nameEl = event.target.closest(SEL_MADEFORMED_OPEN_PATIENT_NAME);
+        if (!nameEl || !isVisible(nameEl)) return null;
+
+        const previewEl =
+            nameEl.closest(SEL_MADEFORMED_PATIENT_PREVIEW) ||
+            nameEl.closest('#users-result .user.preview.panel .panel-heading.patient-preview');
+
+        const sourceEl =
+            previewEl ||
+            nameEl.closest(SEL_MADEFORMED_PATIENT_HEADER) ||
+            nameEl.closest('.page-header.has-nav.sticky') ||
+            nameEl.closest('#infos') ||
+            document;
+
+        const source = previewEl ? 'madeformed_patient_preview' : 'madeformed_patient_header';
+
+        const lastNameEl = nameEl.querySelector('.nom');
+        const firstNameEl = nameEl.querySelector('.prenom');
+        const lastName = cleanText(lastNameEl ? lastNameEl.textContent : '');
+        const firstName = cleanText(firstNameEl ? firstNameEl.textContent : '');
+
+        let patientNameRaw = cleanText([lastName, firstName].filter(Boolean).join(' '));
+
+        if (!patientNameRaw) {
+            patientNameRaw = stripMadeformedPatientTitle(nameEl.textContent || '');
+        }
+
+        if (!patientNameRaw || !isLikelyPatientName(patientNameRaw)) {
+            addLog('WARN', 'Clic nom patient Madeformed ignoré : nom patient non fiable', {
+                rawText: cleanText(nameEl.textContent || '').slice(0, 120)
+            });
+            return null;
+        }
+
+        const birthDateEl =
+            sourceEl.querySelector('.no-phone') ||
+            sourceEl.querySelector('.identite-infos');
+
+        const userIdEl = sourceEl.querySelector('[user-id], [data-user-id]');
+
+        return {
+            nameEl,
+            sourceEl,
+            source,
+            patientNameRaw,
+            dateOfBirth:
+                extractMadeformedDateOfBirth(birthDateEl ? birthDateEl.textContent : '') ||
+                extractMadeformedDateOfBirth(sourceEl.textContent || ''),
+            userId: userIdEl
+                ? cleanText(userIdEl.getAttribute('user-id') || userIdEl.getAttribute('data-user-id') || '')
+                : ''
+        };
+    }
+
     function getMadeformedAgendaPatientFromClickEvent(event) {
         if (!event || event.button !== 0) return null;
 
@@ -938,6 +1032,54 @@
         };
     }
 
+    function openWedaPatientJobFromMadeformed(patient, source, logMessage, extraLogData = {}) {
+        const job = createOpenPatientJob(patient.patientNameRaw, patient.dateOfBirth, source);
+
+        saveJob(job);
+        GM_deleteValue(CLOSE_KEY);
+
+        addLog('INFO', logMessage, {
+            jobId: job.id,
+            madeformed: patient.patientNameRaw,
+            weda: job.patientName,
+            dateOfBirth: job.dateOfBirth || '',
+            ...extraLogData
+        });
+
+        GM_openInTab(`${WEDA_FIND_PATIENT_URL}?tmJob=${encodeURIComponent(job.id)}&tmAction=open_patient`, {
+            active: true,
+            insert: true,
+            setParent: true
+        });
+
+        return true;
+    }
+
+    async function openWedaPatientFromMadeformedPatientHeader(event) {
+        const madeformedPatient = getMadeformedOpenPatientFromClickEvent(event);
+
+        if (!madeformedPatient) {
+            return false;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+
+        return openWedaPatientJobFromMadeformed(
+            madeformedPatient,
+            madeformedPatient.source,
+            madeformedPatient.source === 'madeformed_patient_preview'
+                ? 'Ouverture dossier patient WEDA depuis clic preview patient Madeformed'
+                : 'Ouverture dossier patient WEDA depuis clic en-tête patient Madeformed',
+            {
+                userId: madeformedPatient.userId || ''
+            }
+        );
+    }
+
     async function openWedaPatientFromMadeformedAgenda(event) {
         const agendaPatient = getMadeformedAgendaPatientFromClickEvent(event);
 
@@ -951,28 +1093,16 @@
             event.stopImmediatePropagation();
         }
 
-        const job = createOpenPatientJob(agendaPatient.patientNameRaw, agendaPatient.dateOfBirth);
-
-        saveJob(job);
-        GM_deleteValue(CLOSE_KEY);
-
-        addLog('INFO', 'Ouverture dossier patient WEDA depuis clic agenda Madeformed', {
-            jobId: job.id,
-            madeformed: agendaPatient.patientNameRaw,
-            weda: job.patientName,
-            dateOfBirth: job.dateOfBirth || '',
-            rdvId: agendaPatient.rdvId || '',
-            debut: agendaPatient.debut || '',
-            fin: agendaPatient.fin || ''
-        });
-
-        GM_openInTab(`${WEDA_FIND_PATIENT_URL}?tmJob=${encodeURIComponent(job.id)}&tmAction=open_patient`, {
-            active: true,
-            insert: true,
-            setParent: true
-        });
-
-        return true;
+        return openWedaPatientJobFromMadeformed(
+            agendaPatient,
+            'madeformed_agenda',
+            'Ouverture dossier patient WEDA depuis clic agenda Madeformed',
+            {
+                rdvId: agendaPatient.rdvId || '',
+                debut: agendaPatient.debut || '',
+                fin: agendaPatient.fin || ''
+            }
+        );
     }
 
     function isLaunchShortcut(e) {
@@ -1104,6 +1234,198 @@
         });
     }
 
+    function parseMadeformedMessageCounterValue(value) {
+        const text = cleanText(value);
+
+        if (!text) return 0;
+
+        const compact = text.replace(/\s+/g, '');
+        const match = compact.match(/\d+/);
+
+        if (!match) return 0;
+
+        const count = parseInt(match[0], 10);
+
+        if (!Number.isFinite(count) || count < 0) return 0;
+
+        return count;
+    }
+
+    function getMadeformedPendingMessageCount() {
+        if (!isMadeformed()) return 0;
+
+        const counters = [
+            ...document.querySelectorAll(SEL_MADEFORMED_MESSAGE_COUNTER)
+        ];
+
+        if (counters.length === 0) {
+            return 0;
+        }
+
+        const visibleCounters = counters.filter(isVisible);
+        const candidates = visibleCounters.length > 0 ? visibleCounters : counters;
+
+        let maxCount = 0;
+
+        for (const counter of candidates) {
+            const count = parseMadeformedMessageCounterValue(
+                counter.textContent ||
+                counter.getAttribute('data-count') ||
+                counter.getAttribute('aria-label') ||
+                counter.getAttribute('title') ||
+                ''
+            );
+
+            if (count > maxCount) {
+                maxCount = count;
+            }
+        }
+
+        return maxCount;
+    }
+
+    function getMadeformedBaseFaviconHref() {
+        if (madeformedMessageFaviconBaseHref) {
+            return madeformedMessageFaviconBaseHref;
+        }
+
+        const favicon = [
+            ...document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]')
+        ].find(link => link.id !== 'tm-mf-message-counter-favicon' && link.href);
+
+        madeformedMessageFaviconBaseHref =
+            favicon && favicon.href
+                ? favicon.href
+                : new URL('/favicon.ico', location.origin).href;
+
+        return madeformedMessageFaviconBaseHref;
+    }
+
+    function ensureMadeformedMessageFaviconLink() {
+        let link = document.getElementById('tm-mf-message-counter-favicon');
+
+        if (link) {
+            return link;
+        }
+
+        link = document.createElement('link');
+        link.id = 'tm-mf-message-counter-favicon';
+        link.rel = 'icon';
+        link.type = 'image/svg+xml';
+
+        (document.head || document.documentElement).appendChild(link);
+
+        return link;
+    }
+
+    function makeMadeformedMessageCountFavicon(count) {
+        const safeCount = Math.max(0, Number(count) || 0);
+        const label = safeCount > 99 ? '99+' : String(safeCount);
+        const fontSize = label.length >= 3 ? 22 : label.length === 2 ? 28 : 38;
+
+        const svg = [
+            '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">',
+            '<circle cx="32" cy="32" r="30" fill="#b480ff"/>',
+            '<text x="32" y="34" text-anchor="middle" dominant-baseline="middle"',
+            ` font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="800" fill="#000000">`,
+            escapeHtml(label),
+            '</text>',
+            '</svg>'
+        ].join('');
+
+        return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg);
+    }
+
+    function restoreMadeformedBaseFavicon() {
+        const link = document.getElementById('tm-mf-message-counter-favicon');
+
+        if (!link) {
+            return;
+        }
+
+        const baseHref = getMadeformedBaseFaviconHref();
+
+        link.type = 'image/x-icon';
+        link.href = baseHref;
+    }
+
+    function updateMadeformedMessageFavicon() {
+        if (!isMadeformed()) return;
+
+        const count = getMadeformedPendingMessageCount();
+
+        if (count === madeformedMessageFaviconLastCount) {
+            return;
+        }
+
+        madeformedMessageFaviconLastCount = count;
+
+        if (count > 0) {
+            const link = ensureMadeformedMessageFaviconLink();
+
+            link.type = 'image/svg+xml';
+            link.href = makeMadeformedMessageCountFavicon(count);
+
+            return;
+        }
+
+        restoreMadeformedBaseFavicon();
+    }
+
+    function scheduleMadeformedMessageFaviconRefresh(delayMs = 120) {
+        if (!isMadeformed()) return;
+
+        if (madeformedMessageFaviconRefreshTimer) {
+            clearTimeout(madeformedMessageFaviconRefreshTimer);
+        }
+
+        madeformedMessageFaviconRefreshTimer = setTimeout(() => {
+            madeformedMessageFaviconRefreshTimer = null;
+            updateMadeformedMessageFavicon();
+        }, delayMs);
+    }
+
+    function setupMadeformedMessageFaviconWatcher() {
+        if (!isMadeformed()) return;
+
+        getMadeformedBaseFaviconHref();
+        updateMadeformedMessageFavicon();
+
+        if (!madeformedMessageFaviconObserver && document.body) {
+            madeformedMessageFaviconObserver = new MutationObserver(() => {
+                scheduleMadeformedMessageFaviconRefresh();
+            });
+
+            madeformedMessageFaviconObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+                attributes: true,
+                attributeFilter: [
+                    'class',
+                    'style',
+                    'hidden',
+                    'aria-hidden',
+                    'data-count',
+                    'title',
+                    'aria-label'
+                ]
+            });
+        }
+
+        window.setInterval(() => {
+            scheduleMadeformedMessageFaviconRefresh(0);
+        }, 5000);
+
+        window.addEventListener('focus', () => {
+            scheduleMadeformedMessageFaviconRefresh(0);
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            scheduleMadeformedMessageFaviconRefresh(0);
+        });
+    }
+
     function madeformedMain() {
         setupMadeformedCloseListener();
 
@@ -1117,6 +1439,10 @@
         }, true);
 
         document.addEventListener('click', async function (e) {
+            if (await openWedaPatientFromMadeformedPatientHeader(e)) {
+                return;
+            }
+
             await openWedaPatientFromMadeformedAgenda(e);
         }, true);
 
@@ -1124,7 +1450,8 @@
             raccourcis: [
                 'PageDown'
             ],
-            clicAgenda: 'clic sur le nom du patient dans un rendez-vous Madeformed'
+            clicAgenda: 'clic sur le nom du patient dans un rendez-vous Madeformed',
+            clicFichePatient: 'clic sur le nom du patient dans l’en-tête de fiche Madeformed'
         });
     }
 
@@ -1993,6 +2320,15 @@
 
         const style = document.createElement('style');
         style.textContent = `
+            ${SEL_MADEFORMED_OPEN_PATIENT_NAME} {
+                cursor: pointer !important;
+            }
+
+            :is(${SEL_MADEFORMED_OPEN_PATIENT_NAME}):hover {
+                text-decoration: underline;
+                text-underline-offset: 2px;
+            }
+
             #tm-mf-weda-panel {
                 position: fixed;
                 right: 12px;
@@ -2015,6 +2351,7 @@
                 justify-content: space-between;
                 align-items: center;
                 gap: 8px;
+                cursor: pointer;
             }
 
             #tm-mf-weda-body {
@@ -2044,21 +2381,86 @@
                 display: none;
             }
 
+            #tm-mf-weda-brand {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                min-width: 0;
+            }
+
+            #tm-mf-weda-ruby-icon {
+                width: 22px;
+                height: 22px;
+                border-radius: 50%;
+                background: #b480ff;
+                color: #000;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex: 0 0 auto;
+                font-size: 13px;
+                font-weight: 800;
+                line-height: 1;
+                box-shadow: inset 0 0 0 1px rgba(0,0,0,0.12);
+            }
+
+            #tm-mf-weda-title {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
             #tm-mf-weda-toggle {
                 background: #374151 !important;
                 color: white;
                 border: none !important;
                 margin: 0 !important;
             }
+
+            #tm-mf-weda-panel.tm-collapsed {
+                width: 44px;
+                height: 44px;
+                border-radius: 50%;
+                background: transparent;
+            }
+
+            #tm-mf-weda-panel.tm-collapsed #tm-mf-weda-head {
+                width: 44px;
+                height: 44px;
+                padding: 0;
+                justify-content: center;
+                border-radius: 50%;
+                background: #b480ff;
+            }
+
+            #tm-mf-weda-panel.tm-collapsed #tm-mf-weda-brand {
+                gap: 0;
+            }
+
+            #tm-mf-weda-panel.tm-collapsed #tm-mf-weda-ruby-icon {
+                width: 44px;
+                height: 44px;
+                font-size: 20px;
+                box-shadow: inset 0 0 0 1px rgba(0,0,0,0.14);
+            }
+
+            #tm-mf-weda-panel.tm-collapsed #tm-mf-weda-title,
+            #tm-mf-weda-panel.tm-collapsed #tm-mf-weda-toggle {
+                display: none;
+            }
         `;
 
         const panel = document.createElement('div');
         panel.id = 'tm-mf-weda-panel';
+        panel.className = 'tm-collapsed';
 
         panel.innerHTML = `
             <div id="tm-mf-weda-head">
-                <span>MF → WEDA</span>
-                <button id="tm-mf-weda-toggle" type="button">−</button>
+                <span id="tm-mf-weda-brand" title="Ruby - connecteur Madeformed WEDA">
+                    <span id="tm-mf-weda-ruby-icon" aria-hidden="true">R</span>
+                    <span id="tm-mf-weda-title">Ruby</span>
+                </span>
+                <button id="tm-mf-weda-toggle" type="button" aria-label="Replier Ruby">+</button>
             </div>
             <div id="tm-mf-weda-body">
                 <div id="tm-mf-weda-status"></div>
@@ -2072,11 +2474,24 @@
         document.documentElement.appendChild(style);
         document.body.appendChild(panel);
 
-        document.getElementById('tm-mf-weda-toggle').addEventListener('click', () => {
-            panel.classList.toggle('tm-collapsed');
-            document.getElementById('tm-mf-weda-toggle').textContent =
-                panel.classList.contains('tm-collapsed') ? '+' : '−';
+        const toggleButton = document.getElementById('tm-mf-weda-toggle');
+        const setCollapsed = collapsed => {
+            panel.classList.toggle('tm-collapsed', collapsed);
+            toggleButton.textContent = collapsed ? '+' : '−';
+            toggleButton.setAttribute('aria-label', collapsed ? 'Ouvrir Ruby' : 'Replier Ruby');
+            panel.title = collapsed ? 'Ouvrir Ruby' : '';
+        };
+
+        document.getElementById('tm-mf-weda-head').addEventListener('click', () => {
+            setCollapsed(!panel.classList.contains('tm-collapsed'));
         });
+
+        toggleButton.addEventListener('click', event => {
+            event.stopPropagation();
+            setCollapsed(!panel.classList.contains('tm-collapsed'));
+        });
+
+        setCollapsed(true);
 
         document.getElementById('tm-mf-weda-run').addEventListener('click', () => launchFromMadeformed('bouton_panel'));
         document.getElementById('tm-mf-weda-copy-logs').addEventListener('click', copyLogs);
@@ -2140,6 +2555,7 @@
         registerMenu();
 
         if (isMadeformed()) {
+            setupMadeformedMessageFaviconWatcher();
             createMadeformedPanel();
 
             addLog('INFO', 'Script chargé sur Madeformed', {

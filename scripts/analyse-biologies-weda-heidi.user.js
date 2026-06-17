@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec Heidi Contexte
 // @namespace    https://secure.weda.fr/
-// @version      1.5.9
+// @version      1.5.7
 // @description  Analyse les résultats HPRIM avec Heidi en plaçant la biologie dans le contexte Heidi. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @match        https://scribe.heidihealth.com/*
@@ -23,7 +23,7 @@
   const HEIDI_URL = "https://scribe.heidihealth.com/";
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "1.5.9";
+  const SCRIPT_VERSION = "1.5.7";
 
   const STORAGE_PREFIX = "wedaBioHeidiContext.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
@@ -53,7 +53,7 @@
   const STATUS_ID = "weda-bio-heidi-context-status";
   const DEBUG_LOG_PANEL_ID = "weda-bio-heidi-context-log-panel";
   const DEBUG_LOG_TEXTAREA_ID = "weda-bio-heidi-context-log-textarea";
-  const AUTO_INTERVAL_MS = 15 * 60 * 1000;
+  const AUTO_INTERVAL_MS = 5 * 60 * 1000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -91,6 +91,7 @@
   const DEBUG_LOG_VIEW_MAX_ENTRIES = 120;
   const DEBUG_REPORT_MAX_LOG_ENTRIES = 70;
   const DEBUG_REPORT_MAX_CHARS = 30000;
+  const MANUAL_TITLE_EDIT_GRACE_MS = 2 * 60 * 1000;
 
   let titleAutofillInterval = null;
   let autoRefreshTimer = null;
@@ -100,6 +101,8 @@
   let heidiForegroundFallbackUsed = false;
   let debugSequence = 0;
   const debugSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  let manualTitleEditProtectionReady = false;
+  let manualTitleEditState = null;
 
   const HEIDI_PROMPT = "Tu es médecin généraliste en France.\n\nAnalyse uniquement le compte-rendu de biologie fourni après le signal :\nBIOLOGIE À ANALYSER CI-DESSOUS\n\nOBJECTIF\n\nProduire une seule ligne de synthèse biologique courte, avec :\n- les anomalies biologiques utiles ;\n- les marqueurs obligatoires disponibles, même normaux ;\n- les bilans normaux utiles sous forme abrégée : ECBU RAS, IST RAS ;\n- les anomalies les plus graves en premier ;\n- uniquement des résultats biologiques bruts ;\n- aucun diagnostic ;\n- aucune interprétation médicale ;\n- aucune conduite à tenir ;\n- aucun commentaire long.\n\nRÈGLE ANTI-RECOPIE DU PROMPT\n\nLa sortie finale ne doit jamais contenir une phrase, un seuil, une règle, une consigne, un titre ou une liste provenant du prompt.\nLa sortie finale ne doit jamais commencer par un tiret.\nLa sortie finale ne doit jamais reprendre une phrase du type “si”, “ne jamais”, “toujours”, “commencer la ligne”, “citer”, “écrire”, “vérifier”, “critère”, “règle”, “prompt”.\nSi une consigne du prompt risque d’être recopiée, l’ignorer et produire uniquement les vrais résultats biologiques du patient.\n\nRÈGLE ANTI-FAUX BILAN RAS\n\nAvant de répondre “Bilan RAS”, analyser toute la biologie ligne par ligne.\n\nNe jamais répondre “Bilan RAS” si au moins une valeur est :\n- hors intervalle Minimum / Maximum du laboratoire ;\n- affichée en rouge, gras rouge, couleur d’anomalie ou signalée comme anormale ;\n- accompagnée d’une flèche ou d’un commentaire d’alerte ;\n- manifestement pathologique selon les seuils d’urgence.\n\nSi le tableau contient les colonnes Libellé / Valeur / Unité / Minimum / Maximum :\ncomparer la valeur mesurée au Minimum et au Maximum.\nSi Valeur < Minimum : citer la valeur avec ↓.\nSi Valeur > Maximum : citer la valeur avec ↑.\nNe jamais afficher les Minimum / Maximum dans la sortie finale.\n\nEn cas de doute entre “Bilan RAS” et citer une valeur anormale, citer la valeur anormale.\n“Bilan RAS” est autorisé uniquement si aucune valeur anormale, aucun marqueur obligatoire, aucun ECBU normal et aucun bilan IST normal ne doit être cité.\n\nSOURCE UNIQUE\n\nUtilise uniquement les résultats fournis après le signal :\nBIOLOGIE À ANALYSER CI-DESSOUS\n\nNe jamais inventer une valeur, une unité, une norme, une date ou un contexte clinique.\nLes normes du laboratoire sont prioritaires.\nSi une norme manque, ne pas conclure sauf seuil d’urgence évident.\nTenir compte des unités.\nNe pas interpréter cliniquement au-delà du résultat biologique.\n\nMARQUEURS OBLIGATOIRES\n\nToujours citer ces marqueurs s’ils sont disponibles, même normaux :\nLDL, non-HDL, TROPO, CRP, PCT, BNP, HG, LIPASE, DFG, HCG.\n\nNotation obligatoire :\nLDL : écrire LDL\nnon-HDL : écrire non-HDL sans espace avant la valeur\ntroponine : écrire TROPO\nCRP : écrire CRP\nprocalcitonine : écrire PCT\nNT-proBNP ou BNP : écrire BNP\nHbA1c ou hémoglobine glyquée : écrire HG\nlipase : écrire LIPASE\nDFG : écrire DFG, sans unité\nbêta-HCG : écrire HCG\n\nNe jamais répondre seulement “Bilan RAS”, “ECBU RAS” ou “IST RAS” si un marqueur obligatoire est disponible.\nSi un marqueur obligatoire est présent dans la biologie, il doit être présent dans la sortie finale.\n\nSORTIE FINALE\n\nRépondre uniquement par une seule ligne.\nNe jamais faire de retour à la ligne.\nNe jamais écrire d’explication.\nNe jamais écrire de liste.\nNe jamais commencer par un tiret.\n\nLa sortie finale doit contenir uniquement :\n- des résultats biologiques bruts du patient ;\n- ou Bilan RAS avec marqueurs obligatoires disponibles ;\n- ou ECBU RAS avec marqueurs obligatoires disponibles ;\n- ou IST RAS avec marqueurs obligatoires disponibles ;\n- ou URGENCE : suivi des vrais résultats biologiques urgents du patient.\n\nNe jamais écrire :\nRésumé, Anomalies, Alarme, À RELIRE, IMPORTANT, AUCUNE, Bilans RAS.\n\nÉcrire toujours “Bilan RAS” au singulier, jamais “Bilans RAS”.\n\nLe seul préfixe autorisé est :\nURGENCE :\n\nUtiliser URGENCE : uniquement si un critère d’urgence est présent.\nSinon, ne mettre aucun préfixe.\n\nSi aucune anomalie significative, aucun marqueur obligatoire disponible, aucun ECBU normal et aucun bilan IST normal :\nBilan RAS\n\nSi aucune anomalie significative mais marqueurs obligatoires disponibles :\nBilan RAS, puis les marqueurs obligatoires disponibles.\n\nSi ECBU présent et normal sans anomalie associée :\nECBU RAS\n\nSi ECBU présent et normal avec marqueurs obligatoires disponibles :\nECBU RAS, puis les marqueurs obligatoires disponibles.\n\nSi bilan IST présent et normal sans anomalie associée :\nIST RAS\n\nSi bilan IST présent et normal avec marqueurs obligatoires disponibles :\nIST RAS, puis les marqueurs obligatoires disponibles.\n\nSi anomalie biologique :\nécrire directement les anomalies avec nom du marqueur, flèche si nécessaire, valeur et unité.\n\nNORMES\n\nNe jamais afficher les limites, normes, minimums ou maximums du laboratoire dans la sortie finale.\nLes normes servent uniquement à savoir si une valeur est normale ou anormale.\nLa sortie finale doit contenir uniquement la valeur mesurée et son unité.\nException : pour ASAT, ALAT et GGT élevées, utiliser la norme haute uniquement pour calculer le nombre de fois la norme, mais ne jamais afficher la norme elle-même.\n\nCHOLESTÉROL / LIPIDES\n\nNe jamais afficher le cholestérol total.\nNe jamais afficher CT.\nMême si cholestérol total ou CT est anormal, ne pas le citer dans la sortie finale.\nLDL doit toujours être affiché s’il est disponible.\nnon-HDL doit toujours être affiché s’il est disponible.\nHDL doit être affiché uniquement s’il est anormal ou utile.\nTG doit être affiché uniquement s’il est anormal ou utile.\nNe jamais afficher le rapport CT/HDL.\nNe jamais utiliser le cholestérol total comme anomalie principale.\nPour le bilan lipidique, privilégier : LDL, non-HDL, HDL si anormal, TG si anormal.\n\nABRÉVIATIONS OBLIGATOIRES\n\nTriglycérides : TG\nGlycémie : Gly\nPotassium : K+\nPolynucléaires neutrophiles : PNN\nHémoglobine : Hb\nLeucocytes : Leuco\nMonocytes : Mono\nPlaquettes : Plaq\nFerritine : ferr\nCréatinine : créat\nCréatinine urinaire : Créat U\nRapport protéinurie/créatininurie, Ratio PTU/CU, Rapport ProtU/CrU ou équivalent : RAC\n\nNe jamais écrire dans la sortie finale :\ntriglycérides, glycémie, troponine, créatinine, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, non-HDL-cholestérol, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE.\n\nNe jamais afficher les hématies dans la sortie finale, même si elles sont basses ou hautes.\nNe jamais afficher l’hématocrite dans la sortie finale, même s’il est bas ou haut.\nPour une anomalie de l’hémoglobine, afficher uniquement Hb.\nPour une anomalie des leucocytes, afficher uniquement Leuco.\nPour une anomalie des monocytes, afficher uniquement Mono.\nPour une anomalie des plaquettes, afficher uniquement Plaq.\n\nUNITÉS À PRÉFÉRER SI PLUSIEURS SONT DISPONIBLES\n\nLDL : g/L\nnon-HDL : g/L\nHDL : g/L\nTG : g/L\nHG : %\ncréat : µmol/L\nHb : g/dL\nDFG : valeur seule sans unité\nPour les autres marqueurs : garder l’unité fournie.\n\nNe citer qu’une seule fois une même analyse.\nNe pas citer les unités alternatives si l’unité préférée est disponible.\nNe pas citer les valeurs historiques sauf évolution clairement utile.\n\nRÈGLES SPÉCIALES\n\nSi Hb basse selon la norme :\nciter Hb, et ajouter ferr et VGM s’ils sont disponibles.\nNe pas citer les hématies.\nNe pas citer l’hématocrite.\n\nSi TSH anormale :\nciter TSH et ajouter T4L si disponible.\n\nSi B12 ou folates bas :\nciter B12 ou folates, et ajouter VGM si disponible.\n\nSi BNP élevé :\nciter BNP et ajouter DFG si disponible.\n\nSi HCG disponible :\ntoujours citer HCG.\nNe pas écrire grossesse sauf si explicitement écrit dans le compte-rendu.\n\nECBU\n\nSi un ECBU est présent et normal, écrire :\nECBU RAS\n\nConsidérer ECBU normal si le compte-rendu mentionne une culture stérile, des cultures restées stériles, une absence d’infection urinaire, une absence de colonisation, une absence de bactériurie significative, une absence de leucocyturie significative, une absence de germe pathogène ou un examen cytobactériologique normal.\n\nSi ECBU normal et autres marqueurs obligatoires disponibles, écrire ECBU RAS, puis les marqueurs obligatoires disponibles.\n\nSi ECBU anormal, ne pas écrire ECBU RAS.\nCiter uniquement les éléments utiles : germe, leucocyturie, hématurie, nitrites, bactériurie, antibiogramme si pertinent, commentaire à contrôler si présent.\n\nNe jamais confondre ECBU RAS avec IST RAS.\n\nIST\n\nSi bilan IST présent et tous les résultats fournis sont négatifs ou normaux :\najouter IST RAS.\n\nSi un résultat IST est positif, douteux, limite, indéterminé ou à contrôler :\nne pas écrire IST RAS, citer uniquement le résultat concerné.\n\nIST inclut notamment VIH, syphilis, TPHA, VDRL, Chlamydia, gonocoque, Mycoplasma genitalium, VHB, VHC, Ag HBs, Ac anti-HBs, Ac anti-HBc.\n\nASAT / ALAT / GGT\n\nSi ASAT, ALAT ou GGT sont élevées :\n- si la limite supérieure de la norme est disponible et cohérente, afficher uniquement le nombre de fois la norme ;\n- calculer valeur divisée par limite supérieure ;\n- arrondir à une décimale ;\n- écrire directement sous la forme : ASAT ↑ 1.4N, ALAT ↑ 2.8N ou GGT ↑ 3.1N ;\n- ne pas afficher la valeur mesurée ni l’unité si le calcul en N est possible ;\n- ne pas écrire ≈ ;\n- ne pas écrire x ;\n- ne pas écrire U/L si le calcul en N est possible.\n\nSi la norme haute est absente, incohérente ou aberrante :\nciter la valeur mesurée avec son unité.\n\nSi la valeur est normale :\nne pas calculer en N et ne pas citer sauf nécessité particulière.\n\nFAUX POSITIFS À ÉVITER\n\nNe pas citer les pourcentages de formule leucocytaire si la valeur absolue correspondante est normale.\nNe pas citer les hématies.\nNe pas citer l’hématocrite.\nNe pas citer le rapport CT/HDL.\nNe pas citer les ratios sans utilité clinique associée, sauf RAC élevé.\nNe pas citer poids, taille ou IMC comme biologie.\nIgnorer les normes manifestement aberrantes.\nNe pas citer les anomalies minimes isolées sans pertinence évidente.\nNe pas citer une valeur signalée artefactuelle comme anomalie certaine.\nSi hémolyse, prélèvement coagulé, résultat douteux, limite, indéterminé, à contrôler ou non interprétable : le signaler brièvement dans la ligne.\n\nANOMALIES À CITER\n\nCiter les valeurs hors norme utiles, notamment :\nHb basse ou haute, Leuco élevés ou bas, PNN élevés ou bas, Mono élevés ou bas, Plaq anormales, CRP élevée, VS élevée, PCT élevée, DFG bas, créat augmentée, albuminurie/protéinurie, RAC élevé, ASAT/ALAT/GGT/PAL/bilirubine élevées, HG élevée, Gly élevée, LDL élevé, non-HDL élevé, HDL bas ou élevé selon norme, TG élevés, TSH anormale, T4L anormale, ferr basse ou très élevée, B12 basse, folates bas, vitamine D basse, PSA élevé, LIPASE élevée, BNP élevé, TROPO élevée, ECBU positif, bilan IST positif ou douteux.\n\nNe jamais citer cholestérol total ou CT, même si hors norme.\nNe jamais citer hématies ou hématocrite, même si hors norme.\n\nURGENCE\n\nCommencer la ligne par URGENCE : si au moins un critère suivant est présent :\nvaleur critique signalée par le laboratoire ;\nrésultat urgent ou appel prescripteur signalé par le laboratoire ;\nK+ très bas ou très élevé, sauf hémolyse signalée ;\nsodium très bas ou très élevé ;\ncalcium corrigé très bas ou très élevé ;\nGly très basse ou très élevée ;\nHb très basse ;\nPlaq très basses ;\nPNN très bas ;\nLeuco très élevés ;\nINR très élevé ;\nfibrinogène très bas ;\nlactates élevés ;\npH très acide ou très alcalin ;\nASAT ou ALAT très élevées ;\ncréat très élevée ou insuffisance rénale aiguë mentionnée, surtout avec hyperkaliémie ;\nLIPASE très élevée avec douleur abdominale ou contexte évocateur fourni ;\nhémoculture positive, paludisme positif ou LCR évocateur d’infection bactérienne ;\nTROPO élevée avec variation significative si deux dosages sont fournis ;\nTROPO ou D-dimères critiques si le laboratoire le signale ou si le contexte clinique fourni évoque douleur thoracique, dyspnée, embolie pulmonaire, syncope, déficit neurologique ou urgence cardiovasculaire.\n\nSi K+ élevé avec hémolyse signalée :\nciter K+ et hémolyse, mais ne pas mettre URGENCE uniquement pour ce K+.\n\nSTYLE FINAL\n\nUne seule ligne.\nStyle médical télégraphique.\nUniquement résultats bruts.\nForme normale : nom valeur unité.\nForme anormale : nom flèche nombre unité.\nPour ASAT, ALAT et GGT anormales : nom flèche nombreN si calcul possible.\nNe jamais écrire ASAT ↑ 72 U/L 1.4N.\nÉcrire ASAT ↑ 1.4N.\nNe jamais écrire d’interprétation médicale.\nNe jamais écrire de diagnostic.\nNe jamais écrire hypercholestérolémie, hypertriglycéridémie, dyslipidémie, syndrome inflammatoire, cytolyse, cholestase, anémie, diabète déséquilibré, pancréatite, infarctus, SCA, IDM, grossesse, infection, sauf si explicitement écrit dans le compte-rendu.\nNe jamais regrouper les résultats sous un diagnostic.\nNe jamais mettre les résultats entre parenthèses.\nNe jamais écrire une règle du prompt.\nNe jamais écrire un seuil générique du prompt.\nÉcrire uniquement les résultats biologiques bruts utiles.\nNe jamais ajouter les normes, minimums ou maximums après la valeur.\nSéparer par des virgules.\nUtiliser et uniquement avant le dernier élément.\nUtiliser ↑ ou ↓ si hors norme.\nUtiliser ↑↑ ou ↓↓ si très anormal.\n\nAUTO-CONTRÔLE SILENCIEUX\n\nAvant de répondre, contrôler silencieusement que la sortie finale est une seule ligne, qu’elle ne commence pas par un tiret, qu’elle contient uniquement des résultats biologiques du patient ou les formules Bilan RAS, ECBU RAS, IST RAS, qu’elle ne contient aucune règle du prompt, aucun seuil générique, aucune norme de laboratoire, aucun diagnostic, aucune parenthèse, et qu’elle contient tous les marqueurs obligatoires disponibles.\n\nVérifier aussi que la sortie finale ne contient jamais Hématies ni Hématocrite, et qu’elle utilise bien Hb, Leuco, Mono et Plaq.\n\nNe jamais afficher cet auto-contrôle.";
 
@@ -137,9 +140,9 @@ Ne jamais répondre “Bilan RAS” si au moins une valeur à citer est :
 - accompagnée d’une flèche ou d’un commentaire d’alerte ;
 - manifestement pathologique selon les seuils importants du prompt.
 
-Exception : certaines valeurs sont interdites dans la sortie finale, même si elles sont anormales. Ne pas les citer : créatinine sanguine, créat, cholestérol total, CT, saturation, hématies, hématocrite, CCMH.
+Exception : certaines valeurs sont interdites dans la sortie finale, même si elles sont anormales. Ne pas les citer : créatinine sanguine, créat, cholestérol total, CT, saturation, hématies, hématocrite, CCMH, chlore, chlorémie, chlorures.
 Ne jamais écrire Hématies, hématies, HÉMATIES, Hématocrite, hématocrite ou HÉMATOCRITE dans la sortie finale, même si la valeur est basse, haute, rouge, critique ou hors norme.
-Ne jamais écrire CCMH dans la sortie finale, même si la valeur est basse, haute, rouge, critique ou hors norme.
+Ne jamais écrire CCMH, Chlore, chlore, Chlorémie, chlorémie, Chlorure, chlorure, Chlorures, chlorures, Cl ou Cl- dans la sortie finale, même si la valeur est basse, haute, rouge, critique ou hors norme.
 
 Si le tableau contient les colonnes Libellé / Valeur / Unité / Minimum / Maximum :
 comparer la valeur mesurée au Minimum et au Maximum.
@@ -295,13 +298,7 @@ Créat U reste autorisé uniquement pour la créatinine urinaire si elle est uti
 ABRÉVIATIONS OBLIGATOIRES
 
 Triglycérides : TG
-Pour les triglycérides, écrire uniquement TG dans la sortie finale, jamais Triglycérides.
 Glycémie : Gly
-Pour la glycémie, écrire uniquement Gly dans la sortie finale, jamais Glycémie.
-Bilirubine totale : Bili totale mg/L
-Pour la bilirubine totale, écrire uniquement Bili totale mg/L dans la sortie finale, jamais Bilirubine totale.
-Bilirubine conjuguée : Bili conjuguée mg/L
-Pour la bilirubine conjuguée, écrire uniquement Bili conjuguée mg/L dans la sortie finale, jamais Bilirubine conjuguée.
 Potassium : K+
 Sodium : Na
 Calcium corrigé : Ca corr
@@ -317,14 +314,15 @@ INR : INR
 PSA : PSA
 
 Ne jamais écrire dans la sortie finale :
-Triglycérides, triglycérides, Triglycérides mmol/L, Glycémie, glycémie, Bilirubine totale, bilirubine totale, Bilirubine totale mg/L, Bilirubine totale µmol/L, Bilirubine totale umol/L, Bilirubine conjuguée, bilirubine conjuguée, Bilirubine conjuguée mg/L, Bilirubine conjuguée µmol/L, Bilirubine conjuguée umol/L, troponine, créatinine, créat, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., non-HDL-cholestérol, LDL-cholestérol, HDL-cholestérol, L.D.L., H.D.L., mmol/L pour HDL/LDL/non-HDL, mmol/L pour Gly, mmol/L pour TG, µmol/L pour Bili totale, umol/L pour Bili totale, µmol/L pour Bili conjuguée, umol/L pour Bili conjuguée, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, Saturation, saturation.
+triglycérides, glycémie, troponine, créatinine, créat, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., non-HDL-cholestérol, LDL-cholestérol, HDL-cholestérol, L.D.L., H.D.L., mmol/L pour HDL/LDL/non-HDL, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, Saturation, saturation, CCMH, ccmh, Chlore, chlore, Chlorémie, chlorémie, Chlorure, chlorure, Chlorures, chlorures, Cl, Cl-.
 
 Ne jamais afficher les hématies dans la sortie finale, même si elles sont basses ou hautes.
 Ne jamais afficher l’hématocrite dans la sortie finale, même s’il est bas ou haut.
 Ne jamais écrire Hématies ni Hématocrite dans la sortie finale, quelle que soit la casse ou l’accentuation.
 Ne jamais afficher la saturation dans la sortie finale, même si elle est basse ou haute.
-Ne jamais afficher CCMH dans la sortie finale, même si elle est basse ou haute.
 Ne jamais afficher la créatinine sanguine dans la sortie finale, même si elle est basse ou haute.
+Ne jamais afficher le CCMH dans la sortie finale, même s’il est bas ou haut.
+Ne jamais afficher le chlore, la chlorémie ou les chlorures dans la sortie finale, même s’ils sont bas ou hauts.
 Pour une anomalie de l’hémoglobine, afficher uniquement Hb.
 Pour une anomalie des leucocytes, afficher uniquement Leuco.
 Pour une anomalie des monocytes, afficher uniquement Mono.
@@ -336,14 +334,7 @@ LDL : g/L
 non-HDL : g/L
 HDL : g/L
 Pour HDL, LDL et non-HDL, g/L est obligatoire ; ne jamais afficher mmol/L.
-Gly : g/L
-Pour Gly, g/L est obligatoire ; ne jamais afficher mmol/L.
 TG : g/L
-Pour TG, g/L est obligatoire ; ne jamais afficher mmol/L.
-Bili totale mg/L : mg/L
-Pour Bili totale mg/L, mg/L est obligatoire ; ne jamais afficher µmol/L ni umol/L.
-Bili conjuguée mg/L : mg/L
-Pour Bili conjuguée mg/L, mg/L est obligatoire ; ne jamais afficher µmol/L ni umol/L.
 HG : %
 Hb : g/dL
 DFG : valeur seule sans unité
@@ -353,30 +344,6 @@ Pour les autres marqueurs : garder l’unité fournie.
 
 Ne citer qu’une seule fois une même analyse.
 Ne pas citer les unités alternatives si l’unité préférée est disponible.
-Pour Gly, si une valeur en g/L est fournie, utiliser uniquement la valeur en g/L.
-Pour Gly, si seule une valeur en mmol/L est fournie, convertir en g/L avec le facteur glucose mmol/L × 0,18, arrondir à 0,01 g/L, utiliser une virgule décimale et afficher uniquement g/L.
-Ne jamais citer deux glycémies dans la même sortie.
-Ne jamais afficher simultanément Gly en mmol/L et Gly en g/L.
-Sortie interdite : Glycémie ↑ 6.88 mmol/L, Glycémie ↑ 1.24 g/L.
-Format autorisé : Gly ↑ 1,24 g/L.
-Pour TG, si une valeur en g/L est fournie, utiliser uniquement la valeur en g/L.
-Pour TG, si seule une valeur en mmol/L est fournie, convertir en g/L avec le facteur triglycérides mmol/L × 0,8857, arrondir à 0,01 g/L, utiliser une virgule décimale et afficher uniquement g/L.
-Ne jamais citer deux triglycérides dans la même sortie.
-Ne jamais afficher simultanément TG en mmol/L et TG en g/L.
-Sortie interdite : Triglycérides ↑ 1.51 g/L, Triglycérides mmol/L ↑ 1.72 mmol/L.
-Format autorisé : TG ↑ 1,51 g/L.
-Pour Bili totale mg/L, si une valeur en mg/L est fournie, utiliser uniquement la valeur en mg/L.
-Pour Bili totale mg/L, si seule une valeur en µmol/L ou umol/L est fournie, convertir en mg/L avec le facteur bilirubine µmol/L × 0,5847, arrondir à 0,1 mg/L et afficher uniquement mg/L.
-Ne jamais citer deux bilirubines totales dans la même sortie.
-Ne jamais afficher simultanément Bili totale mg/L en mg/L et Bili totale mg/L en µmol/L.
-Sortie interdite : Bilirubine totale mg/L ↑ 12.9 mg/L, Bilirubine totale ↑ 22.1 µmol/L.
-Format autorisé : Bili totale mg/L ↑ 12.9 mg/L.
-Pour Bili conjuguée mg/L, si une valeur en mg/L est fournie, utiliser uniquement la valeur en mg/L.
-Pour Bili conjuguée mg/L, si seule une valeur en µmol/L ou umol/L est fournie, convertir en mg/L avec le facteur bilirubine µmol/L × 0,5847, arrondir à 0,1 mg/L et afficher uniquement mg/L.
-Ne jamais citer deux bilirubines conjuguées dans la même sortie.
-Ne jamais afficher simultanément Bili conjuguée mg/L en mg/L et Bili conjuguée mg/L en µmol/L.
-Sortie interdite : Bili conjuguée ↑ 6.7 µmol/L et Bili conjuguée mg/L ↑ 3.9 mg/L.
-Format autorisé : Bili conjuguée mg/L ↑ 3.9 mg/L.
 Ne pas citer les valeurs historiques sauf évolution clairement utile.
 
 RÈGLES SPÉCIALES
@@ -499,10 +466,12 @@ Ne pas citer les pourcentages de formule leucocytaire si la valeur absolue corre
 Ne pas citer les hématies.
 Ne pas citer l’hématocrite.
 Ne jamais écrire Hématies ni Hématocrite dans la sortie finale.
-Ne jamais citer CCMH.
+Ne pas citer CCMH.
+Ne pas citer chlore, chlorémie ni chlorures.
 Ne pas citer la saturation.
 Ne pas citer le cholestérol total.
 Ne pas citer CT.
+Ne pas citer le rapport CT/HDL.
 Ne jamais citer la créatinine sanguine ni créat.
 Ne pas citer les ratios sans utilité clinique associée, sauf RAC élevé.
 Ne pas citer poids, taille ou IMC comme biologie.
@@ -525,7 +494,8 @@ Toujours citer PSA s’il est au-dessus de la norme du laboratoire, positif ou s
 Ne jamais citer créatinine sanguine ni créat, même si DFG absent.
 Ne jamais citer cholestérol total ou CT, même si hors norme.
 Ne jamais citer saturation, même si hors norme.
-Ne jamais citer hématies, Hématies, HÉMATIES, hématocrite, Hématocrite, HÉMATOCRITE ou CCMH, même si hors norme.
+Ne jamais citer hématies, Hématies, HÉMATIES, hématocrite, Hématocrite ou HÉMATOCRITE, même si hors norme.
+Ne jamais citer CCMH, chlore, chlorémie ou chlorures, même si hors norme.
 
 STYLE FINAL
 
@@ -561,7 +531,7 @@ AUTO-CONTRÔLE SILENCIEUX
 
 Avant de répondre, contrôler silencieusement que la sortie finale est une seule ligne, qu’elle ne commence pas par un tiret, qu’elle contient uniquement des résultats biologiques du patient ou les formules Bilan RAS, ECBU RAS, IST RAS, Hémoccult RAS, qu’elle ne contient aucune règle du prompt, aucun seuil générique, aucune norme de laboratoire, aucun diagnostic, aucune parenthèse, et qu’elle contient tous les marqueurs obligatoires disponibles.
 
-Vérifier aussi que la sortie finale ne contient jamais Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, Saturation, cholestérol total, CT, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., LDL-cholestérol, HDL-cholestérol, non-HDL-cholestérol, L.D.L., H.D.L., Triglycérides, triglycérides, Glycémie, glycémie, Bilirubine totale, bilirubine totale, Bilirubine totale mg/L, Bilirubine totale µmol/L, Bilirubine totale umol/L, Bilirubine conjuguée, bilirubine conjuguée, Bilirubine conjuguée mg/L, Bilirubine conjuguée µmol/L, Bilirubine conjuguée umol/L, mmol/L pour HDL/LDL/non-HDL, mmol/L pour Gly, mmol/L pour TG, µmol/L pour Bili totale, umol/L pour Bili totale, µmol/L pour Bili conjuguée, umol/L pour Bili conjuguée, créatinine sanguine ou créat, qu’elle utilise bien Hb, Leuco, Mono, Plaq, TG, Gly, Bili totale mg/L et Bili conjuguée mg/L, que Gly est écrit une seule fois au maximum et uniquement en g/L, que TG est écrit une seule fois au maximum et uniquement en g/L, que Bili totale mg/L est écrit une seule fois au maximum et uniquement en mg/L, que Bili conjuguée mg/L est écrit une seule fois au maximum et uniquement en mg/L, que HDL, LDL et non-HDL sont écrits uniquement avec ces libellés et en g/L, que ASAT, ALAT et GGT sont écrites sous la forme ASAT 1,4N, ALAT 2,8N ou GGT 3,1N lorsque le calcul est possible, que INR est toujours présent si disponible, que DFG est toujours présent si disponible, qu’un seul DFG est cité, que la valeur du DFG cité est CKD/CKD-EPI si plusieurs DFG sont disponibles, qu’elle ne contient jamais “à relire”, que Hémoccult RAS est présent si recherche de sang dans les selles négative, que IMPORTANT : Hémoccult positif est présent si recherche de sang dans les selles positive, que tout IST positif commence par IMPORTANT :, que tout ECBU positif avec germe cité commence par IMPORTANT :, que NT-proBNP ou BNP ≥400 commence par IMPORTANT :, que HG ≥9 % commence par IMPORTANT :, que Hb <10 g/dL commence par IMPORTANT :, et que PSA >10 commence par IMPORTANT :.
+Vérifier aussi que la sortie finale ne contient jamais Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, ccmh, Chlore, chlore, Chlorémie, chlorémie, Chlorure, chlorure, Chlorures, chlorures, Cl, Cl-, Saturation, cholestérol total, CT, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., LDL-cholestérol, HDL-cholestérol, non-HDL-cholestérol, L.D.L., H.D.L., mmol/L pour HDL/LDL/non-HDL, créatinine sanguine ou créat, qu’elle utilise bien Hb, Leuco, Mono et Plaq, que HDL, LDL et non-HDL sont écrits uniquement avec ces libellés et en g/L, que ASAT, ALAT et GGT sont écrites sous la forme ASAT 1,4N, ALAT 2,8N ou GGT 3,1N lorsque le calcul est possible, que INR est toujours présent si disponible, que DFG est toujours présent si disponible, qu’un seul DFG est cité, que la valeur du DFG cité est CKD/CKD-EPI si plusieurs DFG sont disponibles, qu’elle ne contient jamais “à relire”, que Hémoccult RAS est présent si recherche de sang dans les selles négative, que IMPORTANT : Hémoccult positif est présent si recherche de sang dans les selles positive, que tout IST positif commence par IMPORTANT :, que tout ECBU positif avec germe cité commence par IMPORTANT :, que NT-proBNP ou BNP ≥400 commence par IMPORTANT :, que HG ≥9 % commence par IMPORTANT :, que Hb <10 g/dL commence par IMPORTANT :, et que PSA >10 commence par IMPORTANT :.
 
 Ne jamais afficher cet auto-contrôle.`;
 
@@ -743,6 +713,7 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     setupRememberedTitleAutofill();
+    setupManualTitleEditProtection();
     window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 900);
     setupAutoHeartbeat();
     handleAutoOnLoad();
@@ -763,7 +734,7 @@ Ne jamais afficher cet auto-contrôle.`;
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE BIOLOGIES CONTEXTE</button>
-        <button type="button" id="wbh-auto">MODE AUTO 15 MIN</button>
+        <button type="button" id="wbh-auto">MODE AUTO 5 MIN</button>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-stop">Arrêter</button>
         <div class="wbh-debug-actions" aria-label="Actions de debug">
@@ -1074,7 +1045,7 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 15 MIN";
+      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 5 MIN";
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
     }
@@ -2701,6 +2672,199 @@ Ne jamais afficher cet auto-contrôle.`;
     });
   }
 
+  function setupManualTitleEditProtection() {
+    if (manualTitleEditProtectionReady) {
+      return;
+    }
+
+    manualTitleEditProtectionReady = true;
+
+    document.addEventListener("focusin", (event) => {
+      if (!isWedaTitleInput(event.target) || getState().running) {
+        return;
+      }
+
+      markManualTitleEdit(event.target, "focus", false);
+    }, true);
+
+    document.addEventListener("keydown", (event) => {
+      if (!isWedaTitleInput(event.target) || getState().running || event.isTrusted === false) {
+        return;
+      }
+
+      if (
+        String(event.key || "").length === 1 ||
+        /^(?:Backspace|Delete|Enter)$/i.test(event.key || "")
+      ) {
+        markManualTitleEdit(event.target, "keydown", true);
+      }
+    }, true);
+
+    document.addEventListener("input", (event) => {
+      if (!isWedaTitleInput(event.target) || getState().running || event.isTrusted === false) {
+        return;
+      }
+
+      markManualTitleEdit(event.target, "input", true);
+    }, true);
+
+    document.addEventListener("change", (event) => {
+      if (!isWedaTitleInput(event.target) || getState().running || event.isTrusted === false) {
+        return;
+      }
+
+      markManualTitleEdit(event.target, "change", true);
+      rememberManualTitleEdit(event.target, "change");
+    }, true);
+
+    document.addEventListener("focusout", (event) => {
+      if (!isWedaTitleInput(event.target) || getState().running) {
+        return;
+      }
+
+      finishManualTitleEdit(event.target, "focusout");
+    }, true);
+  }
+
+  function isWedaTitleInput(element) {
+    return Boolean(element && element.id === "ContentPlaceHolder1_TextBoxHprimTitre");
+  }
+
+  function markManualTitleEdit(input, reason, dirty) {
+    const contentKey = getDisplayedBiologyContentKey();
+    const item = getSelectedBiologyItem();
+
+    if (!contentKey) {
+      return;
+    }
+
+    const previous = manualTitleEditState;
+    const now = Date.now();
+    const isSameBiology = previous && previous.contentKey === contentKey;
+    const wasInactive = !previous || !previous.active;
+
+    manualTitleEditState = {
+      contentKey,
+      rowKey: item ? item.key : "",
+      rowStableKey: item ? item.stableKey : "",
+      rowIndex: item ? item.index : null,
+      startedAt: isSameBiology && previous.startedAt ? previous.startedAt : now,
+      updatedAt: now,
+      lockUntil: (dirty || previous && previous.dirty) ? now + MANUAL_TITLE_EDIT_GRACE_MS : now,
+      active: true,
+      dirty: Boolean(dirty || previous && previous.dirty),
+      value: sanitizeTitle(input.value),
+    };
+
+    if (wasInactive || !isSameBiology) {
+      appendDebugLog("weda:manual-title-edit-start", {
+        reason,
+        contentKey,
+        rowIndex: item ? item.index : null,
+        currentLength: manualTitleEditState.value.length,
+        dirty: Boolean(dirty),
+      });
+    }
+  }
+
+  function finishManualTitleEdit(input, reason) {
+    const contentKey = getDisplayedBiologyContentKey();
+
+    if (!manualTitleEditState || manualTitleEditState.contentKey !== contentKey) {
+      return;
+    }
+
+    const wasDirty = Boolean(manualTitleEditState.dirty);
+    manualTitleEditState = {
+      ...manualTitleEditState,
+      active: false,
+      updatedAt: Date.now(),
+      lockUntil: wasDirty ? Date.now() + MANUAL_TITLE_EDIT_GRACE_MS : Date.now(),
+      value: sanitizeTitle(input.value),
+    };
+
+    if (wasDirty) {
+      rememberManualTitleEdit(input, reason);
+    }
+  }
+
+  function shouldPreserveManualTitleEdit(input, contentKey) {
+    if (!input || !contentKey) {
+      return false;
+    }
+
+    if (document.activeElement === input) {
+      return true;
+    }
+
+    return Boolean(
+      manualTitleEditState &&
+      manualTitleEditState.contentKey === contentKey &&
+      (manualTitleEditState.active || Date.now() <= Number(manualTitleEditState.lockUntil || 0))
+    );
+  }
+
+  function rememberManualTitleEdit(input, reason) {
+    const title = sanitizeTitle(input && input.value ? input.value : "");
+
+    if (!title || !isManualUserTitleAllowed(title)) {
+      return false;
+    }
+
+    const item = getSelectedBiologyItem();
+    const contentKey = getDisplayedBiologyContentKey();
+    const primaryKey = contentKey || (item && (item.key || item.stableKey)) || "";
+
+    if (!primaryKey) {
+      return false;
+    }
+
+    if (item && !isDisplayedBiologyForRow(item)) {
+      appendDebugLog("weda:manual-title-memory-skip", {
+        reason,
+        contentKey,
+        titleLength: title.length,
+        reasonDetail: "selected-row-does-not-match-displayed-biology",
+      });
+      return false;
+    }
+
+    rememberTitle(primaryKey, title, {
+      rowKey: item ? item.key : "",
+      rowStableKey: item ? item.stableKey : "",
+      rowIdentity: item ? item.identityLabel : "",
+      rowIndex: item ? item.index : undefined,
+      contentKey,
+      titleSource: "manual-user-title",
+      rememberReason: reason,
+    });
+
+    appendDebugLog("weda:manual-title-remembered", {
+      reason,
+      primaryKey,
+      contentKey,
+      rowIndex: item ? item.index : null,
+      titleLength: title.length,
+    });
+    return true;
+  }
+
+  function isManualUserTitleAllowed(title) {
+    const text = sanitizeTitle(title);
+
+    if (!text || text.length > 350 || isOnlyPunctuationText(text)) {
+      return false;
+    }
+
+    return !(
+      hasForbiddenHeidiLineText(text) ||
+      hasForbiddenLipidOutput(text) ||
+      hasForbiddenBloodOutput(text) ||
+      isHeidiUiNoiseLine(text) ||
+      isPromptInstructionLine(text)
+    );
+  }
+
   function applyRememberedTitleForSelectedRow(options = {}) {
     const state = getState();
 
@@ -2730,6 +2894,10 @@ Ne jamais afficher cet auto-contrôle.`;
       return;
     }
 
+    if (shouldPreserveManualTitleEdit(input, contentKey)) {
+      return;
+    }
+
     const rememberedInfo = getRememberedTitleForBiology(contentKey, item);
     const remembered = rememberedInfo.title;
     const currentTitle = sanitizeTitle(input.value);
@@ -2738,7 +2906,7 @@ Ne jamais afficher cet auto-contrôle.`;
       return;
     }
 
-    if (currentTitle && isTitleAllowedForWedaInsertion(currentTitle, { titleSource: "existing-weda-title" }) && !isRememberedTitleFromAnotherBiology(currentTitle, rememberedInfo.key || contentKey)) {
+    if (currentTitle && !isRememberedTitleFromAnotherBiology(currentTitle, rememberedInfo.key || contentKey)) {
       return;
     }
 
@@ -2837,6 +3005,10 @@ Ne jamais afficher cet auto-contrôle.`;
 
     if (!cleanTitle) {
       return false;
+    }
+
+    if (entry && entry.titleSource === "manual-user-title") {
+      return isManualUserTitleAllowed(cleanTitle);
     }
 
     return isTitleAllowedForWedaInsertion(cleanTitle, entry) || isExpectedTitleLine(cleanTitle) || isSoftBiologyTitleLine(cleanTitle, entry);
@@ -4938,7 +5110,7 @@ Ne jamais afficher cet auto-contrôle.`;
         throw new Error(forbiddenLipidOutput
           ? "réponse Heidi rejetée car elle contient un libellé ou une unité de cholestérol interdits"
           : forbiddenBloodOutput
-            ? "réponse Heidi rejetée car elle contient Hématies ou Hématocrite"
+            ? "réponse Heidi rejetée car elle contient un marqueur interdit"
           : "réponse Heidi rejetée car elle est vide, incomplète ou ressemble à une consigne du prompt");
       }
     }
@@ -7510,7 +7682,8 @@ Ne jamais afficher cet auto-contrôle.`;
   }
 
   function hasForbiddenBloodOutput(text) {
-    return /(?:^|[^\w])(?:hematies?|hematocrite)(?=$|[^\w])/i.test(normalizeForCompare(text));
+    const normalized = normalizeForCompare(text);
+    return /(?:^|[^\w])(?:hematies?|hematocrite|ccmh|chlore|chloremie|chlorures?|cl\s*-?)(?=$|[^\w])/i.test(normalized);
   }
 
   function isPromptInstructionLine(text) {
@@ -7527,11 +7700,11 @@ Ne jamais afficher cet auto-contrôle.`;
   }
 
   function hasBiologyMarkerText(text) {
-    return /\b(?:LDL|non-HDL|TROPO|CRP|PCT|BNP|NT-proBNP|HG|Hb|ferr|VGM|TSH|T4L|B12|folates|LIPASE|DFG|HCG|K\+|Na|Ca\s*corr|PNN|Plaq|plaquettes|Leuco|leucocytes|Mono|INR|RAC|ASAT|ALAT|GGT|PAL|bilirubine|Bili|cr[ée]at(?:\s*U)?|HDL|TG|Gly|vitamine D|PSA|ECBU|sodium|calcium|magn[ée]sium|Mg|phosphore|phosphate|c[ée]tones?|glyc[ée]mie|fibrinog[èe]ne|lactates?|pH|D-?dim[èe]res?|h[ée]moculture|paludisme|LCR|albuminurie|prot[ée]inurie|Helicobacter|pylori|H\.?\s*pylori|Toxo(?:plasmose)?|S[ée]ro\s*Toxo|S[ée]roToxo|CMV|rub[ée]ole|Rubella|EBV|HSV|VZV|Parvovirus|IgG|IgM)\b/i.test(text);
+    return /\b(?:LDL|non-HDL|TROPO|CRP|PCT|BNP|NT-proBNP|HG|Hb|ferr|VGM|TSH|T4L|B12|folates|LIPASE|DFG|HCG|K\+|Na|Ca\s*corr|PNN|Plaq|plaquettes|Leuco|leucocytes|Mono|INR|RAC|ASAT|ALAT|GGT|PAL|bilirubine|cr[ée]at(?:\s*U)?|HDL|TG|Gly|vitamine D|PSA|ECBU|sodium|calcium|magn[ée]sium|Mg|phosphore|phosphate|c[ée]tones?|glyc[ée]mie|fibrinog[èe]ne|lactates?|pH|D-?dim[èe]res?|h[ée]moculture|paludisme|LCR|albuminurie|prot[ée]inurie|Helicobacter|pylori|H\.?\s*pylori|Toxo(?:plasmose)?|S[ée]ro\s*Toxo|S[ée]roToxo|CMV|rub[ée]ole|Rubella|EBV|HSV|VZV|Parvovirus|IgG|IgM)\b/i.test(text);
   }
 
   function looksLikeBiologySummaryLine(text) {
-    const markerPattern = /\b(?:LDL|non-HDL|TROPO|CRP|PCT|BNP|NT-proBNP|HG|Hb|ferr|VGM|TSH|T4L|B12|folates|LIPASE|DFG|HCG|K\+|Na|Ca\s*corr|PNN|Plaq|plaquettes|Leuco|leucocytes|Mono|INR|RAC|ASAT|ALAT|GGT|PAL|bilirubine|Bili|cr[ée]at(?:\s*U)?|HDL|TG|Gly|vitamine D|PSA|ECBU|sodium|calcium|magn[ée]sium|Mg|phosphore|phosphate|c[ée]tones?|glyc[ée]mie|fibrinog[èe]ne|lactates?|pH|D-?dim[èe]res?|h[ée]moculture|paludisme|LCR|albuminurie|prot[ée]inurie|Helicobacter|pylori|H\.?\s*pylori|Toxo(?:plasmose)?|S[ée]ro\s*Toxo|S[ée]roToxo|CMV|rub[ée]ole|Rubella|EBV|HSV|VZV|Parvovirus|IgG|IgM)\b/i;
+    const markerPattern = /\b(?:LDL|non-HDL|TROPO|CRP|PCT|BNP|NT-proBNP|HG|Hb|ferr|VGM|TSH|T4L|B12|folates|LIPASE|DFG|HCG|K\+|Na|Ca\s*corr|PNN|Plaq|plaquettes|Leuco|leucocytes|Mono|INR|RAC|ASAT|ALAT|GGT|PAL|bilirubine|cr[ée]at(?:\s*U)?|HDL|TG|Gly|vitamine D|PSA|ECBU|sodium|calcium|magn[ée]sium|Mg|phosphore|phosphate|c[ée]tones?|glyc[ée]mie|fibrinog[èe]ne|lactates?|pH|D-?dim[èe]res?|h[ée]moculture|paludisme|LCR|albuminurie|prot[ée]inurie|Helicobacter|pylori|H\.?\s*pylori|Toxo(?:plasmose)?|S[ée]ro\s*Toxo|S[ée]roToxo|CMV|rub[ée]ole|Rubella|EBV|HSV|VZV|Parvovirus|IgG|IgM)\b/i;
     const istPattern = /\b(?:IST|VIH|syphilis|TPHA|VDRL|Chlamydia|gonocoque|Neisseria|Mycoplasma|hépatite|hepatite|Ag HBs|anti-HBs|anti-HBc|VHC)\b/i;
     const stoolBloodPattern = /\b(?:H[ée]mocc?ult|sang occulte|sang dans les selles|RSOS|FIT|test immunologique f[ée]cal|d[ée]pistage colorectal|test colorectal)\b/i;
     const microbiologyPattern = /\b(?:Helicobacter|pylori|H\.?\s*pylori|Toxo(?:plasmose)?|S[ée]ro\s*Toxo|S[ée]roToxo|CMV|rub[ée]ole|Rubella|EBV|HSV|VZV|Parvovirus|IgG|IgM|germe|culture|bact[ée]riurie|leucocyturie|h[ée]maturie|E\.\s*coli|Escherichia|Klebsiella|Proteus|Enterococcus|Pseudomonas|Staphylococcus|Streptococcus)\b/i;
