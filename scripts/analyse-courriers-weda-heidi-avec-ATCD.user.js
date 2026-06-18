@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF Heidi + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      2.10
+// @version      2.11
 // @description  Analyse les courriers PDF de Weda Échanges avec Heidi, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @match        https://scribe.heidihealth.com/*
@@ -28,7 +28,7 @@
   const HEIDI_URL = "https://scribe.heidihealth.com/";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "2.10";
+  const SCRIPT_VERSION = "2.11";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -52,7 +52,8 @@
   const HEIDI_COURRIER_SESSION_URL_KEY = `${STORAGE_PREFIX}heidiSessionUrl`;
   const HEIDI_COURRIER_SESSION_PHASE_KEY = `${STORAGE_PREFIX}heidiSessionPhase`;
   const SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY = `${STORAGE_PREFIX}wedaAtcdWorkerJobId`;
-  const WEDA_ATCD_WORKER_HASH_PREFIX = "AUTO_HH_WEDA_WORKER=";
+  const WEDA_ATCD_WORKER_HASH_PREFIX = "WEDA_ATCD_WORKER=";
+  const WEDA_ATCD_WORKER_HASH_PREFIX_LEGACY = "AUTO_HH_WEDA_WORKER=";
   const WEDA_ATCD_WORKER_OPEN_IN_BACKGROUND = true;
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
   const WEDA_ATCD_PENDING_OPEN_MS = 0; // 0 = pas d'expiration : le job ATCD reste récupérable jusqu'à validation humaine ou abandon manuel.
@@ -6693,14 +6694,56 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return `${base}#${WEDA_ATCD_WORKER_HASH_PREFIX}${encodeURIComponent(jobId)}`;
   }
 
-  function getWedaAtcdWorkerJobIdFromHash() {
+  function isWedaAtcdWorkerJobId(jobId) {
+    return /^weda-atcd(?:-|$)/i.test(String(jobId || ""));
+  }
+
+  function getWedaAtcdHashValue(prefix) {
     const hash = String(location.hash || "").replace(/^#/, "");
-    if (!hash.includes(WEDA_ATCD_WORKER_HASH_PREFIX)) {
+    const paramName = String(prefix || "").replace(/=$/, "");
+
+    if (!hash || !paramName) {
       return "";
     }
 
-    const part = hash.split(/[&]/).find((piece) => piece.startsWith(WEDA_ATCD_WORKER_HASH_PREFIX));
-    return part ? decodeURIComponent(part.slice(WEDA_ATCD_WORKER_HASH_PREFIX.length)) : "";
+    try {
+      const value = new URLSearchParams(hash).get(paramName);
+      if (value) return value;
+    } catch (_error) {
+      // Fallback manuel ci-dessous.
+    }
+
+    const part = hash.split(/[&]/).find((piece) => piece.startsWith(prefix));
+    if (!part) return "";
+
+    try {
+      return decodeURIComponent(part.slice(prefix.length));
+    } catch (_error) {
+      return part.slice(prefix.length);
+    }
+  }
+
+  function getWedaAtcdWorkerJobIdFromHash() {
+    const fromCurrentHash = getWedaAtcdHashValue(WEDA_ATCD_WORKER_HASH_PREFIX);
+    if (fromCurrentHash) {
+      if (isWedaAtcdWorkerJobId(fromCurrentHash)) return fromCurrentHash;
+
+      appendDebugLog("weda-atcd-worker:ignored-invalid-worker-hash", {
+        hashPrefix: WEDA_ATCD_WORKER_HASH_PREFIX,
+        workerJobId: fromCurrentHash,
+      });
+      return "";
+    }
+
+    const fromLegacyHash = getWedaAtcdHashValue(WEDA_ATCD_WORKER_HASH_PREFIX_LEGACY);
+    if (!fromLegacyHash) return "";
+    if (isWedaAtcdWorkerJobId(fromLegacyHash)) return fromLegacyHash;
+
+    appendDebugLog("weda-atcd-worker:ignored-foreign-worker-hash", {
+      hashPrefix: WEDA_ATCD_WORKER_HASH_PREFIX_LEGACY,
+      workerJobId: fromLegacyHash,
+    });
+    return "";
   }
 
   function getWedaAtcdWorkerJobIdForThisTab() {
@@ -6718,7 +6761,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     try {
       const fromSession = sessionStorage.getItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY) || "";
       if (fromSession) {
-        return fromSession;
+        if (!isWedaAtcdWorkerJobId(fromSession)) {
+          sessionStorage.removeItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY);
+          appendDebugLog("weda-atcd-worker:ignored-foreign-worker-session", {
+            workerJobId: fromSession,
+          });
+        } else {
+          return fromSession;
+        }
       }
     } catch (_error) {
       // Si sessionStorage est indisponible, on tente quand même l'adoption du job en attente.

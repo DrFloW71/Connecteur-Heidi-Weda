@@ -1,15 +1,19 @@
 // ==UserScript==
 // @name         WEDA HPRIM -> SMS MadeforMed
 // @namespace    https://secure.weda.fr/
-// @version      1.0.2
+// @version      1.2.2
 // @description  PageDown sur WEDA HPRIM : affecte la biologie active, recherche le patient exact nom+prénom dans MadeforMed et envoie un SMS standardisé.
 // @author       Florian Ronez + ChatGPT
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
+// @match        https://secure.weda.fr/FolderMedical/PatientViewForm.aspx*
+// @match        https://secure.weda.fr/FolderMedical/ConsultationForm.aspx*
 // @match        https://pro.madeformed.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_closeTab
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @run-at       document-idle
@@ -18,14 +22,20 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.2';
+    const VERSION = '1.2.2';
     const LOG_PREFIX = '[AUTO-HPRIM-SMS]';
 
     const MADEFORMED_URL = 'https://pro.madeformed.com/agenda';
     const HASH_PREFIX = 'AUTO_WEDA_HPRIM_SMS=';
+    const WEDA_TRACE_HASH_PREFIX = 'AUTO_HPRIM_SMS_WEDA_TRACE=';
+    const WEDA_TRACE_SESSION_KEY = 'auto_weda_hprim_sms_trace_job_id';
 
     const KEY_JOB = 'auto_weda_hprim_sms_job_v1';
     const KEY_REPORT = 'auto_weda_hprim_sms_last_report_v1';
+    const KEY_WEDA_WARNING = 'auto_weda_hprim_sms_weda_warning_v1';
+    const KEY_WEDA_TRACE_JOB = 'auto_weda_hprim_sms_weda_trace_job_v1';
+    const WEDA_WARNING_TTL_MS = 45 * 60 * 1000;
+    const WEDA_TRACE_TTL_MS = 20 * 60 * 1000;
 
     const SMS_TEXT = 'Bonjour, suite à votre dernière analyse il serait bien que nous nous voyions en consultation (avec moi personnellement). Rien d\'urgent rassurez vous. Bonne journée. Dr Ronez.';
 
@@ -38,6 +48,13 @@
         wedaPatientRows: '#ContentPlaceHolder1_PatientsGrid > tbody > tr.grid-item, #ContentPlaceHolder1_PatientsGrid tr.grid-item',
         wedaPatientIdentityCellPrincipal: '#ContentPlaceHolder1_PatientsGrid > tbody > tr.grid-item > td:nth-child(2)',
         wedaAffecterButtonPrincipal: '#ContentPlaceHolder1_PatientsGrid_ButtonAffecteResultat_0',
+        wedaOpenPatientLink: 'a[id*="PatientsGrid_HyperLinkGridGotoPatient"], a[id*="HyperLinkGridGotoPatient"], a[title*="Ouvrir la fiche patient"]',
+        wedaSearchInput: '#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche',
+        wedaSearchModeSelect: '#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient',
+        wedaSearchButton: '#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient',
+        wedaPatientOldGridLinks: 'a[id^="ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld_LinkButtonOldPatientGetNomPrenom_"]',
+        wedaNewConsultButton: '#ContentPlaceHolder1_MenuNavigate\\:submenu\\:2 > li:nth-child(1) > a',
+        wedaSaveButton: '#ButtonSave, input[name="ctl00$ContentPlaceHolder1$EvenementUcForm1$ButtonSave"], input.buttonheader.valid[value="Enregistrer"]',
 
         madeformedPatientsShortcut: '#shortcuts > div.shortcuts-bar.for-desktop > div:nth-child(1), #shortcuts .shortcut.menu-user-btn[data-title="Patients"], .shortcut.menu-user-btn[data-title="Patients"], [data-title="Patients"]',
         madeformedSearchInput: '#userSearch',
@@ -49,6 +66,10 @@
     };
 
     let localBusy = false;
+    let lastShownWedaWarningId = '';
+    let wedaTraceBusy = false;
+    let wedaTraceWakeListenerInstalled = false;
+    let lastHandledManualSmsJobId = '';
 
     function log(...args) {
         console.log(LOG_PREFIX, ...args);
@@ -85,6 +106,26 @@
         return location.hostname === 'secure.weda.fr' && /\/FolderMedical\/HprimForm\.aspx/i.test(location.pathname);
     }
 
+    function isWedaFindPatientPage() {
+        return location.hostname === 'secure.weda.fr' && /\/FolderMedical\/FindPatientForm\.aspx/i.test(location.pathname);
+    }
+
+    function isWedaPatientViewPage() {
+        return location.hostname === 'secure.weda.fr' && /\/FolderMedical\/PatientViewForm\.aspx/i.test(location.pathname);
+    }
+
+    function isWedaConsultationPage() {
+        return location.hostname === 'secure.weda.fr' && /\/FolderMedical\/ConsultationForm\.aspx/i.test(location.pathname);
+    }
+
+    function isWedaWarningPage() {
+        return isWedaHprimPage() || isWedaConsultationPage();
+    }
+
+    function isWedaTraceWorkerPage() {
+        return isWedaPatientViewPage() || isWedaConsultationPage();
+    }
+
     function isMadeformedPage() {
         return location.hostname === 'pro.madeformed.com';
     }
@@ -93,6 +134,26 @@
         const hash = String(location.hash || '').replace(/^#/, '');
         if (!hash.startsWith(HASH_PREFIX)) return '';
         return decodeURIComponent(hash.slice(HASH_PREFIX.length));
+    }
+
+    function getWedaTraceJobIdForThisTab() {
+        const hash = String(location.hash || '').replace(/^#/, '');
+
+        if (hash.startsWith(WEDA_TRACE_HASH_PREFIX)) {
+            const id = decodeURIComponent(hash.slice(WEDA_TRACE_HASH_PREFIX.length));
+
+            try {
+                sessionStorage.setItem(WEDA_TRACE_SESSION_KEY, id);
+            } catch (_) {}
+
+            return id;
+        }
+
+        try {
+            return sessionStorage.getItem(WEDA_TRACE_SESSION_KEY) || '';
+        } catch (_) {
+            return '';
+        }
     }
 
     function saveReport(status, data = {}) {
@@ -107,6 +168,123 @@
         GM_setValue(KEY_REPORT, report);
         log('Rapport', report);
         return report;
+    }
+
+    function buildSmsNotSentText(reason, patientFullName = '') {
+        const lines = [
+            'SMS MadeforMed non envoyé.',
+            patientFullName ? 'Patient : ' + patientFullName : '',
+            reason ? 'Motif : ' + reason : '',
+            'À envoyer manuellement depuis MadeforMed.'
+        ];
+
+        return lines.filter(Boolean).join('\n');
+    }
+
+    function publishWedaWarningForUnsentSms(job, reason, severity = 'error') {
+        const warning = {
+            id: 'weda_warning_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+            at: nowIso(),
+            jobId: job && job.id ? job.id : '',
+            status: job && job.status ? job.status : '',
+            severity,
+            patientFullName: job && job.patientFullNameRaw ? job.patientFullNameRaw : '',
+            reason: reason || 'Aucun SMS confirmé comme envoyé.'
+        };
+
+        GM_setValue(KEY_WEDA_WARNING, warning);
+        return warning;
+    }
+
+    function isRecentWedaWarning(warning) {
+        if (!warning || !warning.id || !warning.at) return false;
+
+        const ageMs = Date.now() - Date.parse(warning.at);
+        return Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= WEDA_WARNING_TTL_MS;
+    }
+
+    function showWedaWarningForUnsentSms(warning) {
+        if (!isRecentWedaWarning(warning)) return false;
+
+        const currentJob = GM_getValue(KEY_JOB, null);
+        if (currentJob && currentJob.id && warning.jobId && currentJob.id !== warning.jobId) {
+            return false;
+        }
+
+        const message = buildSmsNotSentText(warning.reason, warning.patientFullName);
+
+        if (lastShownWedaWarningId === warning.id && document.getElementById('auto-hprim-sms-weda-warning')) {
+            return true;
+        }
+
+        lastShownWedaWarningId = warning.id;
+        notify(message, warning.severity === 'warn' ? 'warn' : 'error', 0);
+
+        try {
+            const existing = document.getElementById('auto-hprim-sms-weda-warning');
+            if (existing) existing.remove();
+
+            const box = document.createElement('div');
+            box.id = 'auto-hprim-sms-weda-warning';
+            box.style.position = 'sticky';
+            box.style.top = '0';
+            box.style.zIndex = '2147483647';
+            box.style.margin = '8px 8px 12px';
+            box.style.padding = '12px 16px';
+            box.style.border = '3px solid #b3261e';
+            box.style.borderRadius = '8px';
+            box.style.background = '#fff4f4';
+            box.style.color = '#7a1020';
+            box.style.fontFamily = 'Arial, sans-serif';
+            box.style.fontSize = '16px';
+            box.style.fontWeight = '700';
+            box.style.lineHeight = '1.35';
+            box.style.whiteSpace = 'pre-wrap';
+            box.style.boxShadow = '0 4px 18px rgba(122,16,32,0.25)';
+            box.textContent = message;
+
+            const form = document.querySelector('form') || document.body;
+            if (form.firstChild) {
+                form.insertBefore(box, form.firstChild);
+            } else {
+                form.appendChild(box);
+            }
+        } catch (e) {
+            warn('Affichage avertissement WEDA impossible', e);
+        }
+
+        return true;
+    }
+
+    function installWedaWarningListener() {
+        if (!isWedaWarningPage()) return;
+
+        const pendingWarning = GM_getValue(KEY_WEDA_WARNING, null);
+        if (pendingWarning && !isRecentWedaWarning(pendingWarning)) {
+            GM_deleteValue(KEY_WEDA_WARNING);
+        } else if (pendingWarning) {
+            showWedaWarningForUnsentSms(pendingWarning);
+        }
+
+        if (typeof GM_addValueChangeListener === 'function') {
+            GM_addValueChangeListener(KEY_WEDA_WARNING, (_name, _oldValue, newValue) => {
+                if (newValue && !isRecentWedaWarning(newValue)) {
+                    GM_deleteValue(KEY_WEDA_WARNING);
+                } else if (newValue) {
+                    showWedaWarningForUnsentSms(newValue);
+                }
+            });
+            return;
+        }
+
+        setInterval(() => {
+            const warning = GM_getValue(KEY_WEDA_WARNING, null);
+            if (warning && !isRecentWedaWarning(warning)) {
+                GM_deleteValue(KEY_WEDA_WARNING);
+            } else if (warning) {
+                showWedaWarningForUnsentSms(warning);
+            }
+        }, 1500);
     }
 
     function notify(message, type = 'info', durationMs = 5200) {
@@ -447,6 +625,48 @@
         };
     }
 
+    function extractWedaPatientPatDk(patientRow) {
+        if (!patientRow) return '';
+
+        const sources = [];
+        const attrs = ['href', 'onclick', 'value', 'name', 'id', 'data-patdk', 'data-patient-id', 'data-id'];
+        const elements = [patientRow, ...patientRow.querySelectorAll('*')];
+
+        for (const el of elements) {
+            for (const attr of attrs) {
+                try {
+                    const value = el.getAttribute ? el.getAttribute(attr) : '';
+                    if (value) sources.push(value);
+                } catch (_) {}
+            }
+        }
+
+        try {
+            sources.push(patientRow.outerHTML || '');
+        } catch (_) {}
+
+        for (const source of sources) {
+            const text = String(source || '');
+            const match =
+                text.match(/[?&]PatDk=(\d+)/i) ||
+                text.match(/\bPatDk\b[^0-9]{0,40}(\d{2,})/i) ||
+                text.match(/\bPatientDk\b[^0-9]{0,40}(\d{2,})/i);
+
+            if (match && match[1]) return match[1];
+        }
+
+        return '';
+    }
+
+    function extractWedaPatientDateOfBirth(patientRow) {
+        if (!patientRow) return '';
+
+        const text = String(patientRow.textContent || '').replace(/\s+/g, ' ');
+        const match = text.match(/\b(\d{1,2}[./-]\d{1,2}[./-]\d{4})\b/);
+
+        return match ? match[1].replace(/[.-]/g, '/') : '';
+    }
+
     function findActiveWedaHprimNameElement() {
         const principal = document.querySelector(SELECTORS.wedaHprimNomPrincipal);
         if (principal && textOf(principal)) return principal;
@@ -509,6 +729,29 @@
         return null;
     }
 
+    function findWedaOpenPatientLink(patientRow) {
+        if (patientRow) {
+            const linkInRow = patientRow.querySelector(SELECTORS.wedaOpenPatientLink);
+            if (linkInRow) return linkInRow;
+
+            const linkInColumn = patientRow.querySelector('td:nth-child(7) a[href*="PatientViewForm.aspx"]');
+            if (linkInColumn) return linkInColumn;
+        }
+
+        return document.querySelector(SELECTORS.wedaOpenPatientLink);
+    }
+
+    function urlWithTraceHash(url, traceJobId) {
+        try {
+            const parsed = new URL(url, location.href);
+            parsed.hash = WEDA_TRACE_HASH_PREFIX + encodeURIComponent(traceJobId);
+            return parsed.href;
+        } catch (_) {
+            const cleanUrl = String(url || '').replace(/#.*$/, '');
+            return cleanUrl + '#' + WEDA_TRACE_HASH_PREFIX + encodeURIComponent(traceJobId);
+        }
+    }
+
     function clickWedaAffecterWithAutoConfirm(btn) {
         if (!btn) throw new Error('Bouton "Affecter ce résultat" introuvable.');
 
@@ -534,10 +777,21 @@
 
     function openMadeformedWorker(job) {
         const url = MADEFORMED_URL + '#' + HASH_PREFIX + encodeURIComponent(job.id);
+        const windowName = 'AUTO_HPRIM_SMS_' + job.id;
+
+        try {
+            const openedWindow = getPageWindow().open(url, windowName);
+            if (openedWindow) {
+                log('Onglet MadeforMed ouvert via window.open', url);
+                return openedWindow;
+            }
+        } catch (e) {
+            warn('window.open impossible, fallback GM_openInTab', e);
+        }
 
         try {
             const tab = GM_openInTab(url, {
-                active: false,
+                active: true,
                 insert: true,
                 setParent: true
             });
@@ -546,7 +800,7 @@
             return tab;
         } catch (e) {
             warn('GM_openInTab impossible, fallback window.open', e);
-            window.open(url, '_blank', 'noopener,noreferrer');
+            window.open(url, windowName);
             return null;
         }
     }
@@ -586,17 +840,34 @@
         try {
             const patient = getActiveWedaPatientIdentity();
             const hprimNomForLog = getActiveWedaHprimNomForLogOnly();
+            const patientPatDk = extractWedaPatientPatDk(patient.row);
+            const patientDateOfBirthRaw = extractWedaPatientDateOfBirth(patient.row);
+            const openPatientLink = findWedaOpenPatientLink(patient.row);
+            let wedaOpenPatientHref = '';
+
+            if (openPatientLink) {
+                try {
+                    wedaOpenPatientHref = new URL(openPatientLink.getAttribute('href') || openPatientLink.href || '', location.href).href;
+                } catch (_) {
+                    wedaOpenPatientHref = openPatientLink.getAttribute('href') || openPatientLink.href || '';
+                }
+            }
 
             if (!patient.nomNormalized || !patient.prenomNormalized) {
                 throw new Error('Nom/prénom patient vide après normalisation.');
             }
 
+            if (!wedaOpenPatientHref) {
+                throw new Error('Lien WEDA "Ouvrir la fiche patient" introuvable dans la ligne du patient.');
+            }
+
+            GM_deleteValue(KEY_WEDA_WARNING);
+            GM_deleteValue(KEY_WEDA_TRACE_JOB);
+
             const affecterBtn = findWedaAffecterButton(patient.row);
             if (!affecterBtn) {
                 throw new Error('Bouton "Affecter ce résultat" introuvable dans la ligne du patient.');
             }
-
-            await copyNameToClipboard(patient.fullNameRaw);
 
             const job = {
                 id: makeJobId(),
@@ -609,6 +880,9 @@
                 patientNomRaw: patient.nomRaw,
                 patientPrenomRaw: patient.prenomRaw,
                 patientFullNameRaw: patient.fullNameRaw,
+                patientPatDk,
+                patientDateOfBirthRaw,
+                wedaOpenPatientHref,
 
                 patientNomNormalized: patient.nomNormalized,
                 patientPrenomNormalized: patient.prenomNormalized,
@@ -627,6 +901,9 @@
                 patientNom: patient.nomRaw,
                 patientPrenom: patient.prenomRaw,
                 patientFullName: patient.fullNameRaw,
+                patientPatDk,
+                patientDateOfBirth: patientDateOfBirthRaw,
+                wedaOpenPatientHref,
                 hprimNomForLog: hprimNomForLog.raw
             });
 
@@ -638,6 +915,8 @@
             );
 
             openMadeformedWorker(job);
+
+            await copyNameToClipboard(patient.fullNameRaw);
 
             await sleep(250);
 
@@ -831,7 +1110,7 @@
         return textarea;
     }
 
-    async function fillAndSendMadeformedSms(textarea, smsText) {
+    async function prepareMadeformedSmsForManualSend(textarea, smsText) {
         textarea.focus();
 
         setNativeValue(textarea, '');
@@ -850,25 +1129,1061 @@
             throw new Error('Bouton Envoyer MadeforMed introuvable.');
         }
 
-        dispatchMouseClick(sendBtn);
-
-        await sleep(2500);
-
-        return true;
+        return sendBtn;
     }
 
-    function closeMadeformedTabSoon() {
-        notify('SMS envoyé.\nFermeture de l’onglet MadeforMed.', 'success', 2500);
+    function focusMadeformedForManualValidation() {
+        try {
+            window.focus();
+        } catch (_) {}
+
+        try {
+            const pageWindow = getPageWindow();
+            if (pageWindow && typeof pageWindow.focus === 'function') {
+                pageWindow.focus();
+            }
+        } catch (_) {}
+    }
+
+    function focusInitialWedaTabFromMadeformed() {
+        try {
+            if (window.opener && !window.opener.closed && typeof window.opener.focus === 'function') {
+                window.opener.focus();
+                return true;
+            }
+        } catch (e) {
+            warn('Focus onglet WEDA initial via opener impossible', e);
+        }
+
+        return false;
+    }
+
+    function focusCurrentWedaTabForReturn() {
+        let focused = false;
+
+        try {
+            window.focus();
+            focused = true;
+        } catch (_) {}
+
+        try {
+            const pageWindow = getPageWindow();
+            if (pageWindow && typeof pageWindow.focus === 'function') {
+                pageWindow.focus();
+                focused = true;
+            }
+        } catch (_) {}
+
+        return focused;
+    }
+
+    function normalizeSmsTextForTrace(text) {
+        return String(text || '')
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n')
+            .trim();
+    }
+
+    function readMadeformedSmsTextareaText(textarea) {
+        if (!textarea) return '';
+
+        if (typeof textarea.value === 'string') {
+            return normalizeSmsTextForTrace(textarea.value);
+        }
+
+        return normalizeSmsTextForTrace(textOf(textarea));
+    }
+
+    function getRequiredSentSmsText(job) {
+        if (!job || !Object.prototype.hasOwnProperty.call(job, 'smsTextSent')) {
+            throw new Error('Contenu exact du SMS envoyé non capturé : traçage automatique arrêté pour éviter de coller le SMS type.');
+        }
+
+        const smsText = normalizeSmsTextForTrace(job.smsTextSent);
+        if (!smsText) {
+            throw new Error('Contenu exact du SMS envoyé vide ou non capturable : traçage automatique arrêté pour éviter de coller le SMS type.');
+        }
+
+        return smsText;
+    }
+
+    function waitForManualMadeformedSmsSend(job, textarea, sendBtn) {
+        return new Promise(resolve => {
+            let done = false;
+
+            const cleanup = () => {
+                document.removeEventListener('click', onClick, true);
+                document.removeEventListener('submit', onSubmit, true);
+            };
+
+            const finish = trigger => {
+                if (done) return;
+                done = true;
+
+                const smsTextSent = readMadeformedSmsTextareaText(textarea);
+
+                cleanup();
+
+                notify(
+                    smsTextSent
+                        ? 'SMS détecté comme envoyé.\nTexte exact capturé pour le traçage WEDA.'
+                        : 'SMS détecté, mais texte non capturé.\nTraçage WEDA automatique bloqué pour éviter de coller le SMS type.',
+                    smsTextSent ? 'success' : 'error',
+                    smsTextSent ? 2600 : 0
+                );
+
+                setTimeout(() => {
+                    focusInitialWedaTabFromMadeformed();
+                }, 200);
+
+                setTimeout(() => {
+                    resolve({
+                        trigger,
+                        smsTextSent,
+                        sentDetectedAt: nowIso()
+                    });
+                }, 2500);
+            };
+
+            const isSendTarget = target => {
+                if (!target) return false;
+                if (sendBtn && (target === sendBtn || (sendBtn.contains && sendBtn.contains(target)))) return true;
+
+                const closest = target.closest ? target.closest(SELECTORS.madeformedSendButton) : null;
+                return !!closest;
+            };
+
+            const onClick = ev => {
+                if (isSendTarget(ev.target)) {
+                    finish('click-send-button');
+                }
+            };
+
+            const onSubmit = ev => {
+                const form = ev.target;
+                if (form && textarea && form.contains && form.contains(textarea)) {
+                    finish('submit-form');
+                }
+            };
+
+            document.addEventListener('click', onClick, true);
+            document.addEventListener('submit', onSubmit, true);
+
+            notify(
+                'SMS prêt dans MadeforMed.\nRelisez/modifiez si besoin, puis cliquez vous-même sur Envoyer.',
+                'success',
+                0
+            );
+            focusMadeformedForManualValidation();
+        });
+    }
+
+    function buildWedaTraceMessage(smsText) {
+        return 'SMS envoyé au patient via MadeforMed :\n' + normalizeSmsTextForTrace(smsText);
+    }
+
+    function makeWedaTraceJobId(smsJob) {
+        return 'hprim_sms_trace_' + (smsJob && smsJob.id ? smsJob.id : Date.now()) + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    function createWedaTraceJobFromSmsJob(smsJob, data = {}) {
+        const smsText = normalizeSmsTextForTrace(data.smsText || smsJob.smsTextSent || smsJob.smsText || SMS_TEXT);
+
+        return {
+            id: makeWedaTraceJobId(smsJob),
+            smsJobId: smsJob.id,
+            version: VERSION,
+            createdAt: nowIso(),
+            createdAtMs: Date.now(),
+            status: data.status || 'waiting_sms_sent',
+            source: 'hprim_sms_sent',
+            patientNomRaw: smsJob.patientNomRaw || '',
+            patientPrenomRaw: smsJob.patientPrenomRaw || '',
+            patientFullNameRaw: smsJob.patientFullNameRaw || '',
+            patientPatDk: smsJob.patientPatDk || '',
+            patientDateOfBirthRaw: smsJob.patientDateOfBirthRaw || '',
+            smsText,
+            traceMessage: buildWedaTraceMessage(smsText),
+            selectedMadeformedPatient: smsJob.selectedMadeformedPatient || null,
+            ...data
+        };
+    }
+
+    function cancelWedaTraceForUnsentSms(smsJob, reason) {
+        const traceJob = GM_getValue(KEY_WEDA_TRACE_JOB, null);
+        if (!traceJob || !smsJob || traceJob.smsJobId !== smsJob.id) return null;
+
+        const nextTraceJob = {
+            ...traceJob,
+            status: 'cancelled_sms_not_sent',
+            cancelReason: reason || 'SMS non envoyé.',
+            cancelledAt: nowIso(),
+            updatedAt: nowIso()
+        };
+
+        GM_setValue(KEY_WEDA_TRACE_JOB, nextTraceJob);
+        return nextTraceJob;
+    }
+
+    function openWedaTraceTabAfterManualSms(job) {
+        if (!job || !job.id) {
+            throw new Error('Job SMS absent pour le traçage WEDA.');
+        }
+
+        if (!job.wedaOpenPatientHref) {
+            throw new Error('Lien officiel WEDA du patient absent : traçage automatique impossible.');
+        }
+
+        const smsText = getRequiredSentSmsText(job);
+        const traceJob = createWedaTraceJobFromSmsJob(
+            {
+                ...job,
+                smsText,
+                selectedMadeformedPatient: job.selectedMadeformedPatient || null
+            },
+            {
+                status: 'sms_sent_open_consult',
+                smsSentAt: job.smsSentAt || nowIso(),
+                smsText,
+                traceMessage: buildWedaTraceMessage(smsText),
+                wedaOpenPatientHref: job.wedaOpenPatientHref,
+                openedAfterManualSmsAt: nowIso(),
+                hprimUrl: location.href
+            }
+        );
+
+        const tracedHref = urlWithTraceHash(job.wedaOpenPatientHref, traceJob.id);
+
+        GM_setValue(KEY_WEDA_TRACE_JOB, traceJob);
+
+        try {
+            GM_openInTab(tracedHref, {
+                active: false,
+                insert: true,
+                setParent: false
+            });
+        } catch (e) {
+            warn('GM_openInTab WEDA trace arrière-plan impossible', e);
+            throw new Error('Ouverture silencieuse de l’onglet WEDA de traçage impossible.');
+        }
+
+        log('Onglet WEDA de traçage ouvert après SMS manuel', {
+            traceJobId: traceJob.id,
+            smsJobId: job.id,
+            tracedHref
+        });
+
+        return traceJob;
+    }
+
+    function handleManualSmsSentOnWeda(job) {
+        if (!isWedaHprimPage()) return false;
+        if (!job || job.status !== 'sms-sent-manual' || !job.id) return false;
+        if (lastHandledManualSmsJobId === job.id) return true;
+
+        lastHandledManualSmsJobId = job.id;
+
+        try {
+            focusCurrentWedaTabForReturn();
+
+            notify(
+                'SMS envoyé.\nOuverture du dossier WEDA en arrière-plan pour traçage.',
+                'success',
+                4200
+            );
+
+            const traceJob = openWedaTraceTabAfterManualSms(job);
+
+            const nextJob = {
+                ...job,
+                status: 'weda-trace-opened',
+                wedaTraceJobId: traceJob.id,
+                wedaTraceOpenedAt: nowIso()
+            };
+
+            GM_setValue(KEY_JOB, nextJob);
+
+            saveReport('weda-trace-opened', {
+                jobId: job.id,
+                traceJobId: traceJob.id,
+                patientFullName: job.patientFullNameRaw,
+                smsText: traceJob.smsText
+            });
+
+            return true;
+        } catch (e) {
+            error('Ouverture WEDA trace après SMS manuel impossible', e);
+
+            saveReport('error-weda-trace-open-after-manual-sms', {
+                jobId: job.id,
+                patientFullName: job.patientFullNameRaw,
+                message: e.message || String(e),
+                stack: e.stack || ''
+            });
+
+            notify(
+                'SMS envoyé, mais traçage WEDA automatique impossible :\n' +
+                (e.message || String(e)) +
+                '\nTraçage manuel nécessaire.',
+                'error',
+                0
+            );
+
+            return false;
+        }
+    }
+
+    function installManualSmsSentListenerOnWeda() {
+        if (!isWedaHprimPage()) return;
+
+        const currentJob = GM_getValue(KEY_JOB, null);
+        handleManualSmsSentOnWeda(currentJob);
+
+        if (typeof GM_addValueChangeListener === 'function') {
+            GM_addValueChangeListener(KEY_JOB, (_name, _oldValue, newValue) => {
+                handleManualSmsSentOnWeda(newValue);
+            });
+            return;
+        }
+
+        setInterval(() => {
+            handleManualSmsSentOnWeda(GM_getValue(KEY_JOB, null));
+        }, 1500);
+    }
+
+    function getWedaTraceJobForThisTab() {
+        const traceJobId = getWedaTraceJobIdForThisTab();
+        if (!traceJobId) return null;
+
+        const job = GM_getValue(KEY_WEDA_TRACE_JOB, null);
+        if (!job || job.id !== traceJobId) return null;
+
+        const createdAtMs = Number(job.createdAtMs || Date.parse(job.createdAt || ''));
+        if (Number.isFinite(createdAtMs) && Date.now() - createdAtMs > WEDA_TRACE_TTL_MS) {
+            GM_deleteValue(KEY_WEDA_TRACE_JOB);
+            try {
+                sessionStorage.removeItem(WEDA_TRACE_SESSION_KEY);
+            } catch (_) {}
+            return null;
+        }
+
+        return job;
+    }
+
+    function updateWedaTraceJob(patch) {
+        const job = getWedaTraceJobForThisTab();
+        if (!job) return null;
+
+        const next = {
+            ...job,
+            ...patch,
+            updatedAt: nowIso()
+        };
+
+        GM_setValue(KEY_WEDA_TRACE_JOB, next);
+        return next;
+    }
+
+    function clearWedaTraceJob() {
+        GM_deleteValue(KEY_WEDA_TRACE_JOB);
+        try {
+            sessionStorage.removeItem(WEDA_TRACE_SESSION_KEY);
+        } catch (_) {}
+    }
+
+    function failWedaTrace(status, message, data = {}) {
+        const job = updateWedaTraceJob({
+            status: 'error_' + status,
+            errorMessage: message,
+            errorAt: nowIso(),
+            errorData: data
+        }) || getWedaTraceJobForThisTab();
+
+        error('Erreur traçage WEDA SMS', {
+            status,
+            message,
+            data,
+            job
+        });
+
+        saveReport('error-weda-trace-' + status, {
+            traceJobId: job && job.id ? job.id : '',
+            smsJobId: job && job.smsJobId ? job.smsJobId : '',
+            patientFullName: job && job.patientFullNameRaw ? job.patientFullNameRaw : '',
+            message,
+            data
+        });
+
+        notify(
+            'SMS envoyé, mais traçage WEDA impossible :\n' + message +
+            '\nÀ tracer manuellement dans le dossier patient.',
+            'error',
+            0
+        );
+    }
+
+    function scheduleWedaTraceRetry(reason, delayMs = 1200) {
+        log('Relance traçage WEDA programmée', {
+            reason,
+            delayMs
+        });
+
+        setTimeout(() => {
+            wedaTraceBusy = false;
+            runWedaTraceWorker();
+        }, delayMs);
+    }
+
+    function normalizeWedaTraceText(value) {
+        return String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function normalizeWedaDateText(value) {
+        return String(value || '').replace(/[.-]/g, '/').replace(/\s+/g, '').trim();
+    }
+
+    function getWedaTraceClickableTarget(el) {
+        if (!el) return null;
+
+        if (el.matches && el.matches('a, button, input[type="submit"], input[type="button"]')) {
+            return el;
+        }
+
+        const direct = el.querySelector ? el.querySelector('a, button, input[type="submit"], input[type="button"]') : null;
+        if (direct) return direct;
+
+        return el.closest ? el.closest('a, button, input[type="submit"], input[type="button"], tr[onclick], td[onclick], div[onclick], span[onclick]') || el : el;
+    }
+
+    function getWedaTracePatientCandidateText(el) {
+        if (!el) return '';
+
+        const container =
+            el.closest && (
+                el.closest('tr') ||
+                el.closest('li') ||
+                el.closest('table')
+            ) ||
+            el.parentElement ||
+            el;
+
+        return String([
+            el.textContent || '',
+            el.value || '',
+            el.getAttribute ? el.getAttribute('title') || '' : '',
+            container && container !== el ? container.textContent || '' : ''
+        ].join(' ')).replace(/\s+/g, ' ').trim();
+    }
+
+    function getWedaTracePatientCandidateTechnicalSource(el) {
+        if (!el) return '';
+
+        const sources = [getWedaTracePatientCandidateText(el)];
+        const attrs = ['href', 'onclick', 'value', 'name', 'id', 'data-patdk', 'data-patient-id', 'data-id'];
+        const elements = [
+            el,
+            ...(el.querySelectorAll ? Array.from(el.querySelectorAll('*')) : [])
+        ];
+
+        for (const candidate of elements) {
+            for (const attr of attrs) {
+                try {
+                    const value = candidate.getAttribute ? candidate.getAttribute(attr) : '';
+                    if (value) sources.push(value);
+                } catch (_) {}
+            }
+        }
+
+        try {
+            sources.push(el.outerHTML || '');
+        } catch (_) {}
+
+        return sources.join(' ');
+    }
+
+    function sourceContainsPatDk(source, patDk) {
+        if (!patDk) return false;
+
+        const text = String(source || '');
+        const escaped = String(patDk).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        return new RegExp('(?:PatDk|PatientDk|data-patdk)[^0-9]{0,40}' + escaped + '\\b', 'i').test(text);
+    }
+
+    function findWedaTracePatientResultTarget(patientName, dateOfBirth = '', patientPatDk = '') {
+        const wanted = normalizeWedaTraceText(patientName);
+        const wantedDate = normalizeWedaDateText(dateOfBirth);
+        const tokens = wanted.split(' ').filter(token => token.length >= 2);
+
+        if (!tokens.length) return null;
+
+        const oldGridLinks = Array.from(document.querySelectorAll(SELECTORS.wedaPatientOldGridLinks));
+        let best = null;
+        let bestScore = 0;
+
+        for (const link of oldGridLinks) {
+            const rawText = getWedaTracePatientCandidateText(link);
+            const text = normalizeWedaTraceText(rawText);
+            const technicalSource = getWedaTracePatientCandidateTechnicalSource(link);
+            if (!text || !tokens.every(token => text.includes(token))) continue;
+
+            let score = 1000;
+            if (sourceContainsPatDk(technicalSource, patientPatDk)) score += 10000;
+            if (text === wanted) score += 300;
+            if (text.includes(wanted)) score += 200;
+            if (text.startsWith(wanted)) score += 100;
+            if (wantedDate && normalizeWedaDateText(rawText).includes(wantedDate)) score += 500;
+            if (isVisible(link)) score += 50;
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = link;
+            }
+        }
+
+        if (best) return best;
+
+        const candidates = Array.from(document.querySelectorAll('a, button, input[type="submit"], input[type="button"], tr, td, span, div'));
+
+        for (const el of candidates) {
+            const rawText = getWedaTracePatientCandidateText(el);
+            const text = normalizeWedaTraceText(rawText);
+            const technicalSource = getWedaTracePatientCandidateTechnicalSource(el);
+            if (!text || text.length > 800 || !tokens.every(token => text.includes(token))) continue;
+
+            let score = 10;
+            if (sourceContainsPatDk(technicalSource, patientPatDk)) score += 10000;
+            if (text.includes(wanted)) score += 100;
+            if (text.startsWith(wanted)) score += 50;
+            if (wantedDate && normalizeWedaDateText(rawText).includes(wantedDate)) score += 300;
+            if (el.matches && el.matches('a, button, input')) score += 20;
+            if (isVisible(el)) score += 10;
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = getWedaTraceClickableTarget(el);
+            }
+        }
+
+        return best;
+    }
+
+    async function ensureWedaTraceSearchModePatientName() {
+        const select = await waitFor(() => document.querySelector(SELECTORS.wedaSearchModeSelect), 7000, 200);
+        if (!select) return true;
+
+        const selectedText = select.options && select.selectedIndex >= 0
+            ? String(select.options[select.selectedIndex].textContent || '')
+            : '';
+
+        if (select.value === 'Nom' || normalizeWedaTraceText(selectedText).includes('nom')) {
+            return true;
+        }
+
+        const optionByText = Array.from(select.options || []).find(option => normalizeWedaTraceText(option.textContent).includes('nom'));
+        const nextValue = optionByText ? optionByText.value : 'Nom';
+
+        select.value = nextValue;
+        select.dispatchEvent(new Event('input', { bubbles: true }));
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        scheduleWedaTraceRetry('après correction du mode de recherche WEDA', 1800);
+        return false;
+    }
+
+    async function submitWedaTraceSearch(job) {
+        const searchModeReady = await ensureWedaTraceSearchModePatientName();
+        if (!searchModeReady) return;
+
+        const input = await waitFor(() => document.querySelector(SELECTORS.wedaSearchInput), 15000, 200);
+        if (!input) {
+            failWedaTrace('search_input_not_found', 'Barre de recherche patient WEDA introuvable.', {
+                selector: SELECTORS.wedaSearchInput
+            });
+            return;
+        }
+
+        input.focus();
+        setNativeValue(input, job.patientFullNameRaw);
+
+        await sleep(300);
+
+        updateWedaTraceJob({
+            status: 'search_submitted',
+            searchSubmittedAt: Date.now()
+        });
+
+        const btn = document.querySelector(SELECTORS.wedaSearchButton);
+        if (btn) {
+            dispatchMouseClick(btn);
+        } else {
+            pressEnter(input);
+        }
+
+        scheduleWedaTraceRetry('après lancement recherche patient WEDA', 1400);
+    }
+
+    async function clickWedaTracePatient(job) {
+        const target = await waitFor(() => findWedaTracePatientResultTarget(job.patientFullNameRaw, job.patientDateOfBirthRaw || '', job.patientPatDk || ''), 15000, 250);
+
+        if (!target) {
+            const elapsed = Date.now() - (job.searchSubmittedAt || job.createdAtMs || Date.now());
+
+            if (elapsed < 25000 && isWedaFindPatientPage()) {
+                scheduleWedaTraceRetry('résultat patient WEDA non prêt', 1500);
+                return;
+            }
+
+            failWedaTrace('patient_not_found', 'Patient WEDA introuvable pour le traçage du SMS.', {
+                patientFullName: job.patientFullNameRaw,
+                patientDateOfBirth: job.patientDateOfBirthRaw || '',
+                url: location.href
+            });
+            return;
+        }
+
+        updateWedaTraceJob({
+            status: 'patient_clicked',
+            patientClickedAt: Date.now()
+        });
+
+        dispatchMouseClick(target);
+        scheduleWedaTraceRetry('après clic patient WEDA', 1200);
+    }
+
+    async function clickWedaTraceNewConsultation(job) {
+        if (isWedaConsultationPage()) {
+            updateWedaTraceJob({
+                status: 'consultation_clicked',
+                consultationClickedAt: Date.now()
+            });
+            scheduleWedaTraceRetry('consultation déjà ouverte', 500);
+            return;
+        }
+
+        const newConsultBtn = await waitFor(() => document.querySelector(SELECTORS.wedaNewConsultButton), 20000, 250);
+
+        if (!newConsultBtn) {
+            failWedaTrace('new_consult_not_found', 'Bouton Nouvelle consultation WEDA introuvable.', {
+                selector: SELECTORS.wedaNewConsultButton,
+                url: location.href
+            });
+            return;
+        }
+
+        updateWedaTraceJob({
+            status: 'consultation_clicked',
+            consultationClickedAt: Date.now()
+        });
+
+        dispatchMouseClick(newConsultBtn);
+        scheduleWedaTraceRetry('après clic Nouvelle consultation WEDA', 1200);
+    }
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function textToHtmlWithBreaks(text) {
+        return escapeHtml(text)
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n')
+            .replace(/\n/g, '<br>');
+    }
+
+    function findEditableContextInDocument(doc) {
+        if (!doc) return null;
+
+        const candidates = Array.from(doc.querySelectorAll('body[contenteditable="true"], [contenteditable="true"]'));
+
+        for (const el of candidates) {
+            if (el && el.isContentEditable) {
+                return { doc, el };
+            }
+        }
+
+        return null;
+    }
+
+    function findWedaEditorContext() {
+        let ctx = findEditableContextInDocument(document);
+        if (ctx) return ctx;
+
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+
+        for (const iframe of iframes) {
+            try {
+                const doc = iframe.contentDocument || iframe.contentWindow.document;
+                ctx = findEditableContextInDocument(doc);
+                if (ctx) return ctx;
+            } catch (_) {}
+        }
+
+        return null;
+    }
+
+    function insertWedaTraceMessageInEditor(ctx, message) {
+        const { doc, el } = ctx;
+        const html = '<p><br></p><p>' + textToHtmlWithBreaks(message) + '</p>';
+
+        el.focus();
+
+        try {
+            const selection = doc.getSelection();
+            const range = doc.createRange();
+
+            range.selectNodeContents(el);
+            range.collapse(true);
+
+            selection.removeAllRanges();
+            selection.addRange(range);
+
+            doc.execCommand('insertHTML', false, html);
+        } catch (e) {
+            warn('Insertion consultation WEDA par execCommand impossible, fallback innerHTML', e);
+            el.innerHTML = html + el.innerHTML;
+        }
+
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        try {
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' }));
+        } catch (_) {}
+    }
+
+    function normalizeEditorCompareText(value) {
+        return String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/<br\s*\/?\s*>/gi, '\n')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function editorContainsMessage(ctx, message) {
+        if (!ctx || !ctx.el) return false;
+
+        const haystack = normalizeEditorCompareText(ctx.el.innerText || ctx.el.textContent || ctx.el.innerHTML || '');
+        const target = normalizeEditorCompareText(message);
+
+        if (!haystack || !target) return false;
+        if (haystack.includes(target)) return true;
+
+        if (target.length <= 120) return false;
+
+        return haystack.includes(target.slice(0, 90)) && haystack.includes(target.slice(-90));
+    }
+
+    async function fillAndSaveWedaTraceConsultation(job) {
+        if (!isWedaConsultationPage()) {
+            const elapsed = Date.now() - (job.consultationClickedAt || Date.now());
+
+            if (elapsed < 30000) {
+                scheduleWedaTraceRetry('attente page ConsultationForm WEDA', 1000);
+                return;
+            }
+
+            failWedaTrace('consultation_page_not_reached', 'Page de consultation WEDA non atteinte après ouverture du dossier patient.', {
+                url: location.href
+            });
+            return;
+        }
+
+        const ctx = await waitFor(() => findWedaEditorContext(), 20000, 250);
+        if (!ctx) {
+            failWedaTrace('editor_not_found', 'Zone de texte de consultation WEDA introuvable.', {
+                url: location.href,
+                iframesCount: document.querySelectorAll('iframe').length
+            });
+            return;
+        }
+
+        const latestJob = getWedaTraceJobForThisTab();
+        if (!latestJob || latestJob.status !== 'consultation_clicked') return;
+
+        updateWedaTraceJob({
+            status: 'consultation_filling',
+            fillingAt: Date.now()
+        });
+
+        insertWedaTraceMessageInEditor(ctx, latestJob.traceMessage);
+
+        await sleep(300);
+
+        if (!editorContainsMessage(ctx, latestJob.traceMessage)) {
+            insertWedaTraceMessageInEditor(ctx, latestJob.traceMessage);
+            await sleep(300);
+        }
+
+        if (!editorContainsMessage(ctx, latestJob.traceMessage)) {
+            failWedaTrace('message_disappeared_before_save', 'Le texte du SMS n’est pas retrouvé dans la consultation WEDA avant sauvegarde.');
+            return;
+        }
+
+        const saveBtn = await waitFor(() => document.querySelector(SELECTORS.wedaSaveButton), 15000, 250);
+        if (!saveBtn) {
+            failWedaTrace('save_button_not_found', 'Bouton Enregistrer WEDA introuvable.', {
+                selector: SELECTORS.wedaSaveButton
+            });
+            return;
+        }
+
+        updateWedaTraceJob({
+            status: 'saved_pending_close',
+            filledAt: Date.now(),
+            savedAt: Date.now()
+        });
+
+        dispatchMouseClick(saveBtn);
+
+        saveReport('weda-trace-saved', {
+            traceJobId: latestJob.id,
+            smsJobId: latestJob.smsJobId,
+            patientFullName: latestJob.patientFullNameRaw,
+            patientPatDk: latestJob.patientPatDk || '',
+            smsText: latestJob.smsText
+        });
+
+        await sleep(3000);
+
+        closeWedaTraceTab();
+    }
+
+    function closeWedaTraceTab() {
+        clearWedaTraceJob();
 
         setTimeout(() => {
             try {
+                if (typeof GM_closeTab === 'function') {
+                    GM_closeTab();
+                    return;
+                }
+            } catch (e) {
+                warn('GM_closeTab indisponible pour fermer WEDA trace', e);
+            }
+
+            try {
+                if (typeof GM !== 'undefined' && GM && typeof GM.closeTab === 'function') {
+                    GM.closeTab();
+                    return;
+                }
+            } catch (e) {
+                warn('GM.closeTab indisponible pour fermer WEDA trace', e);
+            }
+
+            try {
+                window.open('', '_self');
                 window.close();
+            } catch (e) {
+                warn('window.close indisponible pour fermer WEDA trace', e);
+            }
+
+            setTimeout(() => {
+                try {
+                    if (!document.getElementById('auto-hprim-sms-weda-trace-close-fallback')) {
+                        const banner = document.createElement('div');
+                        banner.id = 'auto-hprim-sms-weda-trace-close-fallback';
+                        banner.style.position = 'fixed';
+                        banner.style.left = '12px';
+                        banner.style.top = '12px';
+                        banner.style.zIndex = '2147483647';
+                        banner.style.background = '#0b5a33';
+                        banner.style.color = '#fff';
+                        banner.style.padding = '10px 12px';
+                        banner.style.borderRadius = '8px';
+                        banner.style.fontFamily = 'Arial, sans-serif';
+                        banner.style.fontSize = '13px';
+                        banner.style.fontWeight = '700';
+                        banner.textContent = 'SMS tracé dans WEDA. Fermeture demandée ; si cet onglet reste ouvert, fermez-le manuellement.';
+                        document.body.appendChild(banner);
+                    }
+                } catch (_) {}
+            }, 900);
+        }, 700);
+    }
+
+    function installWedaTraceWakeListener() {
+        if (wedaTraceWakeListenerInstalled || !isWedaTraceWorkerPage()) return;
+
+        wedaTraceWakeListenerInstalled = true;
+
+        if (typeof GM_addValueChangeListener === 'function') {
+            GM_addValueChangeListener(KEY_WEDA_TRACE_JOB, (_name, _oldValue, newValue) => {
+                const traceJobId = getWedaTraceJobIdForThisTab();
+                if (!newValue || !traceJobId || newValue.id !== traceJobId) return;
+
+                setTimeout(() => {
+                    runWedaTraceWorker();
+                }, 100);
+            });
+            return;
+        }
+
+        setInterval(() => {
+            runWedaTraceWorker();
+        }, 1500);
+    }
+
+    async function runWedaTraceWorker() {
+        if (wedaTraceBusy) return;
+
+        const job = getWedaTraceJobForThisTab();
+        if (!job) return;
+
+        wedaTraceBusy = true;
+
+        try {
+            log('Traçage WEDA SMS actif', {
+                traceJobId: job.id,
+                status: job.status,
+                patientFullName: job.patientFullNameRaw,
+                patientPatDk: job.patientPatDk || '',
+                url: location.href
+            });
+
+            if (String(job.status || '').startsWith('error_')) {
+                notify(
+                    'Traçage WEDA du SMS en erreur :\n' + (job.errorMessage || job.status) +
+                    '\nÀ tracer manuellement dans le dossier patient.',
+                    'error',
+                    0
+                );
+                return;
+            }
+
+            if (job.status === 'waiting_sms_sent') {
+                if (!job.traceTabReadyAt) {
+                    updateWedaTraceJob({
+                        traceTabReadyAt: nowIso(),
+                        traceTabUrl: location.href
+                    });
+                }
+
+                notify(
+                    'Dossier WEDA ouvert pour traçage SMS.\nEn attente de confirmation MadeforMed.',
+                    'info',
+                    4500
+                );
+                return;
+            }
+
+            if (job.status === 'cancelled_sms_not_sent') {
+                notify(
+                    'SMS non envoyé dans MadeforMed.\nFermeture de l’onglet WEDA patient préparé.',
+                    'warn',
+                    2500
+                );
+
+                await sleep(1400);
+                closeWedaTraceTab();
+                return;
+            }
+
+            if (job.status === 'sms_sent_open_consult') {
+                if (isWedaConsultationPage()) {
+                    updateWedaTraceJob({
+                        status: 'consultation_clicked',
+                        consultationClickedAt: Date.now()
+                    });
+                    scheduleWedaTraceRetry('consultation WEDA déjà ouverte après SMS', 500);
+                    return;
+                }
+
+                if (!isWedaPatientViewPage()) {
+                    failWedaTrace('patient_view_not_open', 'L’onglet WEDA patient préparé n’est pas sur la fiche patient après envoi du SMS.', {
+                        url: location.href
+                    });
+                    return;
+                }
+
+                await clickWedaTraceNewConsultation(job);
+                return;
+            }
+
+            if (job.status === 'open_search' || job.status === 'search_submitted') {
+                failWedaTrace(
+                    'legacy_search_disabled',
+                    'Ancienne stratégie de recherche WEDA désactivée. Relancer depuis HPRIM pour ouvrir la fiche via le bouton officiel Ouvrir.',
+                    { url: location.href }
+                );
+                return;
+            }
+
+            if (job.status === 'patient_clicked') {
+                if (isWedaFindPatientPage()) {
+                    scheduleWedaTraceRetry('attente ouverture dossier patient WEDA', 1000);
+                    return;
+                }
+
+                await clickWedaTraceNewConsultation(job);
+                return;
+            }
+
+            if (job.status === 'consultation_clicked') {
+                await fillAndSaveWedaTraceConsultation(job);
+                return;
+            }
+
+            if (job.status === 'consultation_filling') {
+                const elapsed = Date.now() - (job.fillingAt || Date.now());
+
+                if (elapsed > 30000) {
+                    updateWedaTraceJob({ status: 'consultation_clicked' });
+                    scheduleWedaTraceRetry('verrou remplissage WEDA expiré', 500);
+                }
+
+                return;
+            }
+
+            if (job.status === 'saved_pending_close') {
+                await sleep(2500);
+                closeWedaTraceTab();
+                return;
+            }
+        } catch (e) {
+            failWedaTrace('unexpected', e.message || String(e), {
+                stack: e.stack || ''
+            });
+        } finally {
+            wedaTraceBusy = false;
+        }
+    }
+
+    function closeMadeformedTabSoon(message = 'SMS envoyé.\nFermeture de l’onglet MadeforMed.') {
+        notify(message, 'success', 2500);
+
+        setTimeout(() => {
+            focusInitialWedaTabFromMadeformed();
+
+            try {
+                window.close();
+            } catch (_) {}
+
+            try {
+                if (!window.closed && typeof GM_closeTab === 'function') {
+                    GM_closeTab();
+                    return;
+                }
             } catch (_) {}
 
             setTimeout(() => {
                 try {
                     if (!window.closed) {
-                        location.href = 'about:blank';
+                        focusInitialWedaTabFromMadeformed();
+                        warn('Fermeture automatique refusée par le navigateur. Aucun basculement vers about:blank.');
                     }
                 } catch (_) {}
             }, 900);
@@ -884,7 +2199,9 @@
         const job = GM_getValue(KEY_JOB, null);
 
         if (!job || job.id !== hashJobId) {
-            notify('Job HPRIM SMS introuvable ou expiré.\nAucun SMS envoyé.', 'error', 9000);
+            const reason = 'Job HPRIM SMS introuvable ou expiré.';
+            publishWedaWarningForUnsentSms({ id: hashJobId }, reason, 'error');
+            notify(buildSmsNotSentText(reason), 'error', 0);
 
             saveReport('error-madeformed-no-job', {
                 hashJobId
@@ -893,7 +2210,7 @@
             return;
         }
 
-        if (job.status === 'done') {
+        if (String(job.status || '').startsWith('done')) {
             notify('Job déjà terminé.\nAucun nouvel SMS envoyé.', 'warn', 5000);
             return;
         }
@@ -926,6 +2243,10 @@
                 job.madeformedResults = allSummaries;
                 GM_setValue(KEY_JOB, job);
 
+                const reason = 'Aucun patient MadeforMed avec nom + prénom exact.';
+                cancelWedaTraceForUnsentSms(job, reason);
+                publishWedaWarningForUnsentSms(job, reason, 'error');
+
                 saveReport('manual-check-no-exact-patient', {
                     jobId: job.id,
                     patientFullName: job.patientFullNameRaw,
@@ -933,12 +2254,7 @@
                     results: allSummaries
                 });
 
-                notify(
-                    'Aucun patient MadeforMed avec nom + prénom exact : ' + job.patientFullNameRaw +
-                    '\nAucun SMS envoyé. Contrôle manuel nécessaire.',
-                    'error',
-                    0
-                );
+                notify(buildSmsNotSentText(reason, job.patientFullNameRaw), 'error', 0);
 
                 return;
             }
@@ -948,6 +2264,10 @@
                 job.madeformedExactResults = exactSummaries;
                 GM_setValue(KEY_JOB, job);
 
+                const reason = 'Plusieurs patients MadeforMed correspondent exactement : contrôle manuel nécessaire.';
+                cancelWedaTraceForUnsentSms(job, reason);
+                publishWedaWarningForUnsentSms(job, reason, 'warn');
+
                 saveReport('manual-check-homonyms', {
                     jobId: job.id,
                     patientFullName: job.patientFullNameRaw,
@@ -955,12 +2275,7 @@
                     exactResults: exactSummaries
                 });
 
-                notify(
-                    'Plusieurs patients MadeforMed correspondent exactement à : ' + job.patientFullNameRaw +
-                    '\nAucun SMS envoyé pour éviter une erreur d’identité.',
-                    'warn',
-                    0
-                );
+                notify(buildSmsNotSentText(reason, job.patientFullNameRaw), 'warn', 0);
 
                 return;
             }
@@ -978,21 +2293,42 @@
 
             const textarea = await openContactPanelForPatient(selectedPanel);
 
-            await fillAndSendMadeformedSms(textarea, job.smsText || SMS_TEXT);
+            const sendBtn = await prepareMadeformedSmsForManualSend(textarea, job.smsText || SMS_TEXT);
 
-            job.status = 'done';
-            job.doneAt = nowIso();
             job.selectedMadeformedPatient = selectedSummary;
+            job.status = 'madeformed-waiting-manual-send';
+            job.madeformedManualReadyAt = nowIso();
             GM_setValue(KEY_JOB, job);
 
-            saveReport('done', {
+            saveReport('madeformed-waiting-manual-send', {
                 jobId: job.id,
                 patientFullName: job.patientFullNameRaw,
                 selectedMadeformedPatient: selectedSummary,
-                smsText: job.smsText || SMS_TEXT
+                smsTextPrepared: job.smsText || SMS_TEXT
             });
 
-            closeMadeformedTabSoon();
+            const manualSend = await waitForManualMadeformedSmsSend(job, textarea, sendBtn);
+
+            const sentJob = {
+                ...job,
+                status: 'sms-sent-manual',
+                smsSentAt: manualSend.sentDetectedAt,
+                smsTextSent: manualSend.smsTextSent,
+                manualSendTrigger: manualSend.trigger,
+                selectedMadeformedPatient: selectedSummary
+            };
+
+            GM_setValue(KEY_JOB, sentJob);
+
+            saveReport('sms-sent-manual', {
+                jobId: sentJob.id,
+                patientFullName: sentJob.patientFullNameRaw,
+                selectedMadeformedPatient: selectedSummary,
+                smsTextSent: sentJob.smsTextSent,
+                manualSendTrigger: sentJob.manualSendTrigger
+            });
+
+            closeMadeformedTabSoon('SMS envoyé.\nRetour WEDA et traçage lancés.\nFermeture de l’onglet MadeforMed.');
         } catch (e) {
             error('Erreur MadeforMed worker', e);
 
@@ -1004,6 +2340,10 @@
             job.errorAt = nowIso();
             GM_setValue(KEY_JOB, job);
 
+            const reason = 'Erreur MadeforMed : ' + (e.message || String(e));
+            cancelWedaTraceForUnsentSms(job, reason);
+            publishWedaWarningForUnsentSms(job, reason, 'error');
+
             saveReport('error-madeformed', {
                 jobId: job.id,
                 patientFullName: job.patientFullNameRaw,
@@ -1011,12 +2351,7 @@
                 stack: e.stack || ''
             });
 
-            notify(
-                'Erreur MadeforMed :\n' + (e.message || String(e)) +
-                '\nAucun SMS confirmé comme envoyé.',
-                'error',
-                0
-            );
+            notify(buildSmsNotSentText(reason, job.patientFullNameRaw), 'error', 0);
         }
     }
 
@@ -1035,9 +2370,20 @@
             return job;
         };
 
+        root.AUTO_HPRIM_SMS_WEDA_TRACE_JOB = function () {
+            const job = GM_getValue(KEY_WEDA_TRACE_JOB, null);
+            console.log(LOG_PREFIX, 'WEDA_TRACE_JOB', job);
+            return job;
+        };
+
         root.AUTO_HPRIM_SMS_CLEAR = function () {
             GM_deleteValue(KEY_JOB);
             GM_deleteValue(KEY_REPORT);
+            GM_deleteValue(KEY_WEDA_WARNING);
+            GM_deleteValue(KEY_WEDA_TRACE_JOB);
+            try {
+                sessionStorage.removeItem(WEDA_TRACE_SESSION_KEY);
+            } catch (_) {}
             console.log(LOG_PREFIX, 'Stockage nettoyé.');
             return true;
         };
@@ -1094,8 +2440,18 @@
 
     installConsoleHelpers();
 
+    if (isWedaWarningPage()) {
+        installWedaWarningListener();
+    }
+
     if (isWedaHprimPage()) {
+        installManualSmsSentListenerOnWeda();
         installWedaHotkey();
+    }
+
+    if (isWedaTraceWorkerPage()) {
+        installWedaTraceWakeListener();
+        runWedaTraceWorker();
     }
 
     if (isMadeformedPage()) {

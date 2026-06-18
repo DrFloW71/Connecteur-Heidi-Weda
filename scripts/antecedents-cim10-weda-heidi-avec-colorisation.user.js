@@ -2270,6 +2270,7 @@ END_ATCD`;
         log('Job', job);
 
         if (isImportLogEnabled() && job && job.status) {
+            const duplicateCounts = getDuplicateSkipCounts(job);
             logImportEvent('info', 'job_status', 'État du job : ' + job.status, {
                 jobId: job.id || '',
                 status: job.status,
@@ -2277,6 +2278,9 @@ END_ATCD`;
                 importIndex: job.importIndex || 0,
                 parsedCount: Array.isArray(job.parsedAtcd) ? job.parsedAtcd.length : 0,
                 importedCount: Array.isArray(job.imported) ? job.imported.length : 0,
+                duplicatesSkippedCount: duplicateCounts.regular,
+                duplicatesSkippedTotalCount: duplicateCounts.total,
+                duplicatesSkippedQualityRepairCount: duplicateCounts.qualityRepair,
                 errorCount: Array.isArray(job.errors) ? job.errors.length : 0
             });
         }
@@ -2287,6 +2291,10 @@ END_ATCD`;
 
         const expectedPatientId = getExpectedJobPatDk(job);
         const currentPatientId = getCurrentWedaPatDk();
+        const duplicateCounts = getDuplicateSkipCounts(job);
+        const importedQualityRepairCount = Array.isArray(job.imported)
+            ? job.imported.filter(entry => entry && entry.qualityRepair).length
+            : Number(job.importedQualityRepairCount || 0);
 
         const report = {
             ...job,
@@ -2306,6 +2314,11 @@ END_ATCD`;
             errorCount: Array.isArray(job.errors) ? job.errors.length : Number(job.errorCount || 0),
             parsedCount: Array.isArray(job.parsedAtcd) ? job.parsedAtcd.length : Number(job.parsedCount || 0),
             importedCount: Array.isArray(job.imported) ? job.imported.length : Number(job.importedCount || 0),
+            duplicatesSkippedCount: duplicateCounts.regular,
+            duplicatesSkippedTotalCount: duplicateCounts.total,
+            duplicatesSkippedQualityRepairCount: duplicateCounts.qualityRepair,
+            importedQualityRepairCount,
+            targetedReimportCount: importedQualityRepairCount + duplicateCounts.qualityRepair,
         };
 
         try {
@@ -2568,6 +2581,17 @@ END_ATCD`;
         };
     }
 
+    function getDuplicateSkipCounts(job) {
+        const duplicates = Array.isArray(job && job.duplicatesSkipped) ? job.duplicatesSkipped : [];
+        const total = duplicates.length || Number(job && job.duplicatesSkippedTotalCount || job && job.duplicatesSkippedCount || 0);
+        const qualityRepair = duplicates.length
+            ? duplicates.filter(entry => entry && entry.qualityRepair).length
+            : Number(job && job.duplicatesSkippedQualityRepairCount || 0);
+        const regular = Math.max(0, total - qualityRepair);
+
+        return { total, regular, qualityRepair };
+    }
+
     function compactLogValue(value, depth = 0) {
         if (value == null) return value;
         if (typeof value === 'string') return value.length > IMPORT_LOG_STRING_LIMIT ? value.slice(0, IMPORT_LOG_STRING_LIMIT) + '...' : value;
@@ -2614,6 +2638,10 @@ END_ATCD`;
         const currentTabOwnsJob = currentTabIsWorkerForJob || currentTabIsSourceForJob;
         const currentTabPatientMatches = !!(expectedPatientId && currentTabPatientId && sameWedaPatDk(expectedPatientId, currentTabPatientId));
         const currentTabPatientMismatch = !!(expectedPatientId && currentTabPatientId && !sameWedaPatDk(expectedPatientId, currentTabPatientId));
+        const duplicateCounts = getDuplicateSkipCounts(job);
+        const importedQualityRepairCount = Array.isArray(job.imported)
+            ? job.imported.filter(entry => entry && entry.qualityRepair).length
+            : Number(job.importedQualityRepairCount || 0);
 
         return {
             id: job.id || '',
@@ -2635,7 +2663,11 @@ END_ATCD`;
             importIndex: Number(job.importIndex || 0),
             parsedCount: Array.isArray(job.parsedAtcd) ? job.parsedAtcd.length : Number(job.parsedCount || 0),
             importedCount: Array.isArray(job.imported) ? job.imported.length : Number(job.importedCount || 0),
-            duplicatesSkippedCount: Array.isArray(job.duplicatesSkipped) ? job.duplicatesSkipped.length : Number(job.duplicatesSkippedCount || 0),
+            duplicatesSkippedCount: duplicateCounts.regular,
+            duplicatesSkippedTotalCount: duplicateCounts.total,
+            duplicatesSkippedQualityRepairCount: duplicateCounts.qualityRepair,
+            importedQualityRepairCount,
+            targetedReimportCount: importedQualityRepairCount + duplicateCounts.qualityRepair,
             skippedCount: Array.isArray(job.skipped) ? job.skipped.length : Number(job.skippedCount || 0),
             errorCount: Array.isArray(job.errors) ? job.errors.length : Number(job.errorCount || 0),
             qualityFullRetryCount: Number(job.qualityFullRetryCount || 0),
@@ -2701,6 +2733,10 @@ END_ATCD`;
             'parsedCount',
             'importedCount',
             'duplicatesSkippedCount',
+            'duplicatesSkippedTotalCount',
+            'duplicatesSkippedQualityRepairCount',
+            'importedQualityRepairCount',
+            'targetedReimportCount',
             'skippedCount',
             'skippedFamilialAlreadyCodedCount',
             'historicalErrorCount',
@@ -2895,6 +2931,10 @@ END_ATCD`;
             'parsedCount',
             'importedCount',
             'duplicatesSkippedCount',
+            'duplicatesSkippedTotalCount',
+            'duplicatesSkippedQualityRepairCount',
+            'importedQualityRepairCount',
+            'targetedReimportCount',
             'skippedCount',
             'missingCount',
             'expectedCount',
@@ -3262,6 +3302,7 @@ END_ATCD`;
         if (/weda is not defined/i.test(text) && source.startsWith('chrome-extension://')) return true;
         if (/showNotification/i.test(text) && /FWNotif\.js/i.test(source)) return true;
         if (/Cannot read properties of undefined \(reading 'showNotification'\)/i.test(text)) return true;
+        if (/Cannot read properties of undefined \(reading '_behaviors'\)/i.test(text) && /ScriptResource\.axd/i.test(source)) return true;
         if (/editor1\.FocusDocument is not a function/i.test(text)) return true;
         if (/selectZone is not defined/i.test(text)) return true;
         if (/^Erreur JavaScript globale$/i.test(text)) return true;
@@ -7578,10 +7619,13 @@ ${HEIDI_ASK_AI_PROMPT}`
         const raw = normalizeSpaces(text);
         if (!raw) return { date: '', cleaned: raw };
 
-        const fullDate = raw.match(/\b([0-3]\d\/[01]\d\/(?:19|20)\d{2})\b/);
+        const fullDate = raw.match(/\b(0*[0-3]?\d)[\/.-](0*[01]?\d)[\/.-]((?:19|20)\d{2})\b/);
         if (fullDate) {
+            const date = normalizeWedaDateValue(`${Number(fullDate[1])}/${Number(fullDate[2])}/${fullDate[3]}`);
+            if (!date) return { date: '', cleaned: raw };
+
             return {
-                date: fullDate[1],
+                date,
                 cleaned: normalizeSpaces(raw.replace(fullDate[0], '').replace(/^[,;\s]+|[,;\s]+$/g, ''))
             };
         }
@@ -7911,7 +7955,28 @@ ${HEIDI_ASK_AI_PROMPT}`
         const raw = normalizeSpaces(value);
         if (!raw) return false;
         if (extractDateToken(raw).date) return true;
+        if (sanitizeAtcdTechnicalDateField(raw)) return true;
         return /\b(ann[ée]es?|d[ée]but|fin)\b/i.test(raw);
+    }
+
+    function sanitizeAtcdTechnicalDateField(value) {
+        const cleaned = cleanOptionalAtcdTechnicalField(value);
+        if (!cleaned) return '';
+
+        const normalized = normalizeWedaDateValue(cleaned);
+        if (normalized) return normalized;
+
+        const raw = normalizeSpaces(cleaned);
+        const lenientFullDate = raw.match(/^(?:date\s*:?\s*)?0*([1-9]|[12]\d|3[01])[\/.-]0*([1-9]|1[0-2])[\/.-]((?:19|20)\d{2})$/i);
+        if (!lenientFullDate) return '';
+
+        return normalizeWedaDateValue(`${lenientFullDate[1]}/${lenientFullDate[2]}/${lenientFullDate[3]}`);
+    }
+
+    function getYearFromWedaDate(date) {
+        const normalized = normalizeWedaDateValue(date);
+        const match = normalized.match(/\b(19\d{2}|20\d{2})$/);
+        return match ? match[1] : '';
     }
 
     function extractOptionalPriorityFromTechnicalFields(fields) {
@@ -8046,7 +8111,7 @@ ${HEIDI_ASK_AI_PROMPT}`
                     title.description,
                     normalizeTechnicalLateralite(fields[4] || '')
                 );
-                const date = cleanOptionalAtcdTechnicalField(fields[5] || '');
+                const date = sanitizeAtcdTechnicalDateField(fields[5] || '');
 
                 return {
                     section,
@@ -8056,7 +8121,7 @@ ${HEIDI_ASK_AI_PROMPT}`
                         familyMember: title.familyMember,
                         remarks,
                         date,
-                        year: date && /\b(19\d{2}|20\d{2})\b/.test(date) ? date.match(/\b(19\d{2}|20\d{2})\b/)[1] : '',
+                        year: getYearFromWedaDate(date),
                         lateralite
                     }
                 };
@@ -8066,7 +8131,7 @@ ${HEIDI_ASK_AI_PROMPT}`
             const description = cleanAtcdTechnicalField(fields[2] || '');
             const code = normalizeCim10Code(cleanAtcdTechnicalField(fields[3] || ''));
             const remarks = cleanOptionalAtcdTechnicalField(cleanRemarkToken(fields.slice(4, Math.max(5, fields.length - 1)).join(' | ')));
-            const date = cleanOptionalAtcdTechnicalField(fields.length >= 6 ? fields[fields.length - 1] : '');
+            const date = sanitizeAtcdTechnicalDateField(fields.length >= 6 ? fields[fields.length - 1] : '');
 
             return {
                 section,
@@ -8076,7 +8141,7 @@ ${HEIDI_ASK_AI_PROMPT}`
                     familyMember,
                     remarks,
                     date,
-                    year: date && /\b(19\d{2}|20\d{2})\b/.test(date) ? date.match(/\b(19\d{2}|20\d{2})\b/)[1] : '',
+                    year: getYearFromWedaDate(date),
                     lateralite: ''
                 }
             };
@@ -8089,7 +8154,7 @@ ${HEIDI_ASK_AI_PROMPT}`
             description,
             normalizeTechnicalLateralite(fields.length >= 5 ? fields[fields.length - 2] : '') || detectLateralite(description)
         );
-        const date = cleanOptionalAtcdTechnicalField(fields.length >= 6 ? fields[fields.length - 1] : '');
+        const date = sanitizeAtcdTechnicalDateField(fields.length >= 6 ? fields[fields.length - 1] : '');
 
         return {
             section,
@@ -8099,7 +8164,7 @@ ${HEIDI_ASK_AI_PROMPT}`
                 familyMember: '',
                 remarks,
                 date,
-                year: date && /\b(19\d{2}|20\d{2})\b/.test(date) ? date.match(/\b(19\d{2}|20\d{2})\b/)[1] : '',
+                year: getYearFromWedaDate(date),
                 lateralite
             }
         };
@@ -13692,6 +13757,7 @@ ${HEIDI_ASK_AI_PROMPT}`
     function prepareSamePatientFullRetryAfterIncompleteImport(job, qualityReport, context = {}) {
         const latest = getJob() || job || {};
         const retryCount = Number(latest.qualityFullRetryCount || 0) + 1;
+        const duplicateCounts = getDuplicateSkipCounts(latest);
 
         latest.qualityFullRetryCount = retryCount;
         latest.qualityFullRetryHistory = Array.isArray(latest.qualityFullRetryHistory) ? latest.qualityFullRetryHistory : [];
@@ -13702,7 +13768,9 @@ ${HEIDI_ASK_AI_PROMPT}`
             previousImportIndex: Number(latest.importIndex || 0),
             previousParsedCount: Array.isArray(latest.parsedAtcd) ? latest.parsedAtcd.length : 0,
             previousImportedCount: Array.isArray(latest.imported) ? latest.imported.length : 0,
-            previousDuplicatesSkippedCount: Array.isArray(latest.duplicatesSkipped) ? latest.duplicatesSkipped.length : 0,
+            previousDuplicatesSkippedCount: duplicateCounts.regular,
+            previousDuplicatesSkippedTotalCount: duplicateCounts.total,
+            previousDuplicatesSkippedQualityRepairCount: duplicateCounts.qualityRepair,
             previousSkippedCount: Array.isArray(latest.skipped) ? latest.skipped.length : 0,
             previousErrorCount: Array.isArray(latest.errors) ? latest.errors.length : 0,
             context,
@@ -14207,7 +14275,14 @@ ${HEIDI_ASK_AI_PROMPT}`
 
             finalJob = getJob() || finalJob;
             const nbImported = Array.isArray(finalJob.imported) ? finalJob.imported.length : 0;
-            const nbDuplicatesSkipped = Array.isArray(finalJob.duplicatesSkipped) ? finalJob.duplicatesSkipped.length : 0;
+            const duplicateCounts = getDuplicateSkipCounts(finalJob);
+            const nbDuplicatesSkipped = duplicateCounts.regular;
+            const nbDuplicatesSkippedTotal = duplicateCounts.total;
+            const nbDuplicatesSkippedQualityRepair = duplicateCounts.qualityRepair;
+            const nbImportedQualityRepair = Array.isArray(finalJob.imported)
+                ? finalJob.imported.filter(entry => entry && entry.qualityRepair).length
+                : Number(finalJob.importedQualityRepairCount || 0);
+            const nbTargetedReimports = nbImportedQualityRepair + nbDuplicatesSkippedQualityRepair;
             const nbHistoricalErrors = Array.isArray(finalJob.errors) ? finalJob.errors.length : 0;
             const nbSkipped = Array.isArray(finalJob.skipped) ? finalJob.skipped.length : 0;
             const nbMissing = qualityReport && qualityReport.missingCount ? qualityReport.missingCount : 0;
@@ -14233,6 +14308,10 @@ ${HEIDI_ASK_AI_PROMPT}`
                 const retryJob = prepareSamePatientFullRetryAfterIncompleteImport(finalJob, qualityReport, {
                     importedCount: nbImported,
                     duplicatesSkippedCount: nbDuplicatesSkipped,
+                    duplicatesSkippedTotalCount: nbDuplicatesSkippedTotal,
+                    duplicatesSkippedQualityRepairCount: nbDuplicatesSkippedQualityRepair,
+                    importedQualityRepairCount: nbImportedQualityRepair,
+                    targetedReimportCount: nbTargetedReimports,
                     skippedCount: nbSkipped,
                     historicalErrorCount: nbHistoricalErrors,
                     missingCount: nbMissing,
@@ -14262,25 +14341,38 @@ ${HEIDI_ASK_AI_PROMPT}`
                     historicalErrorCount: nbHistoricalErrors,
                     importedCount: nbImported,
                     duplicatesSkippedCount: nbDuplicatesSkipped,
+                    duplicatesSkippedTotalCount: nbDuplicatesSkippedTotal,
+                    duplicatesSkippedQualityRepairCount: nbDuplicatesSkippedQualityRepair,
+                    importedQualityRepairCount: nbImportedQualityRepair,
+                    targetedReimportCount: nbTargetedReimports,
                     expectedCount,
                     foundCount,
                     qualityReport
                 });
             }
 
+            finalJob.duplicatesSkippedCount = nbDuplicatesSkipped;
+            finalJob.duplicatesSkippedTotalCount = nbDuplicatesSkippedTotal;
+            finalJob.duplicatesSkippedQualityRepairCount = nbDuplicatesSkippedQualityRepair;
+            finalJob.importedQualityRepairCount = nbImportedQualityRepair;
+            finalJob.targetedReimportCount = nbTargetedReimports;
             finalJob.status = 'DONE_IMPORT';
             setJob(finalJob);
             logImportEvent('info', 'import_done', 'Import CIM10 terminé sans erreur.', {
                 jobId: finalJob.id,
                 importedCount: nbImported,
                 duplicatesSkippedCount: nbDuplicatesSkipped,
+                duplicatesSkippedTotalCount: nbDuplicatesSkippedTotal,
+                duplicatesSkippedQualityRepairCount: nbDuplicatesSkippedQualityRepair,
+                importedQualityRepairCount: nbImportedQualityRepair,
+                targetedReimportCount: nbTargetedReimports,
                 skippedCount: nbSkipped,
                 expectedCount,
                 foundCount,
             });
 
             showBadge(
-                `Import CIM10 terminé.\nContrôle qualité : ${foundCount}/${expectedCount} retrouvé(s) dans WEDA.\nDoublons évités : ${nbDuplicatesSkipped}\nLignes Heidi ignorées : ${nbSkipped}\nRéimports ciblés : ${Math.max(0, nbImported + nbDuplicatesSkipped - expectedCount)}`,
+                `Import CIM10 terminé.\nContrôle qualité : ${foundCount}/${expectedCount} retrouvé(s) dans WEDA.\nDoublons évités : ${nbDuplicatesSkipped}\nLignes Heidi ignorées : ${nbSkipped}\nRéimports ciblés : ${nbTargetedReimports}`,
                 { duration: 7000 }
             );
 

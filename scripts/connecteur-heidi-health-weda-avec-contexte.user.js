@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Heidi Health vers WEDA
 // @namespace    http://tampermonkey.net/
-// @version      7.82
+// @version      7.86
 // @description  PageUp : lance Heidi + récupération du contexte. PageDown : transfert WEDA. Remplit constantes, suivis structurés, ajoute les étiquettes WEDA, contrôle qualité, notifications renforcées, retour accueil direct et fermeture accélérée. + DEBUG
 // @match        https://*/*
 // @exclude      https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -24,7 +24,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_HH = '7.82';
+    const VERSION_AUTO_HH = '7.86';
 
     const CLE_SIGNAL = 'auto_hh_signal_stable_v768';
     const CLE_SIGNAL_LEGACY = 'auto_hh_signal_stable';
@@ -38,6 +38,7 @@
     const CLE_TRANSFER_PREFIX = 'auto_hh_transfer_job_stable_';
     const CLE_CONTEXT_PREFIX = 'auto_hh_context_job_stable_';
     const CLE_SESSION_JOB = 'auto_hh_weda_worker_job_stable';
+    const CLE_WEDA_WORKER_OPEN_REQUEST = 'auto_hh_weda_worker_open_request_stable';
     const CLE_TAG_LOCK_PREFIX = 'auto_hh_tag_lock_stable_';
     const CLE_NOTIFICATION = 'auto_hh_notification_stable';
     const CLE_STATUT_INTERFACE = 'auto_hh_interface_status_stable_v776';
@@ -76,6 +77,7 @@
     const PAGE_WEDA_PATIENT = '/foldermedical/patientviewform.aspx';
     const PAGE_WEDA_FSE = '/vitalzen/fse.aspx';
     const PAGE_WEDA_HPRIM = '/foldermedical/hprimform.aspx';
+    const SELECTEUR_NOUVELLE_CONSULTATION_WEDA = '#ContentPlaceHolder1_MenuNavigate\\:submenu\\:2 > li:nth-child(1) > a';
 
     const SELECTEUR_IMAGE_SAUVEGARDE_WEDA = '#ContentPlaceHolder1_EvenementUcForm1_MenuNavigate > ul > li > a > img';
     const SELECTEUR_IMAGE_ACCUEIL_WEDA = 'img[src*="W_BLEU.png"], img[src*="W_BLEU"], img[src*="Weda"], img[src*="weda"]';
@@ -169,6 +171,9 @@ const DELAI_EXPIRATION_HEIDI_WORKER_MS = 8 * 60 * 60 * 1000;
 const DELAI_CLAIM_SIGNAL_HEIDI_MS = 120000;
 const DELAI_VERROU_LANCEMENT_HEIDI_MS = 120000;
 const DELAI_VERROU_CLIC_NOUVELLE_SESSION_HEIDI_MS = 10000;
+const DELAI_REPRISE_WORKER_WEDA_MS = 120000;
+const DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS = 5000;
+const NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA = 2;
 const ENTETE_CONTEXTE_WEDA_SECURITE = 'Contexte WEDA patient';
 
 
@@ -242,6 +247,10 @@ const ENTETE_CONTEXTE_WEDA_SECURITE = 'Contexte WEDA patient';
         const href = getTopHref();
         const hrefLower = String(href || '').toLowerCase();
         return hrefLower.includes(PAGE_WEDA_FSE) && !!getParamPatDkDepuisUrl(href);
+    }
+
+    function estPageErreurWeda() {
+        return EST_WEDA && getHrefLower().includes('/error.aspx');
     }
 
     function getUrlFseCouranteSiValide() {
@@ -2135,14 +2144,32 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
         }
     }
 
-    function ouvrirOngletHeidiDedie(worker) {
+    function construireUrlOngletHeidiDedie(workerId, urlCible = URL_HEIDI_DEDIEE) {
+        const urlBase = urlCible || URL_HEIDI_DEDIEE;
+
+        try {
+            const url = new URL(urlBase, URL_HEIDI_DEDIEE);
+            const hashBrut = String(url.hash || '').replace(/^#/, '');
+            const params = new URLSearchParams(hashBrut);
+            params.set(PARAM_WORKER_HEIDI, workerId);
+            url.hash = params.toString();
+            return url.toString();
+        } catch (e) {
+            const separateurHash = String(urlBase).includes('#') ? '&' : '#';
+            return String(urlBase) + separateurHash + PARAM_WORKER_HEIDI + '=' + encodeURIComponent(workerId);
+        }
+    }
+
+    function ouvrirOngletHeidiDedie(worker, options = {}) {
         if (!worker || !worker.workerId) return false;
 
-        const url = URL_HEIDI_DEDIEE + '#' + PARAM_WORKER_HEIDI + '=' + encodeURIComponent(worker.workerId);
+        const url = construireUrlOngletHeidiDedie(worker.workerId, options.sessionUrl || options.url || URL_HEIDI_DEDIEE);
         console.info('[AUTO-HH] Ouverture onglet Heidi dédié :', { url, worker });
         ajouterLogAutoHH('weda-open-heidi-worker-request', {
             url,
-            worker
+            worker,
+            raison: options.raison || null,
+            sessionUrl: options.sessionUrl || null
         });
 
         try {
@@ -2166,7 +2193,8 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             try {
                 window.open(url, '_blank');
                 ajouterLogAutoHH('weda-open-heidi-worker-window-open', {
-                    workerId: worker.workerId
+                    workerId: worker.workerId,
+                    raison: options.raison || null
                 });
                 return true;
             } catch (e2) {
@@ -2362,7 +2390,7 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
 
         try { GM_setValue(cle, jobOuvert); } catch (e) {}
 
-        ouvrirWedaEnArrierePlan(jobOuvert.wedaUrl, jobOuvert.jobId);
+        ouvrirWedaEnArrierePlan(jobOuvert.wedaUrl, jobOuvert.jobId, jobOuvert);
         surveillerStatutTransfert(jobOuvert.jobId);
 
         afficherBadge('AUTO-HH : worker WEDA ouvert', 4000);
@@ -5119,14 +5147,41 @@ function annulerJobsContexteActifsAutoHH(raison) {
         return descendant ? getCibleCliquableHeidi(descendant) : null;
     }
 
-    function getBoutonCopierHeidi() {
-        const spanCopier = [...document.querySelectorAll('span')].find(span => {
-            const texte = getTexteAccessibleElementHeidi(span);
-            return isVisible(span) && texte === normaliserTexte(TEXTE_BOUTON_COPIER);
-        });
+    function texteIndiqueBoutonCopierHeidi(texte) {
+        const t = normaliserTexte(texte).replace(/[_-]/g, ' ');
+        if (!t) return false;
 
-        if (spanCopier) return getCibleCliquableHeidi(spanCopier);
-        return getBoutonParTexte(TEXTE_BOUTON_COPIER);
+        if (t.includes('copier le texte')) return true;
+        if (t.includes('copy text')) return true;
+        if (t.includes('copy note')) return true;
+        if (t.includes('copy clinical note')) return true;
+
+        if (/\b(?:copier|copy)\b/.test(t)) {
+            return !/\b(?:logs?|debug|json)\b/.test(t);
+        }
+
+        return false;
+    }
+
+    function getBoutonCopierHeidi() {
+        const selecteurCandidats = [
+            'button',
+            '[role="button"]',
+            '[aria-label]',
+            '[title]',
+            '[data-testid]',
+            '[data-test-id]',
+            'span'
+        ].join(', ');
+
+        const candidats = [...document.querySelectorAll(selecteurCandidats)]
+            .map(getCibleCliquableHeidi)
+            .filter((element, index, tableau) => element && tableau.indexOf(element) === index);
+
+        return candidats.find(element => {
+            if (!isVisible(element)) return false;
+            return texteIndiqueBoutonCopierHeidi(getTexteAccessibleElementHeidi(element));
+        }) || null;
     }
 
     async function attendreAutomatisationHeidiDisponible(nom, timeoutMs = 12000) {
@@ -5641,15 +5696,39 @@ return null;
                 return;
             }
 
+            ajouterLogAutoHH('heidi-stop-session-restored', {
+                signal,
+                sessionCibleStop,
+                sessionCouranteApresRestore: getSessionHeidiCourante({ preferMenu: true, includeStorage: false })
+            });
+
             await sleep(700);
 
             let boutonArret = getBoutonArretTranscription();
-            if (!boutonArret && !getBoutonCopierHeidi()) {
+            let boutonCopierInitial = getBoutonCopierHeidi();
+
+            ajouterLogAutoHH('heidi-stop-buttons-initial', {
+                boutonArret: decrireBoutonHeidi(boutonArret),
+                boutonCopier: decrireBoutonHeidi(boutonCopierInitial)
+            });
+
+            if (!boutonArret && !boutonCopierInitial) {
                 boutonArret = await waitForElement(getBoutonArretTranscription, 'Arrêter la transcription Heidi', 8000);
+                boutonCopierInitial = getBoutonCopierHeidi();
+                ajouterLogAutoHH('heidi-stop-button-wait-result', {
+                    boutonArret: decrireBoutonHeidi(boutonArret),
+                    boutonCopier: decrireBoutonHeidi(boutonCopierInitial),
+                    boutons: boutonArret || boutonCopierInitial ? null : listerBoutonsHeidiPourDiagnostic()
+                });
             }
 
             if (boutonArret) {
                 const okArret = await cliquerBoutonArretTranscriptionHeidi(boutonArret);
+                ajouterLogAutoHH('heidi-stop-button-click-result', {
+                    okArret,
+                    boutonArret: decrireBoutonHeidi(boutonArret),
+                    boutonCopierApresClic: decrireBoutonHeidi(getBoutonCopierHeidi())
+                });
                 if (!okArret) {
                     afficherBadge('AUTO-HH : clic arrêt tenté, attente génération', 5000);
                 }
@@ -5659,9 +5738,22 @@ return null;
                 afficherBadge('AUTO-HH : arrêt non trouvé, attente génération', 4000);
             }
 
+            ajouterLogAutoHH('heidi-copy-wait-start', {
+                signal,
+                sessionCibleStop,
+                boutonCopierInitial: decrireBoutonHeidi(getBoutonCopierHeidi()),
+                timeoutMs: TIMEOUT_GENERATION_HEIDI_MS
+            });
+
             const boutonCopier = sessionCibleStop && sessionCibleStop.id
                 ? await attendreBoutonCopierHeidiSurSession(signal, sessionCibleStop, TIMEOUT_GENERATION_HEIDI_MS)
                 : await waitForElement(getBoutonCopierHeidi, 'Copier Heidi', TIMEOUT_GENERATION_HEIDI_MS);
+
+            ajouterLogAutoHH(boutonCopier ? 'heidi-copy-button-found' : 'heidi-copy-button-missing', {
+                boutonCopier: decrireBoutonHeidi(boutonCopier),
+                boutons: boutonCopier ? null : listerBoutonsHeidiPourDiagnostic()
+            });
+
             if (!boutonCopier) {
                 definirFaviconHeidiStatut('error', { duree: 8000 });
                 afficherBadge('AUTO-HH : bouton Copier introuvable', 8000);
@@ -5672,7 +5764,13 @@ return null;
 
             await sleep(DELAI_MIN_APRES_BOUTON_COPIER_HEIDI_MS);
             await verifierOuRestaurerSessionHeidiPendantPhase(signal, sessionCibleStop, 'avant_lecture_contenu_final');
-const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS, signal, sessionCibleStop);
+            const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS, signal, sessionCibleStop);
+
+            ajouterLogAutoHH(contenuHeidi && contenuHeidi.texte ? 'heidi-content-stable-found' : 'heidi-content-stable-missing', {
+                longueurTexte: contenuHeidi && contenuHeidi.texte ? contenuHeidi.texte.length : 0,
+                longueurHtml: contenuHeidi && contenuHeidi.html ? contenuHeidi.html.length : 0,
+                apercu: contenuHeidi && contenuHeidi.texte ? contenuHeidi.texte.slice(0, 220) : ''
+            });
 
             if (!contenuHeidi || !contenuHeidi.texte) {
                 definirFaviconHeidiStatut('error', { duree: 8000 });
@@ -5713,7 +5811,15 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
             };
 
             GM_setValue(CLE_TRANSFER_PREFIX + jobId, job);
-            ouvrirWedaEnArrierePlan(wedaUrl, jobId);
+            ajouterLogAutoHH('heidi-transfer-job-created', {
+                jobId,
+                wedaUrl,
+                heidiWorkerId: job.heidiWorkerId || null,
+                heidiSessionId: job.heidiSessionId || null,
+                longueurTexte: contenuHeidi.texte.length,
+                longueurHtml: contenuHeidi.html ? contenuHeidi.html.length : 0
+            });
+            ouvrirWedaEnArrierePlan(wedaUrl, jobId, job);
 
             definirFaviconHeidiStatut('transferring');
             afficherBadge('AUTO-HH : contenu envoyé vers WEDA', 5000);
@@ -5745,10 +5851,195 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         return String(url || '').split('#')[0];
     }
 
-    function ouvrirWedaEnArrierePlan(wedaUrl, jobId) {
+    function publierDemandeOuvertureWorkerWeda(wedaUrl, jobId, job = null) {
+        if (!jobId || !String(jobId).startsWith('job_')) return null;
+
+        const urlBase = nettoyerUrlPourOnglet(wedaUrl);
+        const patDk = getParamPatDkDepuisUrl(urlBase);
+        const demande = {
+            type: 'weda_worker_open_request',
+            version: VERSION_AUTO_HH,
+            jobId,
+            timestamp: Date.now(),
+            nonce: Math.random().toString(36).slice(2),
+            wedaUrl: urlBase,
+            patDk,
+            wedaOpenerId: job && (job.wedaOpenerId || job.wedaOpenedBy) || null,
+            source: location.href,
+            sourceHost: HOST
+        };
+
+        try { GM_setValue(CLE_WEDA_WORKER_OPEN_REQUEST, demande); } catch (e) {}
+        ajouterLogAutoHH('weda-worker-open-request-published', demande);
+        return demande;
+    }
+
+    function getOwnerRepriseWorkerWeda() {
+        let owner = null;
+        try { owner = sessionStorage.getItem('auto_hh_weda_worker_claim_owner_stable'); } catch (e) {}
+        if (!owner) {
+            owner = 'weda_worker_claim_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+            try { sessionStorage.setItem('auto_hh_weda_worker_claim_owner_stable', owner); } catch (e) {}
+        }
+        return owner;
+    }
+
+    function jobTransfertWedaEstReprenable(jobId, demande) {
+        if (!jobId || !String(jobId).startsWith('job_')) return false;
+
+        let job = null;
+        try { job = GM_getValue(CLE_TRANSFER_PREFIX + jobId, null); } catch (e) { job = null; }
+        if (!job || job.jobId !== jobId) return false;
+
+        if (['saved', 'saved_and_closed', 'error'].includes(String(job.status || ''))) return false;
+
+        const hrefCourant = getTopHref();
+        const hrefCourantLower = String(hrefCourant || '').toLowerCase();
+        const pageDossierPatientCourante =
+            hrefCourantLower.includes(PAGE_WEDA_PATIENT) ||
+            hrefCourantLower.includes(PAGE_WEDA_CONSULTATION) ||
+            hrefCourantLower.includes(PAGE_WEDA_FSE);
+        const patDkCourant = getParamPatDkDepuisUrl(hrefCourant);
+
+        if (!pageDossierPatientCourante || !patDkCourant) {
+            ajouterLogAutoHH('weda-worker-open-request-ignored-not-patient-page', {
+                jobId,
+                href: hrefCourant,
+                pageDossierPatientCourante,
+                patDkCourant
+            });
+            return false;
+        }
+
+        const patDkDemande = demande && demande.patDk ? String(demande.patDk) : '';
+        const patDkJob = getParamPatDkDepuisUrl(job.wedaUrl || job.sourceWedaUrl || '');
+
+        if (patDkDemande && patDkDemande !== patDkCourant) return false;
+        if (patDkJob && String(patDkJob) !== String(patDkCourant)) return false;
+
+        return true;
+    }
+
+    function revendiquerDemandeOuvertureWorkerWeda(demande, origine) {
+        if (!demande || !demande.jobId) return false;
+
+        const owner = getOwnerRepriseWorkerWeda();
+        const maintenant = Date.now();
+
+        try {
+            const demandeCourante = GM_getValue(CLE_WEDA_WORKER_OPEN_REQUEST, null);
+            if (!demandeCourante || demandeCourante.jobId !== demande.jobId || demandeCourante.nonce !== demande.nonce) return false;
+
+            if (
+                demandeCourante.claimedBy &&
+                demandeCourante.claimedBy !== owner &&
+                maintenant - Number(demandeCourante.claimedAt || 0) < DELAI_REPRISE_WORKER_WEDA_MS
+            ) {
+                ajouterLogAutoHH('weda-worker-open-request-claim-existing', {
+                    origine,
+                    owner,
+                    demandeCourante
+                });
+                return false;
+            }
+
+            GM_setValue(CLE_WEDA_WORKER_OPEN_REQUEST, {
+                ...demandeCourante,
+                claimedBy: owner,
+                claimedAt: maintenant,
+                claimedHref: getTopHref(),
+                claimedVisibility: (() => { try { return document.visibilityState; } catch (e) { return null; } })()
+            });
+
+            const verification = GM_getValue(CLE_WEDA_WORKER_OPEN_REQUEST, null);
+            const ok = !!(verification && verification.jobId === demande.jobId && verification.claimedBy === owner);
+
+            ajouterLogAutoHH(ok ? 'weda-worker-open-request-claim-won' : 'weda-worker-open-request-claim-lost', {
+                origine,
+                owner,
+                demande,
+                verification
+            });
+
+            return ok;
+        } catch (e) {
+            ajouterLogAutoHH('weda-worker-open-request-claim-error', {
+                origine,
+                demande,
+                erreur: String(e && e.message ? e.message : e)
+            });
+            return true;
+        }
+    }
+
+    function estOngletWorkerContexteWedaActuel() {
+        if (!EST_WEDA) return false;
+
+        try {
+            const hash = String(location.hash || '').replace(/^#/, '');
+            const params = new URLSearchParams(hash);
+            const jobContexteHash = params.get('AUTO_HH_WEDA_CONTEXT_WORKER');
+            if (jobContexteHash && String(jobContexteHash).startsWith('ctx_')) return true;
+        } catch (e) {}
+
+        try {
+            const jobContexteSession = sessionStorage.getItem('auto_hh_weda_context_worker_job_stable');
+            if (jobContexteSession && String(jobContexteSession).startsWith('ctx_')) return true;
+        } catch (e) {}
+
+        return false;
+    }
+
+    function getJobIdDepuisDemandeOuvertureWorkerWeda() {
+        if (!EST_WEDA || !isTopFrame()) return null;
+
+        if (estOngletWorkerContexteWedaActuel()) {
+            ajouterLogAutoHH('weda-worker-open-request-ignored-context-worker', {
+                href: getTopHref()
+            });
+            return null;
+        }
+
+        let demande = null;
+        try { demande = GM_getValue(CLE_WEDA_WORKER_OPEN_REQUEST, null); } catch (e) { demande = null; }
+        if (!demande || demande.type !== 'weda_worker_open_request' || !demande.jobId) return null;
+
+        const ageMs = Date.now() - Number(demande.timestamp || 0);
+        if (!Number.isFinite(ageMs) || ageMs < -5000 || ageMs > DELAI_REPRISE_WORKER_WEDA_MS) return null;
+
+        try {
+            if (document.visibilityState !== 'hidden') {
+                ajouterLogAutoHH('weda-worker-open-request-ignored-visible-tab', {
+                    demande,
+                    href: getTopHref(),
+                    visibility: document.visibilityState
+                });
+                return null;
+            }
+        } catch (e) {}
+
+        if (!jobTransfertWedaEstReprenable(demande.jobId, demande)) {
+            ajouterLogAutoHH('weda-worker-open-request-ignored-not-recoverable', {
+                demande,
+                href: getTopHref()
+            });
+            return null;
+        }
+
+        if (!revendiquerDemandeOuvertureWorkerWeda(demande, 'initialiserWorkerWedaSiBesoin')) return null;
+        return demande.jobId;
+    }
+
+    function ouvrirWedaEnArrierePlan(wedaUrl, jobId, job = null) {
         const urlBase = nettoyerUrlPourOnglet(wedaUrl);
         const urlWorker = urlBase + '#AUTO_HH_WEDA_WORKER=' + encodeURIComponent(jobId);
         console.info('[AUTO-HH] Ouverture WEDA worker en arrière-plan :', urlWorker);
+        publierDemandeOuvertureWorkerWeda(wedaUrl, jobId, job);
+        ajouterLogAutoHH('weda-worker-open-tab-request', {
+            jobId,
+            wedaUrl,
+            urlWorker
+        });
 
         try {
             const onglet = GM_openInTab(urlWorker, { active: false, insert: true, setParent: true });
@@ -5853,6 +6144,15 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
                 return;
             }
 
+            if (job.status === 'weda_error_page') {
+                clearInterval(timer);
+                definirFaviconHeidiStatut('error', { duree: 10000 });
+                afficherBadge('AUTO-HH : page erreur WEDA pendant le transfert', 10000);
+                console.warn('[AUTO-HH] Worker WEDA tombé sur error.aspx :', job);
+                delete ongletsWedaWorkers[jobId];
+                return;
+            }
+
             if (Date.now() - start > 150000) {
                 clearInterval(timer);
                 definirFaviconHeidiStatut('error', { duree: 10000 });
@@ -5930,6 +6230,13 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         GM_setValue(key, nouveauJob);
     }
 
+    function decoderChaineJavascriptAttributWeda(valeur) {
+        return String(valeur || '')
+            .replace(/\\\\/g, '\\')
+            .replace(/\\'/g, "'")
+            .replace(/\\"/g, '"');
+    }
+
     function extrairePostBackWedaDepuisElement(element) {
         if (!element) return null;
 
@@ -5954,8 +6261,10 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
                 const matchSimple = valeur.match(/__doPostBack\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)/);
                 if (matchSimple) {
                     return {
-                        eventTarget: matchSimple[1],
-                        eventArgument: matchSimple[2],
+                        eventTarget: decoderChaineJavascriptAttributWeda(matchSimple[1]),
+                        eventArgument: decoderChaineJavascriptAttributWeda(matchSimple[2]),
+                        eventTargetBrut: matchSimple[1],
+                        eventArgumentBrut: matchSimple[2],
                         source: 'attribut_simple_quote',
                         attribut: valeur
                     };
@@ -5964,8 +6273,10 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
                 const matchDouble = valeur.match(/__doPostBack\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)/);
                 if (matchDouble) {
                     return {
-                        eventTarget: matchDouble[1],
-                        eventArgument: matchDouble[2],
+                        eventTarget: decoderChaineJavascriptAttributWeda(matchDouble[1]),
+                        eventArgument: decoderChaineJavascriptAttributWeda(matchDouble[2]),
+                        eventTargetBrut: matchDouble[1],
+                        eventArgumentBrut: matchDouble[2],
                         source: 'attribut_double_quote',
                         attribut: valeur
                     };
@@ -5974,6 +6285,32 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         }
 
         return null;
+    }
+
+    function decrireElementWeda(element) {
+        if (!element) return null;
+
+        let rect = null;
+        try {
+            const r = element.getBoundingClientRect();
+            rect = {
+                x: Math.round(r.x),
+                y: Math.round(r.y),
+                width: Math.round(r.width),
+                height: Math.round(r.height)
+            };
+        } catch (e) {}
+
+        return {
+            tag: String(element.tagName || '').toLowerCase(),
+            id: element.id || null,
+            href: String(element.getAttribute?.('href') || '').slice(0, 180),
+            onclick: String(element.getAttribute?.('onclick') || '').slice(0, 220),
+            title: String(element.getAttribute?.('title') || '').slice(0, 120),
+            text: String(element.innerText || element.textContent || element.value || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+            visible: isVisible(element),
+            rect
+        };
     }
 
     function getBoutonAccueilWeda() {
@@ -6303,7 +6640,9 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         try {
             const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
             if (typeof w.__doPostBack === 'function') {
-                w.__doPostBack(eventTarget, eventArgument || '');
+                const eventTargetDecode = decoderChaineJavascriptAttributWeda(eventTarget);
+                const eventArgumentDecode = decoderChaineJavascriptAttributWeda(eventArgument || '');
+                w.__doPostBack(eventTargetDecode, eventArgumentDecode || '');
                 return true;
             }
         } catch (e) {
@@ -6382,36 +6721,207 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         return ouvrirAccueilPatientWeda();
     }
 
-    function ouvrirConsultationWedaExistante() {
-        console.info('[AUTO-HH] Tentative ouverture consultation WEDA existante.');
+    function getTexteRechercheElementWeda(element) {
+        if (!element) return '';
+        return normaliserTexte([
+            element.innerText || '',
+            element.textContent || '',
+            element.value || '',
+            element.getAttribute?.('title') || '',
+            element.getAttribute?.('aria-label') || '',
+            element.getAttribute?.('id') || '',
+            element.getAttribute?.('href') || '',
+            element.getAttribute?.('onclick') || ''
+        ].join(' ')).replace(/[_:.-]+/g, ' ');
+    }
 
-        try {
-            const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-            if (typeof w.__doPostBack === 'function') {
-                w.__doPostBack('ctl00$ContentPlaceHolder1$MenuNavigate', '0\\1');
-                console.info('[AUTO-HH] __doPostBack Consultation appelé.');
-                return true;
-            }
-        } catch (e) {
-            console.warn('[AUTO-HH] Échec __doPostBack direct :', e);
+    function collecterCandidatsOuvertureConsultationWeda() {
+        const resultats = [];
+        const vus = new Set();
+
+        function ajouter(element, source, score) {
+            if (!element || vus.has(element)) return;
+            vus.add(element);
+            resultats.push({
+                element,
+                source,
+                score,
+                description: decrireElementWeda(element),
+                postBack: extrairePostBackWedaDepuisElement(element)
+            });
         }
 
-        const liens = [...document.querySelectorAll('a')];
-        const lienConsultation = liens.find(a => {
-            const texte = normaliserTexte(a.innerText || a.textContent || '');
-            const onclick = String(a.getAttribute('onclick') || '');
-            const bonTexte = texte === 'consultation' || /^consultation\s*\(\d+\)$/.test(texte);
-            const pasDistinct = !texte.includes('distinct') && !onclick.includes('-1');
-            return bonTexte && pasDistinct;
+        const docs = collecterDocumentsAccessibles(document);
+        docs.forEach(doc => {
+            try {
+                const boutonConnu = doc.querySelector(SELECTEUR_NOUVELLE_CONSULTATION_WEDA);
+                if (boutonConnu) ajouter(boutonConnu, 'selecteur_nouvelle_consultation', 100);
+            } catch (e) {}
+
+            let elements = [];
+            try {
+                elements = Array.from(doc.querySelectorAll('a, button, input[type="button"], input[type="submit"], [role="button"]'));
+            } catch (e) {
+                elements = [];
+            }
+
+            elements.forEach(element => {
+                const texte = getTexteRechercheElementWeda(element);
+                if (!texte) return;
+
+                const estNouvelleConsultation =
+                    texte.includes('nouvelle consultation') ||
+                    texte.includes('nouveau consultation') ||
+                    texte.includes('creer consultation') ||
+                    texte.includes('creer une consultation') ||
+                    texte.includes('nouvel evenement consultation') ||
+                    texte.includes('menunavigate submenu 2');
+
+                const estConsultationSimple =
+                    texte === 'consultation' ||
+                    /^consultation\s*\(\d+\)$/.test(texte) ||
+                    (texte.includes('consultation') && texte.includes('menunavigate'));
+
+                if (!estNouvelleConsultation && !estConsultationSimple) return;
+
+                const exclu =
+                    texte.includes('distinct') ||
+                    texte.includes('historique') ||
+                    texte.includes('compte rendu') ||
+                    texte.includes('courrier') ||
+                    texte.includes('hprim') ||
+                    texte.includes('biologie') ||
+                    texte.includes('ordonnance');
+
+                if (exclu) return;
+
+                ajouter(element, estNouvelleConsultation ? 'texte_nouvelle_consultation' : 'texte_consultation', estNouvelleConsultation ? 90 : 70);
+            });
         });
 
-        if (lienConsultation) {
-            clickElement(lienConsultation, 'Consultation WEDA');
-            return true;
+        resultats.sort((a, b) => b.score - a.score);
+        return resultats;
+    }
+
+    function ouvrirConsultationWedaExistante(options = {}) {
+        const tentative = Number(options.tentative || 0);
+        console.info('[AUTO-HH] Tentative ouverture consultation WEDA.', { tentative });
+
+        const candidats = collecterCandidatsOuvertureConsultationWeda();
+        ajouterLogAutoHH('weda-consultation-open-candidates', {
+            tentative,
+            count: candidats.length,
+            candidats: candidats.slice(0, 8).map(candidat => ({
+                source: candidat.source,
+                score: candidat.score,
+                element: candidat.description,
+                postBack: candidat.postBack
+            }))
+        });
+
+        for (const candidat of candidats) {
+            const okClic = clickElement(candidat.element, 'Nouvelle consultation WEDA', {
+                autoriserInvisible: true,
+                clicUnique: true
+            });
+            ajouterLogAutoHH('weda-consultation-open-click-candidate', {
+                tentative,
+                okClic,
+                source: candidat.source,
+                element: candidat.description,
+                postBack: candidat.postBack
+            });
+            if (okClic) return true;
+
+            const postBack = candidat.postBack;
+            if (postBack && postBack.eventTarget) {
+                const okPostBack = appelerPostBackWeda(postBack.eventTarget, postBack.eventArgument || '');
+                ajouterLogAutoHH('weda-consultation-open-postback-from-candidate', {
+                    tentative,
+                    okPostBack,
+                    source: candidat.source,
+                    element: candidat.description,
+                    postBack
+                });
+                if (okPostBack) return true;
+            }
         }
 
-        console.warn('[AUTO-HH] Lien Consultation WEDA introuvable.');
+        const postbacksSecours = [
+            { eventTarget: POSTBACK_MENU_GENERAL_EVENTTARGET_WEDA, eventArgument: '0\\1', source: 'menu_general_0_1' }
+        ];
+
+        for (const postback of postbacksSecours) {
+            const ok = appelerPostBackWeda(postback.eventTarget, postback.eventArgument);
+            ajouterLogAutoHH('weda-consultation-open-postback-fallback', {
+                tentative,
+                ok,
+                postback
+            });
+            if (ok) return true;
+        }
+
+        console.warn('[AUTO-HH] Contrôle d’ouverture consultation WEDA introuvable.');
         return false;
+    }
+
+    function planifierVerificationOuvertureConsultationWeda(jobId, tentative) {
+        setTimeout(() => {
+            try {
+                const job = GM_getValue(CLE_TRANSFER_PREFIX + jobId, null);
+                if (!job || ['saving', 'saved', 'saved_and_closed', 'error'].includes(String(job.status || ''))) return;
+
+                if (estPageConsultationWeda()) {
+                    ajouterLogAutoHH('weda-consultation-open-verified', {
+                        jobId,
+                        tentative,
+                        href: getTopHref()
+                    });
+                    traiterWorkerWeda(jobId);
+                    return;
+                }
+
+                if (!estPageAccueilPatientWeda()) {
+                    ajouterLogAutoHH('weda-consultation-open-wait-navigation', {
+                        jobId,
+                        tentative,
+                        href: getTopHref(),
+                        status: job.status || null
+                    });
+                    traiterWorkerWeda(jobId);
+                    return;
+                }
+
+                if (Number(job.openConsultAttempts || 0) < NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA) {
+                    ajouterLogAutoHH('weda-consultation-open-retry', {
+                        jobId,
+                        tentative,
+                        href: getTopHref(),
+                        status: job.status || null
+                    });
+                    traiterWorkerWeda(jobId);
+                    return;
+                }
+
+                mettreAJourJob(jobId, {
+                    status: 'waiting_manual_consultation',
+                    message: 'Ouverture automatique consultation WEDA impossible : attente ouverture manuelle',
+                    waitingManualConsultationAt: Date.now()
+                });
+                ajouterLogAutoHH('weda-consultation-open-waiting-manual', {
+                    jobId,
+                    tentative,
+                    href: getTopHref()
+                });
+                afficherBadge('AUTO-HH : ouvrez une nouvelle consultation WEDA, le collage suivra', 12000, { force: true });
+            } catch (e) {
+                ajouterLogAutoHH('weda-consultation-open-verification-error', {
+                    jobId,
+                    tentative,
+                    erreur: String(e && e.message ? e.message : e)
+                });
+            }
+        }, DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS);
     }
 
     function trouverChampWedaEditable() {
@@ -6759,19 +7269,69 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         const job = GM_getValue(key, null);
         if (!job) {
             console.warn('[AUTO-HH] Job WEDA introuvable :', jobId);
+            ajouterLogAutoHH('weda-worker-job-missing', {
+                jobId,
+                key,
+                href: getTopHref(),
+                jobSession: (() => { try { return sessionStorage.getItem(CLE_SESSION_JOB); } catch (e) { return null; } })()
+            });
             return;
         }
 
         console.info('[AUTO-HH] Worker WEDA actif pour job :', job);
+        ajouterLogAutoHH('weda-worker-start', {
+            jobId,
+            status: job.status || null,
+            href: getTopHref(),
+            wedaUrl: job.wedaUrl || null,
+            sourceWedaUrl: job.sourceWedaUrl || null,
+            texteLength: String(job.texte || '').length,
+            htmlLength: String(job.html || '').length
+        });
         sessionStorage.setItem(CLE_SESSION_JOB, jobId);
+
+        if (estPageErreurWeda()) {
+            mettreAJourJob(jobId, {
+                status: 'weda_error_page',
+                message: 'Page erreur WEDA détectée avant ouverture de la consultation',
+                wedaErrorUrl: getTopHref(),
+                wedaErrorAt: Date.now()
+            });
+            ajouterLogAutoHH('weda-worker-error-page-detected', {
+                jobId,
+                href: getTopHref(),
+                status: job.status || null,
+                texteLength: String(job.texte || '').length,
+                htmlLength: String(job.html || '').length
+            });
+            envoyerNotificationGlobale('error', 'AUTO-HH : WEDA a affiché une erreur pendant l’ouverture de consultation', {
+                jobId,
+                duree: 12000
+            });
+            afficherBadge('AUTO-HH : page erreur WEDA détectée, transfert arrêté', 12000, { force: true });
+            try { sessionStorage.removeItem(CLE_SESSION_JOB); } catch (e) {}
+            return;
+        }
 
         if ((job.status === 'saving' || job.status === 'saved' || job.status === 'saved_and_closed') && estPageAccueilPatientWeda()) {
             console.info('[AUTO-HH] Retour accueil détecté avec job déjà sauvegardé/en sauvegarde : fermeture immédiate.', { jobId, status: job.status, href: getTopHref() });
+            ajouterLogAutoHH('weda-worker-finalize-on-home', {
+                jobId,
+                status: job.status,
+                href: getTopHref()
+            });
             finaliserEtFermerWorkerWeda(jobId, 'retour_accueil_detecte_initialisation_worker');
             return;
         }
 
-        if (job.status === 'saving' || job.status === 'saved' || job.status === 'saved_and_closed' || job.status === 'error') return;
+        if (job.status === 'saving' || job.status === 'saved' || job.status === 'saved_and_closed' || job.status === 'error') {
+            ajouterLogAutoHH('weda-worker-skip-terminal-status', {
+                jobId,
+                status: job.status,
+                href: getTopHref()
+            });
+            return;
+        }
 
         if (!estPageConsultationWeda()) {
             if (!estPageAccueilPatientWeda()) {
@@ -6785,14 +7345,58 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
                 return;
             }
 
-            mettreAJourJob(jobId, { status: 'opening_consultation', message: 'Ouverture consultation WEDA demandée' });
-            afficherBadge('AUTO-HH : ouverture consultation WEDA', 5000);
-            const okConsultation = ouvrirConsultationWedaExistante();
-            if (!okConsultation) {
-                mettreAJourJob(jobId, { status: 'error', message: 'Impossible d’ouvrir la consultation WEDA' }, true);
-                afficherBadge('AUTO-HH : consultation WEDA introuvable', 8000);
+            if (job.status === 'waiting_manual_consultation') {
+                ajouterLogAutoHH('weda-worker-waiting-manual-consultation', {
+                    jobId,
+                    href: getTopHref(),
+                    openConsultAttempts: job.openConsultAttempts || 0
+                });
+                afficherBadge('AUTO-HH : ouvrez une nouvelle consultation WEDA, le collage suivra', 10000, { force: true });
                 return;
             }
+
+            const tentativeOuvertureConsultation = Number(job.openConsultAttempts || 0) + 1;
+            if (tentativeOuvertureConsultation > NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA) {
+                mettreAJourJob(jobId, {
+                    status: 'waiting_manual_consultation',
+                    message: 'Ouverture automatique consultation WEDA impossible : attente ouverture manuelle',
+                    waitingManualConsultationAt: Date.now()
+                });
+                ajouterLogAutoHH('weda-worker-consultation-open-max-attempts', {
+                    jobId,
+                    href: getTopHref(),
+                    openConsultAttempts: job.openConsultAttempts || 0
+                });
+                afficherBadge('AUTO-HH : ouvrez une nouvelle consultation WEDA, le collage suivra', 12000, { force: true });
+                return;
+            }
+
+            mettreAJourJob(jobId, {
+                status: 'opening_consultation',
+                message: 'Ouverture consultation WEDA demandée',
+                openConsultAttempts: tentativeOuvertureConsultation,
+                openConsultRequestedAt: Date.now()
+            });
+            afficherBadge('AUTO-HH : ouverture consultation WEDA', 5000);
+            const okConsultation = ouvrirConsultationWedaExistante({
+                jobId,
+                tentative: tentativeOuvertureConsultation
+            });
+            if (!okConsultation) {
+                mettreAJourJob(jobId, {
+                    status: 'waiting_manual_consultation',
+                    message: 'Contrôle consultation WEDA introuvable : attente ouverture manuelle',
+                    waitingManualConsultationAt: Date.now()
+                });
+                ajouterLogAutoHH('weda-worker-consultation-open-no-control', {
+                    jobId,
+                    href: getTopHref(),
+                    openConsultAttempts: tentativeOuvertureConsultation
+                });
+                afficherBadge('AUTO-HH : ouvrez une nouvelle consultation WEDA, le collage suivra', 12000, { force: true });
+                return;
+            }
+            planifierVerificationOuvertureConsultationWeda(jobId, tentativeOuvertureConsultation);
             return;
         }
 
@@ -6859,15 +7463,36 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
         if (jobDepuisHash) {
             sessionStorage.setItem(CLE_SESSION_JOB, jobDepuisHash);
             try { history.replaceState(null, '', location.href.split('#')[0]); } catch (e) {}
+            ajouterLogAutoHH('weda-worker-init-from-hash', {
+                jobId: jobDepuisHash,
+                href: getTopHref()
+            });
         }
 
-        const jobId = sessionStorage.getItem(CLE_SESSION_JOB);
+        let jobId = sessionStorage.getItem(CLE_SESSION_JOB);
+        if (!jobId) {
+            const jobDepuisDemande = getJobIdDepuisDemandeOuvertureWorkerWeda();
+            if (jobDepuisDemande) {
+                sessionStorage.setItem(CLE_SESSION_JOB, jobDepuisDemande);
+                jobId = jobDepuisDemande;
+                ajouterLogAutoHH('weda-worker-init-from-open-request', {
+                    jobId,
+                    href: getTopHref()
+                });
+            }
+        }
+
         if (!jobId) return;
         if (String(jobId).startsWith('ctx_')) {
             try { sessionStorage.removeItem(CLE_SESSION_JOB); } catch (e) {}
             return;
         }
 
+        ajouterLogAutoHH('weda-worker-init-scheduled', {
+            jobId,
+            href: getTopHref(),
+            jobHash: jobDepuisHash || null
+        });
         setTimeout(() => { traiterWorkerWeda(jobId); }, 300);
     }
 
@@ -6933,6 +7558,9 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
             extrasSignal.heidiWorkerId = workerIdWeda;
 
             const workerActifStop = getHeidiWorkerActif();
+            const presenceStop = getPresenceHeidiWorker(workerIdWeda);
+            const workerVivantStop = presenceHeidiWorkerEstVivable(workerIdWeda, presenceStop);
+
             if (workerActifStop && workerActifStop.workerId === workerIdWeda && workerActifStop.heidiSessionId) {
                 extrasSignal.heidiSessionId = workerActifStop.heidiSessionId;
                 extrasSignal.heidiSessionUrl = workerActifStop.heidiSessionUrl || construireUrlSessionHeidi(workerActifStop.heidiSessionId);
@@ -6946,6 +7574,39 @@ const contenuHeidi = await waitForContenuHeidiStable(TIMEOUT_GENERATION_HEIDI_MS
                     workerIdWeda,
                     workerActifStop
                 });
+            }
+
+            const sessionUrlPourReveil = extrasSignal.heidiSessionUrl ||
+                (extrasSignal.heidiSessionId ? construireUrlSessionHeidi(extrasSignal.heidiSessionId) : null);
+
+            if (!workerVivantStop) {
+                const workerPourReveil = {
+                    ...(workerActifStop && workerActifStop.workerId === workerIdWeda ? workerActifStop : {}),
+                    workerId: workerIdWeda,
+                    heidiSessionId: extrasSignal.heidiSessionId || (workerActifStop && workerActifStop.heidiSessionId) || null,
+                    heidiSessionUrl: sessionUrlPourReveil,
+                    status: 'stop_reopen_requested'
+                };
+
+                const okReveilHeidi = sessionUrlPourReveil
+                    ? ouvrirOngletHeidiDedie(workerPourReveil, {
+                        sessionUrl: sessionUrlPourReveil,
+                        raison: 'stop_transfer_worker_inactif'
+                    })
+                    : false;
+
+                ajouterLogAutoHH('weda-heidi-worker-reopen-for-stop', {
+                    workerIdWeda,
+                    workerVivantStop,
+                    presenceStop,
+                    sessionUrlPourReveil,
+                    okReveilHeidi
+                });
+
+                afficherBadge(
+                    okReveilHeidi ? 'AUTO-HH : réveil onglet Heidi dédié' : 'AUTO-HH : onglet Heidi dédié inactif',
+                    okReveilHeidi ? 5000 : 8000
+                );
             }
 
             memoriserHeidiWorkerActif({
