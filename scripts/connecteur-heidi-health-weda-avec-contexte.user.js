@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Heidi Health vers WEDA
 // @namespace    http://tampermonkey.net/
-// @version      7.86
+// @version      7.94
 // @description  PageUp : lance Heidi + récupération du contexte. PageDown : transfert WEDA. Remplit constantes, suivis structurés, ajoute les étiquettes WEDA, contrôle qualité, notifications renforcées, retour accueil direct et fermeture accélérée. + DEBUG
 // @match        https://*/*
 // @exclude      https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -24,7 +24,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_HH = '7.86';
+    const VERSION_AUTO_HH = '7.94';
 
     const CLE_SIGNAL = 'auto_hh_signal_stable_v768';
     const CLE_SIGNAL_LEGACY = 'auto_hh_signal_stable';
@@ -65,7 +65,19 @@
     const PARAM_HEIDI_BIO_JOB = 'wedaBioJob';
     const URL_HEIDI_DEDIEE = 'https://scribe.heidihealth.com/';
 
-    const SELECTEUR_NOUVELLE_SESSION = 'button[data-testid="sessions-panel-action-new-session"]';
+    const SELECTEUR_NOUVELLE_SESSION = [
+        '[data-testid="global-create-new-session"]',
+        '[role="menuitem"][data-testid="global-create-new-session"]',
+        'button[data-testid="sessions-panel-action-new-session"]'
+    ].join(', ');
+    const SELECTEUR_BOUTON_TRANSCRIPTION_HEIDI = [
+        'button[data-testid="start-recording-button"]',
+        '[data-testid="start-recording-button"]'
+    ].join(', ');
+    const SELECTEUR_MENU_TRANSCRIPTION_HEIDI = [
+        'button[data-testid="start-recording-dropdown"]',
+        '[data-testid="start-recording-dropdown"]'
+    ].join(', ');
     const SELECTEUR_TEXTE_HEIDI = '#template-block-editor-content > div';
     const SELECTEUR_BOUTON_ARRET_HEIDI = 'button[data-testid="stop-recording-button"], [data-testid="stop-recording-button"]';
 
@@ -114,7 +126,7 @@
     const SELECTEUR_BOUTON_PANEL_ETIQUETTE_WEDA = '#ContentPlaceHolder1_EvenementUcForm1_ButtonStatEtiquette';
     const SELECTEUR_GRID_GLOSSAIRES_WEDA = '#ContentPlaceHolder1_EvenementUcForm1_GlossairesGrid';
 
-    const DELAI_APRES_NOUVELLE_SESSION_MS = 900;
+    const DELAI_APRES_NOUVELLE_SESSION_MS = 250;
     const TIMEOUT_BOUTON_MS = 20000;
     const TIMEOUT_GENERATION_HEIDI_MS = 60000;
     const TIMEOUT_WEDA_CHAMP_MS = 45000;
@@ -150,9 +162,9 @@
     const CLE_WEDA_ACTIVE_SNAPSHOT = 'auto_hh_weda_active_snapshot_stable';
     const NOMBRE_MAX_LOGS_DEBUG = 700;
 
-    const DELAI_STABILITE_CONTENU_HEIDI_MS = 6000;
-const INTERVALLE_STABILITE_CONTENU_HEIDI_MS = 500;
-const DELAI_MIN_APRES_BOUTON_COPIER_HEIDI_MS = 1500;
+    const DELAI_STABILITE_CONTENU_HEIDI_MS = 3000;
+    const INTERVALLE_STABILITE_CONTENU_HEIDI_MS = 250;
+    const DELAI_MIN_APRES_BOUTON_COPIER_HEIDI_MS = 500;
 
     const CLE_ACK_HEIDI = 'auto_hh_heidi_ack_stable';
 const DELAI_SIGNAL_INITIAL_RECENT_HEIDI_MS = 90000;
@@ -160,11 +172,11 @@ const DELAI_TRAITEMENT_SIGNAL_INITIAL_HEIDI_MS = 500;
 const DELAIS_RELANCE_SIGNAL_HEIDI_MS = [250, 750, 1500, 3000, 6000, 10000];
 const INTERVALLE_POLL_SIGNAL_HEIDI_MS = 150;
 const DELAI_BLOCAGE_DOUBLE_STOP_TRANSFER_MS = 45000;
-const DELAI_CONFIRMATION_TRANSCRIPTION_HEIDI_MS = 12000;
+const DELAI_CONFIRMATION_TRANSCRIPTION_HEIDI_MS = 30000;
 const INTERVALLE_CONFIRMATION_TRANSCRIPTION_HEIDI_MS = 250;
 const DELAI_DOUBLE_CONFIRMATION_TRANSCRIPTION_HEIDI_MS = 650;
 const DELAI_CORRECTION_STATUT_REC_HEIDI_MS = 3500;
-const DELAI_MAX_STATUT_DEMARRAGE_HEIDI_MS = 18000;
+const DELAI_MAX_STATUT_DEMARRAGE_HEIDI_MS = 45000;
 const INTERVALLE_SURVEILLANCE_STATUT_HEIDI_MS = 1500;
 const DELAI_VERROU_RACCOURCI_GLOBAL_MS = 2500;
 const DELAI_EXPIRATION_HEIDI_WORKER_MS = 8 * 60 * 60 * 1000;
@@ -173,7 +185,9 @@ const DELAI_VERROU_LANCEMENT_HEIDI_MS = 120000;
 const DELAI_VERROU_CLIC_NOUVELLE_SESSION_HEIDI_MS = 10000;
 const DELAI_REPRISE_WORKER_WEDA_MS = 120000;
 const DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS = 5000;
-const NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA = 2;
+const DELAI_MAX_ATTENTE_NAVIGATION_CONSULTATION_WEDA_MS = 5000;
+const DELAI_MAX_VALIDATION_TEXTE_ACCUEIL_WEDA_MS = 5000;
+const NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA = 1;
 const ENTETE_CONTEXTE_WEDA_SECURITE = 'Contexte WEDA patient';
 
 
@@ -1606,10 +1620,10 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
     function getHeidiSessionIdDepuisUrl(urlBrute) {
         try {
             const url = new URL(urlBrute || location.href, location.origin);
-            const match = String(url.pathname || '').match(/\/scribe\/session\/([^\/?#]+)/i);
+            const match = String(url.pathname || '').match(/\/scribe\/sessions?\/([^\/?#]+)/i);
             return match && match[1] ? decodeURIComponent(match[1]) : null;
         } catch (e) {
-            const match = String(urlBrute || location.href || '').match(/\/scribe\/session\/([^\/?#]+)/i);
+            const match = String(urlBrute || location.href || '').match(/\/scribe\/sessions?\/([^\/?#]+)/i);
             return match && match[1] ? decodeURIComponent(match[1]) : null;
         }
     }
@@ -1622,17 +1636,17 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             if (matchLocale && matchLocale[1]) locale = matchLocale[1];
         } catch (e) {}
         const origineHeidi = EST_HEIDI ? location.origin : URL_HEIDI_DEDIEE.replace(/\/$/, '');
-        return origineHeidi + '/' + locale + '/scribe/session/' + encodeURIComponent(sessionId);
+        return origineHeidi + '/' + locale + '/scribe/sessions/' + encodeURIComponent(sessionId);
     }
 
     function trouverLienSessionHeidi(sessionId) {
         if (!sessionId) return null;
-        const liens = Array.from(document.querySelectorAll('a[href*="/scribe/session/"]'));
+        const liens = Array.from(document.querySelectorAll('a[href*="/scribe/session"]'));
         return liens.find(lien => getHeidiSessionIdDepuisUrl(lien.getAttribute('href') || lien.href || '') === sessionId) || null;
     }
 
     function getSessionHeidiActiveDepuisMenu() {
-        const liens = Array.from(document.querySelectorAll('[data-testid="session-list-session-item"] a[href*="/scribe/session/"], a[href*="/scribe/session/"]'));
+        const liens = Array.from(document.querySelectorAll('[data-testid="session-list-session-item"] a[href*="/scribe/session"], a[href*="/scribe/session"]'));
         for (const lien of liens) {
             const actif = lien.querySelector('[data-active="true"]') || lien.closest?.('[data-active="true"]');
             if (!actif) continue;
@@ -5035,8 +5049,85 @@ function annulerJobsContexteActifsAutoHH(raison) {
      * HEIDI
      ************************************************************/
 
+    function getPremierElementVisible(selecteur) {
+        return [...document.querySelectorAll(selecteur)]
+            .map(getCibleCliquableHeidi)
+            .filter((element, index, tableau) => element && tableau.indexOf(element) === index)
+            .find(isVisible) || null;
+    }
+
     function getBoutonNouvelleSession() {
-        return document.querySelector(SELECTEUR_NOUVELLE_SESSION);
+        return getPremierElementVisible(SELECTEUR_NOUVELLE_SESSION) ||
+            document.querySelector(SELECTEUR_NOUVELLE_SESSION);
+    }
+
+    function elementEstDeclencheurCreationSessionHeidi(element) {
+        const cible = getCibleCliquableHeidi(element) || element;
+        if (!cible || !isVisible(cible)) return false;
+        if (cible.matches?.(SELECTEUR_NOUVELLE_SESSION)) return false;
+        if (elementEstMenuTranscriptionHeidi(cible) || elementEstBoutonTranscriptionDemarrageHeidi(cible)) return false;
+
+        const testId = String(cible.getAttribute?.('data-testid') || cible.getAttribute?.('data-test-id') || '').toLowerCase();
+        const texte = getTexteAccessibleElementHeidi(cible);
+        const ariaHasPopup = String(cible.getAttribute?.('aria-haspopup') || '').toLowerCase();
+
+        if (/global.*create|create.*global|new.*session|session.*new/.test(testId)) return true;
+        if (ariaHasPopup === 'menu' && /\b(?:creer|create|new|nouveau|nouvelle)\b/.test(texte)) return true;
+        if (/\b(?:creer|create|new|nouveau|nouvelle)\b/.test(texte) && /\b(?:session|consultation|note|scribe)\b/.test(texte)) return true;
+
+        return false;
+    }
+
+    function getDeclencheurCreationSessionHeidi() {
+        const selecteurCandidats = [
+            'button[data-testid*="global"]',
+            '[role="button"][data-testid*="global"]',
+            'button[data-testid*="create"]',
+            '[role="button"][data-testid*="create"]',
+            'button[data-testid*="new"]',
+            '[role="button"][data-testid*="new"]',
+            'button[aria-haspopup="menu"]',
+            '[role="button"][aria-haspopup="menu"]',
+            'button[aria-label]',
+            '[role="button"][aria-label]',
+            'button[title]',
+            '[role="button"][title]'
+        ].join(', ');
+
+        return [...document.querySelectorAll(selecteurCandidats)]
+            .map(getCibleCliquableHeidi)
+            .filter((element, index, tableau) => element && tableau.indexOf(element) === index)
+            .find(elementEstDeclencheurCreationSessionHeidi) || null;
+    }
+
+    async function attendreBoutonNouvelleSessionHeidi(signal = null) {
+        let bouton = getBoutonNouvelleSession();
+        if (bouton && isVisible(bouton)) return bouton;
+
+        let declencheur = getDeclencheurCreationSessionHeidi();
+        if (!declencheur) {
+            bouton = await waitForElement(getBoutonNouvelleSession, 'Nouvelle session', Math.min(1200, TIMEOUT_BOUTON_MS));
+            if (bouton) return bouton;
+
+            declencheur = await waitForElement(getDeclencheurCreationSessionHeidi, 'menu création Heidi', Math.min(2500, TIMEOUT_BOUTON_MS));
+        }
+
+        ajouterLogAutoHH('heidi-new-session-menu-trigger-search', {
+            signal,
+            declencheur: decrireBoutonHeidi(declencheur),
+            directMenuItem: decrireBoutonHeidi(document.querySelector('[data-testid="global-create-new-session"]'))
+        });
+
+        if (!declencheur) {
+            return await waitForElement(getBoutonNouvelleSession, 'Nouvelle session sans menu création', Math.min(2500, TIMEOUT_BOUTON_MS));
+        }
+
+        afficherBadge('AUTO-HH : ouverture menu création Heidi', 2000);
+        clickElement(declencheur, 'Menu création Heidi');
+        await sleep(150);
+
+        bouton = await waitForElement(getBoutonNouvelleSession, 'Nouvelle session après ouverture menu', 5000);
+        return bouton;
     }
 
     function getBoutonParTexte(texteRecherche, options = {}) {
@@ -5057,7 +5148,24 @@ function annulerJobsContexteActifsAutoHH(raison) {
     }
 
     function getBoutonTranscription() {
-        return getBoutonParTexte(TEXTE_BOUTON_TRANSCRIPTION, { classeContient: 'bg-validation-success' });
+        const boutonDirect = getPremierElementVisible(SELECTEUR_BOUTON_TRANSCRIPTION_HEIDI);
+        if (boutonDirect && elementEstBoutonTranscriptionDemarrageHeidi(boutonDirect)) {
+            return boutonDirect;
+        }
+
+        const boutons = [...document.querySelectorAll('button')]
+            .filter(button => {
+                const cible = getCibleCliquableHeidi(button) || button;
+                if (!isVisible(cible)) return false;
+                if (elementEstMenuTranscriptionHeidi(cible)) return false;
+
+                const texte = getTexteAccessibleElementHeidi(cible);
+                return texte.includes(normaliserTexte(TEXTE_BOUTON_TRANSCRIPTION)) &&
+                    String(cible.className || '').includes('bg-validation-success') &&
+                    elementEstBoutonTranscriptionDemarrageHeidi(cible);
+            });
+
+        return boutons[0] || null;
     }
 
     function getTexteAccessibleElementHeidi(element) {
@@ -5080,6 +5188,18 @@ function annulerJobsContexteActifsAutoHH(raison) {
     function getCibleCliquableHeidi(element) {
         if (!element) return null;
         return element.closest?.('button, [role="button"]') || element;
+    }
+
+    function elementEstMenuTranscriptionHeidi(element) {
+        const cible = getCibleCliquableHeidi(element) || element;
+        if (!cible) return false;
+
+        const testId = String(cible.getAttribute?.('data-testid') || cible.getAttribute?.('data-test-id') || '');
+        if (testId.includes('start-recording-dropdown')) return true;
+        if (cible.matches?.(SELECTEUR_MENU_TRANSCRIPTION_HEIDI)) return true;
+
+        const ariaLabel = normaliserTexte(cible.getAttribute?.('aria-label') || '');
+        return ariaLabel.includes('ouvrir le menu') && ariaLabel.includes('transcription');
     }
 
     function texteIndiqueBoutonArretHeidi(texte) {
@@ -5214,6 +5334,7 @@ function annulerJobsContexteActifsAutoHH(raison) {
     function elementEstBoutonTranscriptionDemarrageHeidi(element) {
         const cible = getCibleCliquableHeidi(element) || element;
         if (!cible || !isVisible(cible)) return false;
+        if (elementEstMenuTranscriptionHeidi(cible)) return false;
 
         const texte = getTexteAccessibleElementHeidi(cible);
         if (!texte) return false;
@@ -5523,7 +5644,7 @@ return null;
             sessionAvantNouvelle
         });
 
-        const boutonNouvelleSession = await waitForElement(getBoutonNouvelleSession, 'Nouvelle session');
+        const boutonNouvelleSession = await attendreBoutonNouvelleSessionHeidi(signal);
         ajouterLogAutoHH('heidi-new-session-button-found', {
             bouton: decrireBoutonHeidi(boutonNouvelleSession),
             signal
@@ -5702,7 +5823,7 @@ return null;
                 sessionCouranteApresRestore: getSessionHeidiCourante({ preferMenu: true, includeStorage: false })
             });
 
-            await sleep(700);
+            await sleep(250);
 
             let boutonArret = getBoutonArretTranscription();
             let boutonCopierInitial = getBoutonCopierHeidi();
@@ -6107,9 +6228,25 @@ return null;
                 return;
             }
 
-            if (job.status === 'saved_and_closed' || job.status === 'saved') {
+            if (job.status === 'saved_and_closed') {
                 clearInterval(timer);
                 demanderFermetureOnglet(job, job.status);
+                return;
+            }
+
+            if (job.status === 'saved') {
+                if (job.requiresHomeValidation && !job.homeValidationConfirmedAt && !job.homeValidationFallbackAt) {
+                    console.info('[AUTO-HH] Consultation sauvegardée, attente validation du texte sur accueil WEDA...', { jobId });
+                    return;
+                }
+
+                clearInterval(timer);
+                demanderFermetureOnglet(job, job.status);
+                return;
+            }
+
+            if (job.status === 'saving' && job.requiresHomeValidation && !job.homeValidationConfirmedAt && !job.homeValidationFallbackAt) {
+                console.info('[AUTO-HH] Sauvegarde WEDA en cours, validation accueil requise avant fermeture...', { jobId });
                 return;
             }
 
@@ -6651,6 +6788,183 @@ return null;
         return false;
     }
 
+    function getFormulairePostBackWeda() {
+        try {
+            const doc = document;
+            return doc.forms && doc.forms[0] ? doc.forms[0] :
+                doc.getElementById('form1') ||
+                doc.querySelector('form') ||
+                null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getOuCreerChampPostBackWeda(form, nom) {
+        if (!form || !nom) return null;
+
+        const doc = form.ownerDocument || document;
+        let champ = null;
+
+        try { champ = form.elements && form.elements[nom] ? form.elements[nom] : null; } catch (e) { champ = null; }
+        if (champ && !champ.tagName && typeof champ.length === 'number') champ = champ[0] || null;
+        if (!champ) {
+            try { champ = doc.getElementsByName(nom)[0] || null; } catch (e) { champ = null; }
+        }
+        if (!champ) {
+            try { champ = doc.getElementById(nom) || null; } catch (e) { champ = null; }
+        }
+        if (!champ) {
+            try {
+                champ = doc.createElement('input');
+                champ.type = 'hidden';
+                champ.name = nom;
+                champ.id = nom;
+                form.appendChild(champ);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        return champ;
+    }
+
+    function soumettrePostBackWedaParFormulaire(eventTarget, eventArgument, contexte = {}) {
+        const eventTargetDecode = decoderChaineJavascriptAttributWeda(eventTarget);
+        const eventArgumentDecode = decoderChaineJavascriptAttributWeda(eventArgument || '');
+
+        try {
+            const form = getFormulairePostBackWeda();
+            if (!form) {
+                ajouterLogAutoHH('weda-postback-form-submit-missing-form', {
+                    eventTarget: eventTargetDecode,
+                    eventArgument: eventArgumentDecode,
+                    contexte
+                });
+                return false;
+            }
+
+            const champTarget = getOuCreerChampPostBackWeda(form, '__EVENTTARGET');
+            const champArgument = getOuCreerChampPostBackWeda(form, '__EVENTARGUMENT');
+            if (!champTarget || !champArgument) {
+                ajouterLogAutoHH('weda-postback-form-submit-missing-fields', {
+                    eventTarget: eventTargetDecode,
+                    eventArgument: eventArgumentDecode,
+                    formId: form.id || null,
+                    contexte
+                });
+                return false;
+            }
+
+            champTarget.value = eventTargetDecode;
+            champArgument.value = eventArgumentDecode;
+
+            ajouterLogAutoHH('weda-postback-form-submit', {
+                eventTarget: eventTargetDecode,
+                eventArgument: eventArgumentDecode,
+                formId: form.id || null,
+                formAction: String(form.getAttribute('action') || form.action || '').slice(0, 240),
+                contexte
+            });
+
+            const win = form.ownerDocument && form.ownerDocument.defaultView ? form.ownerDocument.defaultView : window;
+            if (win.HTMLFormElement && win.HTMLFormElement.prototype && typeof win.HTMLFormElement.prototype.submit === 'function') {
+                win.HTMLFormElement.prototype.submit.call(form);
+            } else if (typeof form.submit === 'function') {
+                form.submit();
+            } else {
+                return false;
+            }
+            return true;
+        } catch (e) {
+            ajouterLogAutoHH('weda-postback-form-submit-error', {
+                eventTarget: eventTargetDecode,
+                eventArgument: eventArgumentDecode,
+                contexte,
+                erreur: String(e && e.message ? e.message : e)
+            });
+            return false;
+        }
+    }
+
+    function installerDetecteurDepartPageWeda() {
+        let departDetecte = false;
+
+        function marquerDepart() {
+            departDetecte = true;
+        }
+
+        try { window.addEventListener('beforeunload', marquerDepart, true); } catch (e) {}
+        try { window.addEventListener('pagehide', marquerDepart, true); } catch (e) {}
+
+        return {
+            departDetecte: () => departDetecte,
+            retirer: () => {
+                try { window.removeEventListener('beforeunload', marquerDepart, true); } catch (e) {}
+                try { window.removeEventListener('pagehide', marquerDepart, true); } catch (e) {}
+            }
+        };
+    }
+
+    async function declencherPostBackWedaAvecSecoursNavigation(postBack, contexte = {}) {
+        if (!postBack || !postBack.eventTarget) {
+            return {
+                ok: false,
+                okPostBack: false,
+                okFormSubmit: false,
+                navigationDetectee: false,
+                urlAvant: getTopHref(),
+                urlApresPostBack: getTopHref()
+            };
+        }
+
+        const urlAvant = getTopHref();
+        const detecteur = installerDetecteurDepartPageWeda();
+        let okPostBack = false;
+        let okFormSubmit = false;
+        let urlApresPostBack = urlAvant;
+        let navigationDetectee = false;
+        const utiliserFormulaireDirect = contexte && (
+            contexte.mode === 'direct_hidden_candidate' ||
+            contexte.mode === 'postback_fallback' ||
+            contexte.utiliserFormulaireDirect === true
+        );
+
+        try {
+            if (utiliserFormulaireDirect) {
+                okFormSubmit = soumettrePostBackWedaParFormulaire(postBack.eventTarget, postBack.eventArgument || '', {
+                    ...contexte,
+                    raison: 'soumission formulaire directe pour éviter double création consultation'
+                });
+            } else {
+                okPostBack = appelerPostBackWeda(postBack.eventTarget, postBack.eventArgument || '');
+                await sleep(850);
+
+                urlApresPostBack = getTopHref();
+                navigationDetectee = detecteur.departDetecte() ||
+                    urlApresPostBack !== urlAvant ||
+                    estPageConsultationWeda() ||
+                    estPageErreurWeda();
+
+                if (!navigationDetectee && !okPostBack) {
+                    okFormSubmit = soumettrePostBackWedaParFormulaire(postBack.eventTarget, postBack.eventArgument || '', contexte);
+                }
+            }
+        } finally {
+            try { detecteur.retirer(); } catch (e) {}
+        }
+
+        return {
+            ok: navigationDetectee || okFormSubmit,
+            okPostBack,
+            okFormSubmit,
+            navigationDetectee,
+            departDetecte: detecteur.departDetecte(),
+            urlAvant,
+            urlApresPostBack
+        };
+    }
+
     function getPageRequestManagerWeda() {
         try {
             const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -6803,7 +7117,16 @@ return null;
         return resultats;
     }
 
-    function ouvrirConsultationWedaExistante(options = {}) {
+    function candidatOuvertureConsultationWedaEstInvisible(candidat) {
+        const description = candidat && candidat.description ? candidat.description : {};
+        const rect = description.rect || {};
+        return description.visible === false || (
+            Number(rect.width || 0) === 0 &&
+            Number(rect.height || 0) === 0
+        );
+    }
+
+    async function ouvrirConsultationWedaExistante(options = {}) {
         const tentative = Number(options.tentative || 0);
         console.info('[AUTO-HH] Tentative ouverture consultation WEDA.', { tentative });
 
@@ -6820,6 +7143,33 @@ return null;
         });
 
         for (const candidat of candidats) {
+            const postBack = candidat.postBack;
+            const postBackDirectAvantClic = !!(postBack && postBack.eventTarget && candidatOuvertureConsultationWedaEstInvisible(candidat));
+
+            if (postBackDirectAvantClic) {
+                const resultatPostBackDirect = await declencherPostBackWedaAvecSecoursNavigation(postBack, {
+                    tentative,
+                    source: candidat.source,
+                    mode: 'direct_hidden_candidate',
+                    jobId: options.jobId || null
+                });
+                ajouterLogAutoHH('weda-consultation-open-postback-direct-hidden-candidate', {
+                    tentative,
+                    okPostBack: resultatPostBackDirect.okPostBack,
+                    okFormSubmit: resultatPostBackDirect.okFormSubmit,
+                    navigationDetectee: resultatPostBackDirect.navigationDetectee,
+                    departDetecte: resultatPostBackDirect.departDetecte,
+                    urlAvant: resultatPostBackDirect.urlAvant,
+                    urlApresPostBack: resultatPostBackDirect.urlApresPostBack,
+                    source: candidat.source,
+                    element: candidat.description,
+                    postBack,
+                    raison: 'lien menu consultation invisible : le clic natif peut retourner true sans déclencher la navigation'
+                });
+                if (resultatPostBackDirect.ok) return true;
+                continue;
+            }
+
             const okClic = clickElement(candidat.element, 'Nouvelle consultation WEDA', {
                 autoriserInvisible: true,
                 clicUnique: true
@@ -6833,17 +7183,26 @@ return null;
             });
             if (okClic) return true;
 
-            const postBack = candidat.postBack;
             if (postBack && postBack.eventTarget) {
-                const okPostBack = appelerPostBackWeda(postBack.eventTarget, postBack.eventArgument || '');
+                const resultatPostBack = await declencherPostBackWedaAvecSecoursNavigation(postBack, {
+                    tentative,
+                    source: candidat.source,
+                    mode: 'fallback_candidate',
+                    jobId: options.jobId || null
+                });
                 ajouterLogAutoHH('weda-consultation-open-postback-from-candidate', {
                     tentative,
-                    okPostBack,
+                    okPostBack: resultatPostBack.okPostBack,
+                    okFormSubmit: resultatPostBack.okFormSubmit,
+                    navigationDetectee: resultatPostBack.navigationDetectee,
+                    departDetecte: resultatPostBack.departDetecte,
+                    urlAvant: resultatPostBack.urlAvant,
+                    urlApresPostBack: resultatPostBack.urlApresPostBack,
                     source: candidat.source,
                     element: candidat.description,
                     postBack
                 });
-                if (okPostBack) return true;
+                if (resultatPostBack.ok) return true;
             }
         }
 
@@ -6852,20 +7211,36 @@ return null;
         ];
 
         for (const postback of postbacksSecours) {
-            const ok = appelerPostBackWeda(postback.eventTarget, postback.eventArgument);
+            const resultatPostBack = await declencherPostBackWedaAvecSecoursNavigation(postback, {
+                tentative,
+                source: postback.source,
+                mode: 'postback_fallback',
+                jobId: options.jobId || null
+            });
             ajouterLogAutoHH('weda-consultation-open-postback-fallback', {
                 tentative,
-                ok,
+                okPostBack: resultatPostBack.okPostBack,
+                okFormSubmit: resultatPostBack.okFormSubmit,
+                navigationDetectee: resultatPostBack.navigationDetectee,
+                departDetecte: resultatPostBack.departDetecte,
+                urlAvant: resultatPostBack.urlAvant,
+                urlApresPostBack: resultatPostBack.urlApresPostBack,
                 postback
             });
-            if (ok) return true;
+            if (resultatPostBack.ok) return true;
         }
 
         console.warn('[AUTO-HH] Contrôle d’ouverture consultation WEDA introuvable.');
         return false;
     }
 
-    function planifierVerificationOuvertureConsultationWeda(jobId, tentative) {
+    function getDelaiRestantVerificationOuvertureConsultationWeda(job) {
+        const ageOuvertureMs = Date.now() - Number(job && job.openConsultRequestedAt || 0);
+        if (!Number.isFinite(ageOuvertureMs) || ageOuvertureMs < 0) return DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS;
+        return Math.max(250, Math.min(DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS, DELAI_MAX_ATTENTE_NAVIGATION_CONSULTATION_WEDA_MS - ageOuvertureMs));
+    }
+
+    function planifierVerificationOuvertureConsultationWeda(jobId, tentative, delaiMs = DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS) {
         setTimeout(() => {
             try {
                 const job = GM_getValue(CLE_TRANSFER_PREFIX + jobId, null);
@@ -6892,14 +7267,16 @@ return null;
                     return;
                 }
 
-                if (Number(job.openConsultAttempts || 0) < NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA) {
-                    ajouterLogAutoHH('weda-consultation-open-retry', {
+                const ageOuvertureMs = Date.now() - Number(job.openConsultRequestedAt || 0);
+                if (Number.isFinite(ageOuvertureMs) && ageOuvertureMs < DELAI_MAX_ATTENTE_NAVIGATION_CONSULTATION_WEDA_MS) {
+                    ajouterLogAutoHH('weda-consultation-open-wait-slow-navigation', {
                         jobId,
                         tentative,
                         href: getTopHref(),
-                        status: job.status || null
+                        status: job.status || null,
+                        ageOuvertureMs
                     });
-                    traiterWorkerWeda(jobId);
+                    planifierVerificationOuvertureConsultationWeda(jobId, tentative, getDelaiRestantVerificationOuvertureConsultationWeda(job));
                     return;
                 }
 
@@ -6921,7 +7298,7 @@ return null;
                     erreur: String(e && e.message ? e.message : e)
                 });
             }
-        }, DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS);
+        }, Math.max(250, Number(delaiMs) || DELAI_VERIFICATION_OUVERTURE_CONSULTATION_WEDA_MS));
     }
 
     function trouverChampWedaEditable() {
@@ -7101,6 +7478,167 @@ return null;
         });
     }
 
+    function normaliserTextePourValidationAccueilWeda(texte) {
+        return normaliserTexte(texte)
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function creerFragmentValidationAccueilWedaDepuisTexte(texteNormalise, nombreMots) {
+        const mots = String(texteNormalise || '').split(' ').filter(Boolean);
+        if (mots.length < Math.min(nombreMots, 6)) return '';
+        return mots.slice(0, Math.min(nombreMots, mots.length)).join(' ');
+    }
+
+    function creerFragmentsValidationTexteAccueilWeda(texte) {
+        const fragments = [];
+
+        function ajouter(fragment) {
+            const normalise = normaliserTextePourValidationAccueilWeda(fragment);
+            if (normalise.length < 28) return;
+            if (!fragments.includes(normalise)) fragments.push(normalise);
+        }
+
+        const texteNettoye = nettoyerTexte(texte || '');
+        ajouter(creerFragmentValidationAccueilWedaDepuisTexte(normaliserTextePourValidationAccueilWeda(texteNettoye), 16));
+        ajouter(creerFragmentValidationAccueilWedaDepuisTexte(normaliserTextePourValidationAccueilWeda(texteNettoye), 10));
+
+        texteNettoye
+            .split('\n')
+            .map(ligne => ligne.trim())
+            .filter(ligne => ligne.length >= 28)
+            .slice(0, 8)
+            .forEach(ligne => {
+                const ligneNormalisee = normaliserTextePourValidationAccueilWeda(ligne);
+                ajouter(creerFragmentValidationAccueilWedaDepuisTexte(ligneNormalisee, 14));
+                ajouter(creerFragmentValidationAccueilWedaDepuisTexte(ligneNormalisee, 8));
+            });
+
+        return fragments.slice(0, 10);
+    }
+
+    function getTexteVisibleAccueilPatientWedaPourValidation() {
+        const docs = collecterDocumentsAccessibles(document);
+        return docs.map(doc => {
+            try {
+                return doc.body ? (doc.body.innerText || doc.body.textContent || '') : '';
+            } catch (e) {
+                return '';
+            }
+        }).join('\n');
+    }
+
+    function verifierTexteHeidiPresentSurAccueilWeda(job) {
+        const texteJob = String(job && job.texte ? job.texte : '');
+        const fragments = creerFragmentsValidationTexteAccueilWeda(texteJob);
+
+        if (!texteJob || fragments.length === 0) {
+            return {
+                ok: false,
+                impossible: true,
+                raison: 'texte_heidi_absent_ou_trop_court',
+                jobTextLength: texteJob.length,
+                href: getTopHref()
+            };
+        }
+
+        const textePage = normaliserTextePourValidationAccueilWeda(getTexteVisibleAccueilPatientWedaPourValidation());
+        const fragmentTrouve = fragments.find(fragment => textePage.includes(fragment)) || '';
+        const fragmentsTestes = fragments.slice(0, 4).map(fragment => ({
+            length: fragment.length,
+            words: fragment.split(' ').filter(Boolean).length
+        }));
+
+        return {
+            ok: !!fragmentTrouve,
+            impossible: false,
+            fragmentTrouve: !!fragmentTrouve,
+            fragmentTrouveLength: fragmentTrouve.length,
+            fragmentsTestes,
+            fragmentsCount: fragments.length,
+            pageTextLength: textePage.length,
+            jobTextLength: texteJob.length,
+            href: getTopHref()
+        };
+    }
+
+    async function attendreValidationTexteAccueilWedaAvantFermeture(jobId, raison) {
+        const start = Date.now();
+        let retourAccueilDemande = false;
+        let derniereValidation = null;
+
+        mettreAJourJob(jobId, {
+            requiresHomeValidation: true,
+            homeValidationStartedAt: start,
+            homeValidationReason: raison || null
+        });
+
+        while (Date.now() - start <= DELAI_MAX_VALIDATION_TEXTE_ACCUEIL_WEDA_MS) {
+            const job = GM_getValue(CLE_TRANSFER_PREFIX + jobId, null);
+            if (!job) return { ok: false, impossible: true, raison: 'job_absent' };
+
+            if (!estPageAccueilPatientWeda()) {
+                if (!retourAccueilDemande && estPageConsultationWeda()) {
+                    retourAccueilDemande = true;
+                    ajouterLogAutoHH('weda-home-text-validation-return-home-request', {
+                        jobId,
+                        raison,
+                        href: getTopHref()
+                    });
+                    retourAccueilDirectWeda(jobId);
+                }
+
+                await sleep(350);
+                continue;
+            }
+
+            derniereValidation = verifierTexteHeidiPresentSurAccueilWeda(job);
+            mettreAJourJob(jobId, {
+                homeValidationLastCheckAt: Date.now(),
+                homeValidationLastResult: derniereValidation
+            });
+
+            if (derniereValidation.ok) {
+                mettreAJourJob(jobId, {
+                    homeValidationConfirmedAt: Date.now(),
+                    homeValidationConfirmedFragmentLength: derniereValidation.fragmentTrouveLength || 0,
+                    homeValidationFallbackAt: null
+                });
+                ajouterLogAutoHH('weda-home-text-validation-confirmed', {
+                    jobId,
+                    raison,
+                    validation: derniereValidation
+                });
+                return derniereValidation;
+            }
+
+            if (derniereValidation.impossible) {
+                ajouterLogAutoHH('weda-home-text-validation-skipped', {
+                    jobId,
+                    raison,
+                    validation: derniereValidation
+                });
+                return derniereValidation;
+            }
+
+            await sleep(500);
+        }
+
+        mettreAJourJob(jobId, {
+            homeValidationFallbackAt: Date.now(),
+            homeValidationFallbackReason: 'texte_non_retrouve_sur_accueil_dans_delai',
+            homeValidationLastResult: derniereValidation
+        });
+        ajouterLogAutoHH('weda-home-text-validation-timeout', {
+            jobId,
+            raison,
+            validation: derniereValidation,
+            timeoutMs: DELAI_MAX_VALIDATION_TEXTE_ACCUEIL_WEDA_MS
+        });
+        return derniereValidation || { ok: false, impossible: false, raison: 'timeout_sans_validation' };
+    }
+
     async function sauvegarderConsultationWeda(jobId) {
         console.info('[AUTO-HH] Sauvegarde WEDA standard.');
         afficherBadge('AUTO-HH : sauvegarde WEDA', 2500);
@@ -7123,14 +7661,19 @@ return null;
             return false;
         }
 
-        mettreAJourJob(jobId, { status: 'saving', message: 'Sauvegarde WEDA déclenchée' });
+        mettreAJourJob(jobId, {
+            status: 'saving',
+            message: 'Sauvegarde WEDA déclenchée',
+            requiresHomeValidation: true
+        });
         const raisonSauvegarde = await attendreRetourAccueilOuFinSauvegardeWeda(DELAI_APRES_SAVE_AVANT_FERMETURE_MS);
 
         mettreAJourJob(jobId, {
             status: 'saved',
             message: 'Consultation WEDA sauvegardée',
-            saveCloseReason: raisonSauvegarde
-        }, true);
+            saveCloseReason: raisonSauvegarde,
+            requiresHomeValidation: true
+        });
 
         afficherBadge('AUTO-HH : consultation sauvegardée', 3500);
         return true;
@@ -7147,9 +7690,19 @@ return null;
         }, 900);
     }
 
-    function finaliserEtFermerWorkerWeda(jobId, raison) {
+    async function finaliserEtFermerWorkerWeda(jobId, raison) {
         const key = CLE_TRANSFER_PREFIX + jobId;
-        const job = GM_getValue(key, null) || { jobId };
+        let job = GM_getValue(key, null) || { jobId };
+
+        if (
+            job &&
+            job.texte &&
+            !job.homeValidationConfirmedAt &&
+            !job.homeValidationFallbackAt
+        ) {
+            await attendreValidationTexteAccueilWedaAvantFermeture(jobId, raison || 'fermeture_immediate');
+            job = GM_getValue(key, null) || job;
+        }
 
         const jobFinal = {
             ...job,
@@ -7193,7 +7746,8 @@ return null;
         mettreAJourJob(jobId, {
             status: 'saving',
             message: 'Sauvegarde WEDA déclenchée par retour accueil direct',
-            directAccueilPostback: true
+            directAccueilPostback: true,
+            requiresHomeValidation: true
         });
 
         const raisonSauvegarde = await attendreRetourAccueilOuFinSauvegardeWeda(DELAI_APRES_SAVE_AVANT_FERMETURE_MS);
@@ -7202,8 +7756,9 @@ return null;
             status: 'saved',
             message: 'Consultation WEDA sauvegardée par retour accueil direct',
             saveCloseReason: raisonSauvegarde,
-            directAccueilPostback: true
-        }, true);
+            directAccueilPostback: true,
+            requiresHomeValidation: true
+        });
 
         afficherBadge('AUTO-HH : consultation sauvegardée', 5000);
         return true;
@@ -7258,7 +7813,7 @@ return null;
         }
 
         if (!okSave) return;
-        finaliserEtFermerWorkerWeda(jobId, 'worker_apres_sauvegarde_directe');
+        await finaliserEtFermerWorkerWeda(jobId, 'worker_apres_sauvegarde_directe');
         console.info('[AUTO-HH] Étiquettes + sauvegarde + fermeture terminées pour job :', jobId);
     }
 
@@ -7320,7 +7875,22 @@ return null;
                 status: job.status,
                 href: getTopHref()
             });
-            finaliserEtFermerWorkerWeda(jobId, 'retour_accueil_detecte_initialisation_worker');
+            await finaliserEtFermerWorkerWeda(jobId, 'retour_accueil_detecte_initialisation_worker');
+            return;
+        }
+
+        if (
+            job.status === 'saved' &&
+            job.requiresHomeValidation &&
+            !job.homeValidationConfirmedAt &&
+            !job.homeValidationFallbackAt
+        ) {
+            ajouterLogAutoHH('weda-worker-resume-home-validation', {
+                jobId,
+                status: job.status,
+                href: getTopHref()
+            });
+            await finaliserEtFermerWorkerWeda(jobId, 'validation_accueil_reprise_worker');
             return;
         }
 
@@ -7355,6 +7925,26 @@ return null;
                 return;
             }
 
+            if (job.status === 'opening_consultation') {
+                const ageOuvertureMs = Date.now() - Number(job.openConsultRequestedAt || 0);
+                if (Number.isFinite(ageOuvertureMs) && ageOuvertureMs < DELAI_MAX_ATTENTE_NAVIGATION_CONSULTATION_WEDA_MS) {
+                    ajouterLogAutoHH('weda-worker-consultation-open-already-pending', {
+                        jobId,
+                        href: getTopHref(),
+                        openConsultAttempts: job.openConsultAttempts || 0,
+                        ageOuvertureMs,
+                        raison: 'postback consultation déjà envoyé, attente navigation sans second clic'
+                    });
+                    afficherBadge('AUTO-HH : attente ouverture consultation WEDA', 5000);
+                    planifierVerificationOuvertureConsultationWeda(
+                        jobId,
+                        Number(job.openConsultAttempts || 1),
+                        getDelaiRestantVerificationOuvertureConsultationWeda(job)
+                    );
+                    return;
+                }
+            }
+
             const tentativeOuvertureConsultation = Number(job.openConsultAttempts || 0) + 1;
             if (tentativeOuvertureConsultation > NOMBRE_MAX_TENTATIVES_OUVERTURE_CONSULTATION_WEDA) {
                 mettreAJourJob(jobId, {
@@ -7378,7 +7968,7 @@ return null;
                 openConsultRequestedAt: Date.now()
             });
             afficherBadge('AUTO-HH : ouverture consultation WEDA', 5000);
-            const okConsultation = ouvrirConsultationWedaExistante({
+            const okConsultation = await ouvrirConsultationWedaExistante({
                 jobId,
                 tentative: tentativeOuvertureConsultation
             });
@@ -7917,6 +8507,25 @@ if (!signal) return;
             return;
         }
 
+        if (statut === 'starting' && automatisationEnCours) {
+            publierStatutInterfaceAutoHH('starting', {
+                message: 'Démarrage Heidi encore en cours',
+                details: {
+                    statutRecord,
+                    ageMs,
+                    diagnostic,
+                    automatisationEnCours
+                }
+            });
+            ajouterLogAutoHH('heidi-status-starting-preserved-automation-running', {
+                statutRecord,
+                ageMs,
+                diagnostic,
+                raison: 'lancement Heidi encore actif, pas de passage en erreur pendant la création de session'
+            });
+            return;
+        }
+
         if (Date.now() - derniereCorrectionStatutHeidi < 5000) return;
         derniereCorrectionStatutHeidi = Date.now();
 
@@ -8402,10 +9011,10 @@ if (!signal) return;
     function getHeidiSessionIdDepuisUrlContexte(urlBrute) {
         try {
             const url = new URL(urlBrute || location.href, location.origin);
-            const match = String(url.pathname || '').match(/\/scribe\/session\/([^\/?#]+)/i);
+            const match = String(url.pathname || '').match(/\/scribe\/sessions?\/([^\/?#]+)/i);
             return match && match[1] ? decodeURIComponent(match[1]) : null;
         } catch (e) {
-            const match = String(urlBrute || location.href || '').match(/\/scribe\/session\/([^\/?#]+)/i);
+            const match = String(urlBrute || location.href || '').match(/\/scribe\/sessions?\/([^\/?#]+)/i);
             return match && match[1] ? decodeURIComponent(match[1]) : null;
         }
     }
@@ -8418,11 +9027,11 @@ if (!signal) return;
             if (matchLocale && matchLocale[1]) locale = matchLocale[1];
         } catch (e) {}
         const origineHeidi = EST_HEIDI_CONTEXTE ? location.origin : 'https://scribe.heidihealth.com';
-        return origineHeidi + '/' + locale + '/scribe/session/' + encodeURIComponent(sessionId);
+        return origineHeidi + '/' + locale + '/scribe/sessions/' + encodeURIComponent(sessionId);
     }
 
     function getSessionHeidiCouranteContexte() {
-        const liens = Array.from(document.querySelectorAll('[data-testid="session-list-session-item"] a[href*="/scribe/session/"], a[href*="/scribe/session/"]'));
+        const liens = Array.from(document.querySelectorAll('[data-testid="session-list-session-item"] a[href*="/scribe/session"], a[href*="/scribe/session"]'));
         for (const lien of liens) {
             const actif = lien.querySelector('[data-active="true"]') || lien.closest?.('[data-active="true"]');
             if (!actif) continue;
@@ -8444,7 +9053,7 @@ if (!signal) return;
 
     function trouverLienSessionHeidiContexte(sessionId) {
         if (!sessionId) return null;
-        const liens = Array.from(document.querySelectorAll('a[href*="/scribe/session/"]'));
+        const liens = Array.from(document.querySelectorAll('a[href*="/scribe/session"]'));
         return liens.find(lien => getHeidiSessionIdDepuisUrlContexte(lien.getAttribute('href') || lien.href || '') === sessionId) || null;
     }
 
@@ -9517,7 +10126,7 @@ if (!signal) return;
     const CLE_DEBUG_LAST_REPORT = 'auto_hh_debug_last_report_stable';
 
     const SELECTEURS = {
-        heidiNouvelleSession: 'button[data-testid="sessions-panel-action-new-session"]',
+        heidiNouvelleSession: '[data-testid="global-create-new-session"], [role="menuitem"][data-testid="global-create-new-session"], button[data-testid="sessions-panel-action-new-session"]',
         heidiTexteGenere: '#template-block-editor-content > div',
         heidiOngletContexte: 'button[data-testid="session-tab-context"]',
         heidiChampContexte: 'div[data-testid="context-tab-block-editor"] [contenteditable="true"]',
