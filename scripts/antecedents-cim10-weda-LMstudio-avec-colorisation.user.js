@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antécédents CIM-10 WEDA avec LM Studio AVEC colorisation
 // @namespace    http://tampermonkey.net/
-// @version      6.2.1
+// @version      6.2.3
 // @description  Touche Début/Home : exporte les antécédents WEDA non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @all-frames   true
@@ -25,7 +25,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.1-LMstudio-avec-colorisation';
+    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.3-LMstudio-avec-colorisation';
 
     const HOST_WEDA = 'secure.weda.fr';
     const HOST_HEIDI = 'scribe.heidihealth.com';
@@ -70,6 +70,7 @@
     const MAX_QUALITY_REIMPORT_PASSES = 6;
     const MAX_QUALITY_STALLED_PASSES = 2;
     const QUALITY_FULL_RETRY_DELAY_MS = 5000;
+    const MAX_QUALITY_FULL_RETRIES = 2;
     const IMPORT_STALL_WARNING_MS = 60000;
     const IMPORT_STALL_RECOVERY_MS = 120000;
     const MAX_IMPORT_STALL_RECOVERIES = 8;
@@ -2709,6 +2710,7 @@ END_ATCD`;
             foundCount: Number(report.foundCount || 0),
             missingCount: Number(report.missingCount || 0),
             blockCount: Number(report.blockCount || 0),
+            noControleQualityBlockCount: Number(report.noControleQualityBlockCount || 0),
             familialNoControleBlockCount: Number(report.familialNoControleBlockCount || 0),
             missing: Array.isArray(report.missing)
                 ? report.missing.slice(0, IMPORT_LOG_ARRAY_LIMIT).map(summarizeQualityEntryForLog)
@@ -2734,10 +2736,14 @@ END_ATCD`;
             'source',
             'reason',
             'phase',
+            'familyMember',
+            'familyMemberKind',
+            'familyMemberBranch',
             'date',
             'selector',
             'dateField',
             'allergyCategories',
+            'fallbackValue',
             'batchId',
             'patientId',
             'currentPatientId',
@@ -2776,6 +2782,11 @@ END_ATCD`;
         if (raw.skippedItem) out.skippedItem = summarizeImportItem(raw.skippedItem);
         if (raw.items) out.itemsSample = Array.isArray(raw.items) ? raw.items.slice(0, 3).map(summarizeImportItem) : compactLogValue(raw.items);
         if (raw.missingSummary) out.missingSummary = raw.missingSummary;
+        if (raw.selectedOption) out.selectedOption = compactLogValue(raw.selectedOption, 1);
+        if (raw.candidates) out.candidates = compactLogValue(raw.candidates, 1);
+        if (raw.availableOptions) out.availableOptions = compactLogValue(raw.availableOptions, 1);
+        if (raw.selectCandidates) out.selectCandidates = compactLogValue(raw.selectCandidates, 1);
+        if (raw.select) out.select = compactLogValue(raw.select, 1);
 
         const quality = raw.qualityReport || raw.report;
         if (quality && typeof quality === 'object' && ('expectedCount' in quality || 'missingCount' in quality || 'foundCount' in quality)) {
@@ -3078,9 +3089,9 @@ END_ATCD`;
         }
 
         return {
-            scope: jobId ? 'job_empty' : 'all_jobs',
-            logs: jobId ? [] : logs,
-            reason: jobId ? 'no_matching_log' : 'no_current_job'
+            scope: jobId ? 'all_jobs_fallback' : 'all_jobs',
+            logs,
+            reason: jobId ? 'no_matching_job_log' : 'no_current_job'
         };
     }
 
@@ -8718,6 +8729,25 @@ ${HEIDI_ASK_AI_PROMPT}`
         };
     }
 
+    function getFamilyMemberOtherFallbackCommentLine(item) {
+        const fallback = item && item.wedaFamilyMemberOtherFallback;
+        const member = normalizeSpaces(fallback && fallback.familyMember || '');
+        return member ? `Lien familial : ${member}` : '';
+    }
+
+    function buildWedaCommentForFill(item, rawCommentValue) {
+        const baseComment = stripWedaDateLinesFromComment(rawCommentValue);
+        const fallbackLine = getFamilyMemberOtherFallbackCommentLine(item);
+        if (!fallbackLine) return baseComment;
+
+        const fallbackMember = item && item.wedaFamilyMemberOtherFallback
+            ? item.wedaFamilyMemberOtherFallback.familyMember
+            : '';
+        if (normalizedTextHasExactFamilyMember(baseComment, fallbackMember)) return baseComment;
+
+        return [fallbackLine, baseComment].filter(Boolean).join('\n');
+    }
+
     async function finalizeHeidiResultAndOpenWeda(resultText, source = 'auto', options = {}) {
         if (window.__AUTO_ATCD_CIM10_LMSTUDIO_HEIDI_FINALIZE_RUNNING__) {
             showBadge('Transmission du résultat IA déjà en cours dans cet onglet.', { duration: 4000 });
@@ -10083,6 +10113,36 @@ ${HEIDI_ASK_AI_PROMPT}`
         }));
     }
 
+    function getSelectOptionSummary(option) {
+        if (!option) return null;
+        return {
+            value: String(option.value || ''),
+            text: getSelectOptionLabel(option)
+        };
+    }
+
+    function findOtherFamilyOption(select) {
+        const options = Array.from(select && select.options ? select.options : []);
+        return options.find(option => String(option.value || '') === '99')
+            || options.find(option => /\bautres?\b/.test(normalizeForMatch(getSelectOptionLabel(option))));
+    }
+
+    function clearFamilyMemberOtherFallback(item) {
+        if (!item || typeof item !== 'object') return;
+        try { delete item.wedaFamilyMemberOtherFallback; } catch (_) {
+            item.wedaFamilyMemberOtherFallback = null;
+        }
+    }
+
+    function markFamilyMemberOtherFallback(item, member, reason, selectedOption) {
+        if (!item || typeof item !== 'object') return;
+        item.wedaFamilyMemberOtherFallback = {
+            familyMember: normalizeSpaces(member || ''),
+            reason: reason || 'other_family_member_fallback',
+            selectedOption: getSelectOptionSummary(selectedOption)
+        };
+    }
+
     function getFamilyMemberBranch(member) {
         const n = normalizeForMatch(member);
         if (!n) return '';
@@ -10182,6 +10242,42 @@ ${HEIDI_ASK_AI_PROMPT}`
         ].includes(getFamilyMemberKind(member));
     }
 
+    function familyMemberKindDefaultsToPaternal(kind) {
+        return [
+            'grand_pere',
+            'grand_mere',
+            'petit_fils',
+            'petite_fille',
+            'oncle',
+            'tante',
+            'neveu',
+            'niece',
+            'cousin',
+            'cousine'
+        ].includes(kind);
+    }
+
+    function getEffectiveFamilyMemberBranch(member) {
+        const explicitBranch = getFamilyMemberBranch(member);
+        if (explicitBranch) return explicitBranch;
+
+        const kind = getFamilyMemberKind(member);
+        return familyMemberKindDefaultsToPaternal(kind) ? 'paternel' : '';
+    }
+
+    function findPaternalFamilyOptionCandidate(candidates) {
+        return (Array.isArray(candidates) ? candidates : [])
+            .filter(candidate => familyOptionHasBranch(candidate && candidate.normalized || '', 'paternel'))
+            .sort((a, b) => {
+                const leftText = normalizeForMatch(a && a.label || '');
+                const rightText = normalizeForMatch(b && b.label || '');
+                const leftMaternal = familyOptionHasBranch(leftText, 'maternel') ? 1 : 0;
+                const rightMaternal = familyOptionHasBranch(rightText, 'maternel') ? 1 : 0;
+                if (leftMaternal !== rightMaternal) return leftMaternal - rightMaternal;
+                return String(a && a.label || '').localeCompare(String(b && b.label || ''));
+            })[0] || null;
+    }
+
     function familyMemberOptionMatches(optionText, member) {
         const optionNorm = normalizeForMatch(optionText);
         const memberNorm = normalizeForMatch(member);
@@ -10190,7 +10286,7 @@ ${HEIDI_ASK_AI_PROMPT}`
         if (optionNorm === memberNorm) return true;
 
         const memberKind = getFamilyMemberKind(member);
-        const memberBranch = getFamilyMemberBranch(member);
+        const memberBranch = getEffectiveFamilyMemberBranch(member);
         if (memberKind && optionMatchesFamilyMemberKind(optionNorm, memberKind)) {
             if (memberBranch) return familyOptionHasBranch(optionNorm, memberBranch);
             return !familyOptionHasBranch(optionNorm, 'paternel')
@@ -10225,7 +10321,7 @@ ${HEIDI_ASK_AI_PROMPT}`
 
         const memberNorm = normalizeForMatch(member);
         const memberKind = getFamilyMemberKind(member);
-        const memberBranch = getFamilyMemberBranch(member);
+        const memberBranch = getEffectiveFamilyMemberBranch(member);
         const candidates = [];
 
         for (const option of Array.from(select.options || [])) {
@@ -10269,6 +10365,12 @@ ${HEIDI_ASK_AI_PROMPT}`
     function findSelectOptionByFamilyMember(select, member) {
         const candidates = getFamilyMemberOptionCandidates(select, member) || [];
         if (!candidates.length) return null;
+
+        const defaultPaternalCandidate = !getFamilyMemberBranch(member)
+            && getEffectiveFamilyMemberBranch(member) === 'paternel'
+            ? findPaternalFamilyOptionCandidate(candidates)
+            : null;
+        if (defaultPaternalCandidate) return defaultPaternalCandidate.option;
 
         const topScore = candidates[0].score;
         const top = candidates.filter(candidate => candidate.score === topScore);
@@ -10366,8 +10468,9 @@ ${HEIDI_ASK_AI_PROMPT}`
         const n = normalizeForMatch(member);
         if (!n) return '99';
 
-        const branchePaternelle = /\b(paternel|paternelle|p|cote paternel|cote paternelle)\b/.test(n);
-        const brancheMaternelle = /\b(maternel|maternelle|m|cote maternel|cote maternelle)\b/.test(n);
+        const effectiveBranch = getEffectiveFamilyMemberBranch(member);
+        const branchePaternelle = effectiveBranch === 'paternel';
+        const brancheMaternelle = effectiveBranch === 'maternel';
 
         if (/\bbeau pere\b/.test(n)) return '26';
         if (/\bbelle mere\b/.test(n)) return '27';
@@ -10432,22 +10535,29 @@ ${HEIDI_ASK_AI_PROMPT}`
         return '99';
     }
 
-    async function setWedaCollateral(member, doc) {
+    async function setWedaCollateral(member, doc, item = null) {
         const select = doc && String(doc.tagName || '').toLowerCase() === 'select'
             ? doc
             : findWedaCollateralSelect(doc);
         if (!select) return false;
 
+        clearFamilyMemberOtherFallback(item);
+        const branchDefaultedToPaternal = !getFamilyMemberBranch(member)
+            && getEffectiveFamilyMemberBranch(member) === 'paternel';
+
         const option = await waitFor(() => findSelectOptionByFamilyMember(select, member), 4500, 200);
         if (option) {
             const ok = setSelectOption(select, option);
             if (ok) {
-                logImportEvent('info', 'familial_fields', 'Lien familial WEDA sélectionné par libellé exact.', {
+                const selectedNorm = normalizeForMatch(getSelectOptionLabel(option));
+                const selectedByPaternalDefault = branchDefaultedToPaternal
+                    && familyOptionHasBranch(selectedNorm, 'paternel');
+                logImportEvent('info', 'familial_fields', selectedByPaternalDefault
+                    ? 'Lien familial WEDA sélectionné côté paternel par défaut.'
+                    : 'Lien familial WEDA sélectionné par libellé exact.', {
                     familyMember: member,
-                    selectedOption: {
-                        value: String(option.value || ''),
-                        text: getSelectOptionLabel(option)
-                    }
+                    defaultBranch: selectedByPaternalDefault ? 'paternel' : '',
+                    selectedOption: getSelectOptionSummary(option)
                 });
             }
             return ok;
@@ -10456,8 +10566,36 @@ ${HEIDI_ASK_AI_PROMPT}`
         const memberCandidates = getFamilyMemberOptionCandidates(select, member) || [];
         const bestCandidateScore = memberCandidates.length ? memberCandidates[0].score : 0;
         const bestCandidates = memberCandidates.filter(candidate => candidate.score === bestCandidateScore);
+        const defaultPaternalCandidate = branchDefaultedToPaternal
+            ? (findPaternalFamilyOptionCandidate(bestCandidates) || findPaternalFamilyOptionCandidate(memberCandidates))
+            : null;
+        if (defaultPaternalCandidate) {
+            const ok = setSelectOption(select, defaultPaternalCandidate.option);
+            if (ok) {
+                logImportEvent('info', 'familial_fields', 'Lien familial WEDA sélectionné côté paternel par défaut.', {
+                    familyMember: member,
+                    defaultBranch: 'paternel',
+                    selectedOption: getSelectOptionSummary(defaultPaternalCandidate.option),
+                    candidates: memberCandidates.map(candidate => ({
+                        value: String(candidate.option && candidate.option.value || ''),
+                        text: candidate.label,
+                        score: candidate.score,
+                        reason: candidate.reason
+                    })),
+                    availableOptions: getSelectOptionsSnapshot(select)
+                });
+                return true;
+            }
+        }
+
+        const ambiguousBranchOnly = bestCandidates.length > 1
+            && bestCandidateScore > 0
+            && !getFamilyMemberBranch(member)
+            && bestCandidates.every(candidate => candidate.reason === 'ambiguous_branch_label');
         if (bestCandidates.length > 1 && bestCandidateScore > 0) {
-            logImportEvent('warning', 'familial_fields', 'Lien familial WEDA ambigu : aucun choix automatique pour éviter un mauvais doublon.', {
+            logImportEvent('warning', 'familial_fields', ambiguousBranchOnly
+                ? 'Lien familial WEDA imprécis : côté paternel par défaut introuvable.'
+                : 'Lien familial WEDA ambigu : aucun choix automatique pour éviter un mauvais doublon.', {
                 familyMember: member,
                 candidates: bestCandidates.map(candidate => ({
                     value: String(candidate.option && candidate.option.value || ''),
@@ -10467,12 +10605,22 @@ ${HEIDI_ASK_AI_PROMPT}`
                 })),
                 availableOptions: getSelectOptionsSnapshot(select)
             });
-            return false;
+            if (!ambiguousBranchOnly) return false;
         }
 
-        const value = mapFamilyMemberToCollateralValue(member);
-        if (!value || (value === '99' && familyMemberMustNotFallbackToOther(member))) {
-            logImportEvent('warning', 'familial_fields', 'Fallback vers Autre refusé pour un membre familial précis.', {
+        let value = mapFamilyMemberToCollateralValue(member);
+        let fallbackReason = branchDefaultedToPaternal ? 'paternal_default_internal_value' : '';
+        if (!value && ambiguousBranchOnly) {
+            value = '99';
+            fallbackReason = 'paternal_default_unavailable';
+        } else if (!value && familyMemberMustNotFallbackToOther(member)) {
+            value = '99';
+            fallbackReason = fallbackReason || 'specific_member_without_exact_option';
+        }
+
+        const otherOption = value === '99' ? findOtherFamilyOption(select) : null;
+        if (!value || (value === '99' && familyMemberMustNotFallbackToOther(member) && !otherOption)) {
+            logImportEvent('warning', 'familial_fields', 'Fallback vers Autre impossible pour un membre familial précis.', {
                 familyMember: member,
                 fallbackValue: value || '',
                 familyMemberKind: getFamilyMemberKind(member),
@@ -10482,12 +10630,25 @@ ${HEIDI_ASK_AI_PROMPT}`
             return false;
         }
 
-        const okFallback = setSelectValue(select, value);
+        const okFallback = otherOption
+            ? setSelectOption(select, otherOption)
+            : setSelectValue(select, value);
+
+        if (okFallback && value === '99' && member && !/\bautres?\b/.test(normalizeForMatch(member))) {
+            markFamilyMemberOtherFallback(
+                item,
+                member,
+                fallbackReason || (familyMemberMustNotFallbackToOther(member) ? 'specific_member_to_other' : 'other_member_to_other'),
+                otherOption
+            );
+        }
 
         logImportEvent(value === '99' ? 'warning' : 'info', 'familial_fields', 'Fallback lien familial WEDA par valeur interne.', {
             familyMember: member,
             fallbackValue: value,
             okFallback,
+            fallbackReason,
+            selectedOption: otherOption ? getSelectOptionSummary(otherOption) : null,
             availableOptions: getSelectOptionsSnapshot(select)
         });
 
@@ -10658,7 +10819,7 @@ ${HEIDI_ASK_AI_PROMPT}`
                 }
             });
 
-            const okCollateral = await setWedaCollateral(item.familyMember || '', collateral);
+            const okCollateral = await setWedaCollateral(item.familyMember || '', collateral, item);
             collateralOk = !!okCollateral;
             if (!okCollateral) {
                 warn('Collateral non renseigné', item.familyMember, item);
@@ -12394,7 +12555,8 @@ ${HEIDI_ASK_AI_PROMPT}`
         const rawCommentValue = Object.prototype.hasOwnProperty.call(item, 'comment')
             ? item.comment
             : (item.description || '');
-        const commentValue = stripWedaDateLinesFromComment(rawCommentValue);
+        const commentValue = buildWedaCommentForFill(item, rawCommentValue);
+        item.comment = commentValue;
         setNativeValue(textarea, commentValue);
 
 
@@ -12546,7 +12708,7 @@ ${HEIDI_ASK_AI_PROMPT}`
         return blocks;
     }
 
-    function toWedaNoControleQualityBlock(block) {
+    function toWedaNoControleQualityBlock(block, section = null, source = 'no_controle') {
         if (!block) return null;
 
         const text = normalizeSpaces(block.text || '');
@@ -12559,11 +12721,17 @@ ${HEIDI_ASK_AI_PROMPT}`
             tag: block.container && block.container.tag || '',
             id: block.container && block.container.id || '',
             className: block.container && block.container.className || '',
-            section: 'familial',
-            source: 'no_controle',
+            section: section || null,
+            source,
             icon: block.icon,
             container: block.container
         };
+    }
+
+    function noControleBlockHasFamilyMemberText(block) {
+        const n = block && (block.normalizedText || normalizeForMatch(block.text || ''));
+        if (!n) return false;
+        return /\b(pere|mere|frere|soeur|fils|fille|enfant|parent|grand\s+pere|grand\s+mere|grand\s+parent|oncle|tante|cousin|cousine|famille|familial|familiale)\b/.test(n);
     }
 
     function isLikelyImportedFamilialNoControleBlock(block) {
@@ -12582,8 +12750,14 @@ ${HEIDI_ASK_AI_PROMPT}`
 
     function collectWedaFamilialNoControleBlocks(limit = 200) {
         return collectWedaNoControleDiagnosticBlocks(limit)
-            .map(toWedaNoControleQualityBlock)
+            .map(block => toWedaNoControleQualityBlock(block, 'familial', 'no_controle_familial'))
             .filter(isLikelyImportedFamilialNoControleBlock);
+    }
+
+    function collectWedaNonFamilialNoControleBlocks(limit = 200) {
+        return collectWedaNoControleDiagnosticBlocks(limit)
+            .map(block => toWedaNoControleQualityBlock(block, null, 'no_controle'))
+            .filter(block => block && !noControleBlockHasFamilyMemberText(block));
     }
 
     function isInsideNoControleContainer(el, containers) {
@@ -12765,8 +12939,12 @@ ${HEIDI_ASK_AI_PROMPT}`
         });
         const importedMatches = importedBlocks.filter(block => wedaBlockMatchesImportedItem(block, item, expectedCodes));
         const noControleQualityBlocks = item && item.section === 'familial'
-            ? noControleBlocks.map(toWedaNoControleQualityBlock).filter(isLikelyImportedFamilialNoControleBlock)
-            : [];
+            ? noControleBlocks
+                .map(block => toWedaNoControleQualityBlock(block, 'familial', 'no_controle_familial'))
+                .filter(isLikelyImportedFamilialNoControleBlock)
+            : noControleBlocks
+                .map(block => toWedaNoControleQualityBlock(block, null, 'no_controle'))
+                .filter(block => block && !noControleBlockHasFamilyMemberText(block));
         const noControleMatches = noControleQualityBlocks.filter(block => wedaBlockMatchesImportedItem(block, item, expectedCodes));
 
         return {
@@ -13583,6 +13761,12 @@ ${HEIDI_ASK_AI_PROMPT}`
             && options.includeFamilialNoControleDuplicates !== false);
     }
 
+    function shouldIncludeNonFamilialNoControleDuplicates(item, options = {}) {
+        return !!(item
+            && item.section !== 'familial'
+            && options.includeNonFamilialNoControleDuplicates !== false);
+    }
+
     function findExistingWedaDuplicateForItem(item, codes = [], options = {}) {
         const expectedCodes = [];
 
@@ -13600,6 +13784,10 @@ ${HEIDI_ASK_AI_PROMPT}`
         const includeFamilialNoControleDuplicates = shouldIncludeFamilialNoControleDuplicates(item, options);
         if (includeFamilialNoControleDuplicates) {
             blocks.push(...collectWedaFamilialNoControleBlocks(200));
+        }
+        const includeNonFamilialNoControleDuplicates = shouldIncludeNonFamilialNoControleDuplicates(item, options);
+        if (includeNonFamilialNoControleDuplicates) {
+            blocks.push(...collectWedaNonFamilialNoControleBlocks(200));
         }
 
         const strictMatch = blocks.find(block => blockHasExactCodeAndCommentDuplicate(block, item, expectedCodes));
@@ -13622,7 +13810,7 @@ ${HEIDI_ASK_AI_PROMPT}`
             if (highSimilarityCommentMatch) return highSimilarityCommentMatch;
         }
 
-        if (options.strictCodeCommentOnly && !includeFamilialNoControleDuplicates) return null;
+        if (options.strictCodeCommentOnly && !includeFamilialNoControleDuplicates && !includeNonFamilialNoControleDuplicates) return null;
 
         return blocks.find(block => wedaBlockMatchesDuplicateRule(block, item, expectedCodes)) || null;
     }
@@ -13716,7 +13904,8 @@ ${HEIDI_ASK_AI_PROMPT}`
         const items = Array.isArray(job && job.parsedAtcd) ? job.parsedAtcd : [];
         const importedBlocks = collectWedaImportedAntecedentBlocks();
         const familialNoControleBlocks = collectWedaFamilialNoControleBlocks(200);
-        const reportBlocks = importedBlocks.concat(familialNoControleBlocks);
+        const nonFamilialNoControleBlocks = collectWedaNonFamilialNoControleBlocks(200);
+        const reportBlocks = importedBlocks.concat(nonFamilialNoControleBlocks).concat(familialNoControleBlocks);
         const importedByKey = getImportedRecordsByAtcdKey(job);
         const found = [];
         const missing = [];
@@ -13731,7 +13920,9 @@ ${HEIDI_ASK_AI_PROMPT}`
             }
             expectedCodes = getExpectedCim10CodesForQuality(item, importedRecords);
 
-            const blocks = item && item.section === 'familial' ? reportBlocks : importedBlocks;
+            const blocks = item && item.section === 'familial'
+                ? importedBlocks.concat(familialNoControleBlocks)
+                : importedBlocks.concat(nonFamilialNoControleBlocks);
             const block = blocks.find(candidate => wedaBlockMatchesImportedItem(candidate, item, expectedCodes))
                 || buildJobConfirmedQualityBlock(item, importedRecords, expectedCodes);
 
@@ -13764,6 +13955,7 @@ ${HEIDI_ASK_AI_PROMPT}`
             found,
             missing,
             blockCount: importedBlocks.length,
+            noControleQualityBlockCount: nonFamilialNoControleBlocks.length,
             familialNoControleBlockCount: familialNoControleBlocks.length,
             blocksSample: reportBlocks.slice(0, 12).map(block => ({
                 text: block.text.slice(0, 260),
@@ -14552,6 +14744,13 @@ ${HEIDI_ASK_AI_PROMPT}`
             const nbMissing = qualityReport && qualityReport.missingCount ? qualityReport.missingCount : 0;
             const expectedCount = qualityReport ? qualityReport.expectedCount : items.length;
             const foundCount = qualityReport ? qualityReport.foundCount : Math.max(0, expectedCount - nbMissing);
+            const retryableMissingCount = qualityReport && qualityReport.retryableMissingCount !== undefined
+                ? Number(qualityReport.retryableMissingCount || 0)
+                : nbMissing;
+            const unrecoverableMissingCount = qualityReport && qualityReport.unrecoverableMissingCount !== undefined
+                ? Number(qualityReport.unrecoverableMissingCount || 0)
+                : Math.max(0, nbMissing - retryableMissingCount);
+            const qualityFullRetryCount = Number(finalJob.qualityFullRetryCount || 0);
 
             finalJob.updatedAt = nowIso();
             finalJob.doneAt = nowIso();
@@ -14569,6 +14768,54 @@ ${HEIDI_ASK_AI_PROMPT}`
                     })
                     .join('\n');
 
+                if (retryableMissingCount <= 0 || qualityFullRetryCount >= MAX_QUALITY_FULL_RETRIES) {
+                    finalJob.status = 'ERROR_QUALITY_CONTROL';
+                    finalJob.qualityControl = qualityReport;
+                    finalJob.qualityControlBlockedAt = nowIso();
+                    finalJob.qualityControlBlockedReason = retryableMissingCount <= 0
+                        ? 'unrecoverable_missing'
+                        : 'full_retry_limit_reached';
+                    finalJob.doneAt = '';
+                    finalJob.updatedAt = nowIso();
+                    finalJob.errors = Array.isArray(finalJob.errors) ? finalJob.errors : [];
+                    finalJob.errors.push({
+                        at: nowIso(),
+                        phase: 'quality_control_blocked',
+                        message: retryableMissingCount <= 0
+                            ? 'Contrôle qualité incomplet : aucun antécédent absent n’est réparable automatiquement.'
+                            : `Contrôle qualité incomplet : limite de ${MAX_QUALITY_FULL_RETRIES} reprise(s) complète(s) atteinte.`,
+                        missingSummary,
+                        missingCount: nbMissing,
+                        retryableMissingCount,
+                        unrecoverableMissingCount,
+                        qualityFullRetryCount
+                    });
+                    setJob(finalJob);
+
+                    logImportEvent('error', 'quality_control_blocked', 'Import incomplet arrêté pour éviter une reprise infinie du même patient.', {
+                        jobId: finalJob.id,
+                        missingCount: nbMissing,
+                        retryableMissingCount,
+                        unrecoverableMissingCount,
+                        qualityFullRetryCount,
+                        maxQualityFullRetries: MAX_QUALITY_FULL_RETRIES,
+                        missingSummary,
+                        qualityReport
+                    });
+
+                    releaseWorkerLock(finalJob);
+                    restoreWedaBackgroundExecutionShim('quality_control_blocked');
+                    setImportLogEnabled(true);
+                    showBadge(
+                        `Import incomplet arrêté.\nRetrouvés dans WEDA : ${foundCount}/${expectedCount}\nToujours absents : ${nbMissing}\n\n${missingSummary}\n\nJournal : Ctrl+Alt+L ou bouton Logs ATCD.`,
+                        { error: true, duration: 30000 }
+                    );
+                    setTimeout(() => {
+                        try { showImportLogPanel(); } catch (_) {}
+                    }, 600);
+                    return;
+                }
+
                 const retryJob = prepareSamePatientFullRetryAfterIncompleteImport(finalJob, qualityReport, {
                     importedCount: nbImported,
                     duplicatesSkippedCount: nbDuplicatesSkipped,
@@ -14579,6 +14826,10 @@ ${HEIDI_ASK_AI_PROMPT}`
                     skippedCount: nbSkipped,
                     historicalErrorCount: nbHistoricalErrors,
                     missingCount: nbMissing,
+                    retryableMissingCount,
+                    unrecoverableMissingCount,
+                    qualityFullRetryCount,
+                    maxQualityFullRetries: MAX_QUALITY_FULL_RETRIES,
                     expectedCount,
                     foundCount,
                     missingSummary,

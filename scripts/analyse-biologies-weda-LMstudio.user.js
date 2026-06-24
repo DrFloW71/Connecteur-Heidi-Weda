@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec LM Studio local
 // @namespace    https://secure.weda.fr/
-// @version      0.1.0
+// @version      0.1.3
 // @description  Analyse les résultats HPRIM avec l'API OpenAI-compatible de LM Studio en local. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @grant        GM_addValueChangeListener
@@ -31,7 +31,7 @@
   const LMSTUDIO_MAX_TOKENS = 220;
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "0.1.0";
+  const SCRIPT_VERSION = "0.1.3";
 
   const STORAGE_PREFIX = "wedaBioLmStudio.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
@@ -725,7 +725,7 @@ Ne jamais afficher cet auto-contrôle.`;
 
     setupRememberedTitleAutofill();
     setupManualTitleEditProtection();
-    window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 900);
+    window.setTimeout(() => applyRememberedTitleForSelectedRow(), 900);
     setupAutoHeartbeat();
     handleAutoOnLoad();
   }
@@ -2655,13 +2655,13 @@ Ne jamais afficher cet auto-contrôle.`;
     const grid = document.querySelector("#ContentPlaceHolder1_HprimsGrid");
     if (grid) {
       grid.addEventListener("click", () => {
-        window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 1700);
+        window.setTimeout(() => applyRememberedTitleForSelectedRow(), 1700);
       }, true);
     }
 
     if (!titleAutofillInterval) {
       titleAutofillInterval = window.setInterval(() => {
-        applyRememberedTitleForSelectedRow({ autoSave: true, silent: true });
+        applyRememberedTitleForSelectedRow({ silent: true });
       }, 1200);
     }
 
@@ -2673,7 +2673,7 @@ Ne jamais afficher cet auto-contrôle.`;
     let timer = null;
     const observer = new MutationObserver(() => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => applyRememberedTitleForSelectedRow({ autoSave: true }), 500);
+      timer = window.setTimeout(() => applyRememberedTitleForSelectedRow(), 500);
     });
 
     observer.observe(panel, {
@@ -2926,7 +2926,9 @@ Ne jamais afficher cet auto-contrôle.`;
       selectedStableKey: item ? item.stableKey : "",
       memoryKey: rememberedInfo.key || "",
       titleLength: remembered.length,
-      autoSave: Boolean(options.autoSave),
+      autoSave: false,
+      autoSaveRequested: Boolean(options.autoSave),
+      saveSuppressed: Boolean(options.autoSave),
     });
 
     const assignmentGuard = item
@@ -2955,13 +2957,9 @@ Ne jamais afficher cet auto-contrôle.`;
     input.value = remembered;
     input.dispatchEvent(new Event("input", { bubbles: true }));
 
-    if (options.autoSave) {
-      triggerWedaTitleSave(input, assignmentGuard);
-    }
-
     if (!options.silent) {
       const lineLabel = item ? ` pour la ligne ${item.index + 1}` : "";
-      setPanelStatus(`Titre mémorisé réaffiché${lineLabel}.`);
+      setPanelStatus(`Titre mémorisé réaffiché${lineLabel}, sans sauvegarde automatique.`);
     }
   }
 
@@ -3759,7 +3757,7 @@ Ne jamais afficher cet auto-contrôle.`;
       return false;
     }
 
-    if (isPromptInstructionLine(text) || hasForbiddenHeidiLineTextWithoutWedaStatus(text) || hasForbiddenLipidOutput(text) || hasForbiddenBloodOutput(text)) {
+    if (isPromptInstructionLine(text) || hasForbiddenHeidiLineTextWithoutWedaStatus(text) || hasForbiddenBloodOutput(text)) {
       return false;
     }
 
@@ -3800,13 +3798,16 @@ Ne jamais afficher cet auto-contrôle.`;
   }
 
   function isTitleAllowedForWedaInsertion(title, result = {}) {
+    if (isWedaGeneratedFallbackTitle(result, title)) {
+      return true;
+    }
+
     if (hasForbiddenLipidOutput(title) || hasForbiddenBloodOutput(title)) {
       return false;
     }
 
     return isExpectedTitleLine(title) ||
       isAcceptableCopiedHeidiAnswer(title) ||
-      isWedaGeneratedFallbackTitle(result, title) ||
       isSoftBiologyTitleLine(title, result) ||
       isPermissiveHumanBiologyTitleLine(title, result);
   }
@@ -4331,12 +4332,12 @@ Ne jamais afficher cet auto-contrôle.`;
       contentKey: target.contentKey || displayedContentKey,
       titleSource: result.titleSource || result.source || "lmstudio-local",
     });
-    triggerWedaTitleSave(input, assignmentGuard);
+    triggerWedaTitleSave(input, assignmentGuard, "lmstudio-title");
 
     window.setTimeout(() => goToNextBiology(result.jobId), NEXT_AFTER_SAVE_MS);
   }
 
-  function triggerWedaTitleSave(input, assignmentGuard = null) {
+  function triggerWedaTitleSave(input, assignmentGuard = null, source = "") {
     if (assignmentGuard) {
       try {
         assertTitleAssignmentTarget(assignmentGuard, "before-save-events");
@@ -4350,6 +4351,15 @@ Ne jamais afficher cet auto-contrôle.`;
     input.dispatchEvent(new Event("change", { bubbles: true }));
 
     const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+    appendDebugLog("weda:title-save-trigger", {
+      source,
+      jobId: assignmentGuard && assignmentGuard.jobId || "",
+      contentKey: assignmentGuard && assignmentGuard.contentKey || getDisplayedBiologyContentKey(),
+      rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
+      titleLength: input ? sanitizeTitle(input.value).length : 0,
+      hasDoPostBack: Boolean(pageWindow && typeof pageWindow.__doPostBack === "function"),
+    });
 
     try {
       if (typeof pageWindow.IllegalCaracterFilter === "function") {
@@ -4371,6 +4381,12 @@ Ne jamais afficher cet auto-contrôle.`;
             }
           }
 
+          appendDebugLog("weda:title-save-postback", {
+            source,
+            jobId: assignmentGuard && assignmentGuard.jobId || "",
+            contentKey: assignmentGuard && assignmentGuard.contentKey || getDisplayedBiologyContentKey(),
+            rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
+          });
           pageWindow.__doPostBack("ctl00$ContentPlaceHolder1$TextBoxHprimTitre", "");
         }, 250);
       }
@@ -5886,7 +5902,7 @@ Ne jamais afficher cet auto-contrôle.`;
   }
 
   function buildWedaStatusFallbackTitle(tableText) {
-    const parts = extractWedaAbnormalRows(tableText)
+    const parts = selectPreferredWedaFallbackRows(extractWedaAbnormalRows(tableText))
       .map(formatWedaAbnormalRowForTitle)
       .filter(Boolean)
       .slice(0, 8);
@@ -5952,8 +5968,57 @@ Ne jamais afficher cet auto-contrôle.`;
       .filter((cells) => !hasCkdDfg || !isDfgLabel(cells[0]) || isCkdDfgLabel(cells[0]));
   }
 
+  function selectPreferredWedaFallbackRows(rows) {
+    const byMarker = new Map();
+
+    rows.forEach((cells, order) => {
+      const markerKey = getWedaFallbackMarkerKey(cells);
+      if (!markerKey) {
+        return;
+      }
+
+      const rank = getWedaFallbackUnitRank(cells);
+      const existing = byMarker.get(markerKey);
+
+      if (!existing || rank < existing.rank) {
+        byMarker.set(markerKey, {
+          cells,
+          rank,
+          order: existing ? existing.order : order,
+        });
+      }
+    });
+
+    return Array.from(byMarker.values())
+      .sort((left, right) => left.order - right.order)
+      .map((entry) => entry.cells);
+  }
+
+  function getWedaFallbackMarkerKey(cells) {
+    const label = normalizeWedaFallbackBiologyLabel(cells && cells[0]);
+    return label ? normalizeForCompare(label) : "";
+  }
+
+  function getWedaFallbackUnitRank(cells) {
+    const unit = normalizeForCompare(cells && cells[2]);
+
+    if (/^g\s*\/\s*l$/.test(unit)) {
+      return 0;
+    }
+
+    if (!unit) {
+      return 1;
+    }
+
+    if (/^mmol\s*\/\s*l$/.test(unit)) {
+      return 2;
+    }
+
+    return 1;
+  }
+
   function formatWedaAbnormalRowForTitle(cells) {
-    const label = compactBiologyLabel(cells[0]);
+    const label = normalizeWedaFallbackBiologyLabel(cells[0]);
     const value = cells[1] || "";
     const unit = cells[2] || "";
     const status = cells[5] || "";
@@ -5969,6 +6034,34 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     return normalizeText(`${label}${arrow} ${value}${unit ? ` ${unit}` : ""}`);
+  }
+
+  function normalizeWedaFallbackBiologyLabel(label) {
+    const compact = compactBiologyLabel(label);
+    const normalized = normalizeForCompare(compact);
+
+    if (!compact) {
+      return "";
+    }
+
+    if (/(?:^|[^\w])non\s*[- ]?\s*hdl(?:\s*[- ]?\s*cholesterol|\s+cholesterol)?(?=$|[^\w])/.test(normalized) ||
+      /(?:^|[^\w])cholesterol\s+non\s*[- ]?\s*hdl(?=$|[^\w])/.test(normalized)) {
+      return "non-HDL";
+    }
+
+    if (/(?:^|[^\w])(?:cholesterol\s+)?h\s*\.?\s*d\s*\.?\s*l(?:\s*[- ]?\s*cholesterol)?(?=$|[^\w])/.test(normalized)) {
+      return "HDL";
+    }
+
+    if (/(?:^|[^\w])(?:cholesterol\s+)?l\s*\.?\s*d\s*\.?\s*l(?:\s*[- ]?\s*cholesterol)?(?=$|[^\w])/.test(normalized)) {
+      return "LDL";
+    }
+
+    if (/\btriglycerides?\b/.test(normalized)) {
+      return "TG";
+    }
+
+    return compact;
   }
 
   function isDfgLabel(label) {
