@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Heidi Health vers WEDA
 // @namespace    http://tampermonkey.net/
-// @version      7.94
+// @version      7.95
 // @description  PageUp : lance Heidi + récupération du contexte. PageDown : transfert WEDA. Remplit constantes, suivis structurés, ajoute les étiquettes WEDA, contrôle qualité, notifications renforcées, retour accueil direct et fermeture accélérée. + DEBUG
 // @match        https://*/*
 // @exclude      https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -24,7 +24,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_HH = '7.94';
+    const VERSION_AUTO_HH = '7.95';
 
     const CLE_SIGNAL = 'auto_hh_signal_stable_v768';
     const CLE_SIGNAL_LEGACY = 'auto_hh_signal_stable';
@@ -32,6 +32,7 @@
     const CLE_LOGS_DEBUG = 'auto_hh_debug_logs_stable';
     const CLE_WEDA_CONNECTEUR_ACTIF = 'auto_hh_weda_connector_enabled_stable';
     const CLE_WEDA_PANEL_POSITION = 'auto_hh_weda_panel_position_stable';
+    const CLE_WEDA_PANEL_COMPACT = 'auto_hh_weda_panel_compact_stable';
     const CLE_LAST_WEDA_URL = 'auto_hh_last_weda_url_stable';
     const CLE_RETOUR_ACCUEIL_ORIGINE_WEDA = 'auto_hh_weda_return_home_request_stable';
     const CLE_RETOUR_ACCUEIL_ORIGINE_WEDA_TRAITE = 'auto_hh_weda_return_home_request_done_stable';
@@ -754,6 +755,9 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
                 const bouton = document.createElement('button');
                 bouton.type = 'button';
                 bouton.textContent = libelle;
+                bouton.style.display = 'inline-flex';
+                bouton.style.alignItems = 'center';
+                bouton.style.justifyContent = 'center';
                 bouton.style.border = '1px solid rgba(255,255,255,0.35)';
                 bouton.style.background = 'rgba(255,255,255,0.12)';
                 bouton.style.color = '#ffffff';
@@ -766,9 +770,65 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
                 return bouton;
             }
 
+            function creerBoutonIcone(libelle, titre) {
+                const bouton = creerBouton(libelle);
+                bouton.title = titre;
+                bouton.setAttribute('aria-label', titre);
+                bouton.style.width = '28px';
+                bouton.style.minWidth = '28px';
+                bouton.style.padding = '0';
+                bouton.style.font = '700 16px Arial, sans-serif';
+                return bouton;
+            }
+
             const boutonLancer = creerBouton('Lancer');
             const boutonArreter = creerBouton('Arrêter');
             const boutonLogs = creerBouton('Copier logs');
+            const boutonReduire = creerBoutonIcone('-', 'Réduire le panneau Auto-HH');
+
+            function repositionnerPanneauApresChangementTaille() {
+                setTimeout(() => {
+                    try {
+                        const positionConnue = GM_getValue(CLE_WEDA_PANEL_POSITION, null);
+                        if (positionConnue) appliquerPositionPanneau(positionConnue);
+                        else memoriserPositionPanneau();
+                    } catch (e) {}
+                }, 0);
+            }
+
+            function appliquerModeCompactPanneau(compact, options = {}) {
+                const compactActif = !!compact;
+                const controlesMasques = [version, boutonLancer, boutonArreter, boutonLogs, boutonReduire];
+
+                panneau.dataset.autoHhCompact = compactActif ? '1' : '0';
+                panneau.style.gap = compactActif ? '4px' : '6px';
+                panneau.style.padding = compactActif ? '5px 7px' : '7px';
+                panneau.style.opacity = compactActif ? '0.9' : '0.82';
+
+                blocVersion.style.minWidth = compactActif ? '54px' : '58px';
+                blocVersion.style.gap = compactActif ? '0' : '3px';
+
+                statutInterface.style.minWidth = compactActif ? '52px' : '54px';
+                statutInterface.style.font = compactActif ? '700 10px Arial, sans-serif' : '700 9px Arial, sans-serif';
+                statutInterface.style.cursor = compactActif ? 'pointer' : 'default';
+
+                controlesMasques.forEach(element => {
+                    element.style.display = compactActif ? 'none' : 'inline-flex';
+                });
+
+                poignee.title = compactActif ? 'Déplacer le panneau réduit' : 'Déplacer le panneau';
+                try { mettreAJourStatutPanneauAutoHH(getStatutInterfaceAutoHH()); } catch (e) {}
+
+                try { GM_setValue(CLE_WEDA_PANEL_COMPACT, compactActif); } catch (e) {}
+                if (!options.silencieux) {
+                    ajouterLogAutoHH('weda-ui-panel-compact-change', {
+                        compact: compactActif,
+                        origine: options.origine || null
+                    });
+                }
+
+                repositionnerPanneauApresChangementTaille();
+            }
 
             boutonLancer.addEventListener('click', async event => {
                 event.preventDefault();
@@ -794,13 +854,31 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
                 afficherBadge(ok ? 'AUTO-HH : logs copiés' : 'AUTO-HH : copie des logs impossible', ok ? 3000 : 7000, { force: true });
             }, true);
 
+            boutonReduire.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                appliquerModeCompactPanneau(true, { origine: 'bouton_reduire' });
+            }, true);
+
+            statutInterface.addEventListener('click', event => {
+                if (panneau.dataset.autoHhCompact !== '1') return;
+                event.preventDefault();
+                event.stopPropagation();
+                appliquerModeCompactPanneau(false, { origine: 'statut_reduit' });
+            }, true);
+
             panneau.appendChild(poignee);
             panneau.appendChild(blocVersion);
+            panneau.appendChild(boutonReduire);
             panneau.appendChild(boutonLancer);
             panneau.appendChild(boutonArreter);
             panneau.appendChild(boutonLogs);
             document.body.appendChild(panneau);
             mettreAJourStatutPanneauAutoHH(getStatutInterfaceAutoHH());
+
+            try {
+                appliquerModeCompactPanneau(GM_getValue(CLE_WEDA_PANEL_COMPACT, false), { silencieux: true, origine: 'init' });
+            } catch (e) {}
 
             try {
                 appliquerPositionPanneau(GM_getValue(CLE_WEDA_PANEL_POSITION, null));
@@ -1110,10 +1188,14 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             const statut = normaliserStatutInterfaceAutoHH(statutRecord && statutRecord.statut);
             const config = getConfigStatutInterfaceAutoHH(statut);
             const libelle = String((statutRecord && statutRecord.libelle) || config.libelle || 'PRÊT');
+            const panneau = document.getElementById('auto-hh-weda-panel');
+            const compact = !!(panneau && panneau.dataset && panneau.dataset.autoHhCompact === '1');
 
             element.textContent = libelle;
             element.style.color = (statutRecord && statutRecord.couleur) || config.couleur || '#cfe8ff';
-            element.title = 'Statut Auto-HH : ' + libelle + (statutRecord && statutRecord.message ? ' — ' + statutRecord.message : '');
+            element.title = 'Statut Auto-HH : ' + libelle +
+                (statutRecord && statutRecord.message ? ' — ' + statutRecord.message : '') +
+                (compact ? ' — cliquer pour agrandir' : '');
         } catch (e) {}
     }
 

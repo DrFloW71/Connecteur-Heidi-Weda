@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WEDA - Copilote prévention vigilance LM Studio
 // @namespace    https://secure.weda.fr/
-// @version      0.6.5
+// @version      0.6.7
 // @description  Lit la page d'accueil patient WEDA, l'envoie à LM Studio local avec un prompt médical, puis affiche un encart copilote flottant.
 // @author       Florian Ronez + ChatGPT
 // @match        https://secure.weda.fr/FolderMedical/PatientViewForm.aspx*
@@ -11,6 +11,7 @@
 // @grant        GM_setClipboard
 // @connect      localhost
 // @connect      127.0.0.1
+// @connect      *
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -18,7 +19,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '0.6.5';
+    const SCRIPT_VERSION = '0.6.7';
 
     const CONFIG = {
         LM_STUDIO_BASE_URL: 'http://127.0.0.1:1234/v1',
@@ -78,10 +79,16 @@ Le but est de montrer uniquement ce qui mérite une action, une vérification ou
 Ne pas féliciter, ne pas écrire “à jour”, ne pas noter “RAS”, ne pas mentionner les éléments faits correctement.
 S'il n'y a rien à faire dans une section, omets complètement la section, sauf DIAGNOSTICS / DIFFÉRENTIELS À ÉVOQUER où tu peux écrire : “Aucun différentiel pertinent retrouvé dans les données fournies.”
 
-EXCEPTION FROTTIS / DÉPISTAGE DU COL ENTRE 25 ET 30 ANS
+RÈGLE FROTTIS / DÉPISTAGE DU COL
+
+Avant 25 ans :
+- ne mentionne jamais le frottis, le dépistage du col, la cytologie ou le test HPV-HR ;
+- ne signale jamais une date non retrouvée ;
+- ne propose jamais de vérifier ou refaire un frottis ;
+- exception uniquement si le dossier mentionne explicitement un antécédent gynécologique particulier nécessitant un suivi spécifique : lésion cervicale, conisation, CIN, HSIL, LSIL, immunodépression, VIH, DES ou suivi gynécologique spécialisé déjà en cours. Dans ce cas, formuler comme vigilance prudente, pas comme dépistage systématique.
 
 Pour les femmes de 25 ans à moins de 30 ans :
-- ne conclus pas que le frottis est à refaire ;
+- ne conclus pas automatiquement que le frottis est à refaire ;
 - ne classe pas le frottis comme “en retard” ;
 - affiche seulement la dernière date retrouvée du frottis / dépistage du col / cytologie si elle existe ;
 - si aucune date n'est retrouvée, écris seulement que la dernière date n'est pas retrouvée ;
@@ -90,6 +97,16 @@ Format attendu :
 [INFO] **Frottis / col** : dernière date retrouvée **JJ/MM/AAAA**.
 ou
 [JAUNE] **Frottis / col** : dernière date non retrouvée, décision médicale laissée au médecin.
+
+Pour les femmes de 30 à 65 ans inclus :
+- vérifier frottis / dépistage du col / test HPV-HR tous les 5 ans ;
+- alerter si aucun frottis / dépistage du col / test HPV-HR retrouvé depuis plus de 5 ans ou si aucune date n'est retrouvée ;
+- si un dépistage du col est retrouvé depuis moins de 5 ans, ne pas le mentionner ;
+- ne jamais utiliser [ROUGE] pour le frottis / dépistage du col.
+
+Après 65 ans :
+- ne mentionne pas systématiquement le frottis / dépistage du col ;
+- mentionner seulement si le dossier indique explicitement un suivi gynécologique particulier, un antécédent de lésion cervicale ou un suivi spécialisé.
 
 RÈGLE CODE COULEUR DANS TOUTES LES SECTIONS
 
@@ -232,7 +249,9 @@ PRÉVENTION À VÉRIFIER
 - Liste courte des examens, vaccins ou dépistages probablement en retard.
 - Ne cite que les éléments pertinents selon âge, sexe, antécédents et facteurs de risque.
 - N'affiche aucun dépistage ou vaccin déjà à jour.
-- Exception : pour les femmes de 25 ans à moins de 30 ans, afficher seulement la dernière date du frottis / dépistage du col retrouvée, sans conclure que c'est à refaire.
+- Avant 25 ans, ne mentionne jamais le frottis / col / cytologie / HPV-HR sauf contexte gynécologique particulier explicitement retrouvé.
+- Pour les femmes de 25 ans à moins de 30 ans, afficher seulement la dernière date du frottis / dépistage du col retrouvée, sans conclure que c'est à refaire.
+- Pour les femmes de 30 à 65 ans, appliquer l'intervalle de 5 ans.
 - Pour les vaccins, applique strictement les règles vaccinales françaises 2026 ci-dessous.
 - Chaque ligne doit commencer par [ROUGE], [ORANGE], [JAUNE] ou [INFO].
 
@@ -247,6 +266,7 @@ DONNÉES MANQUANTES UTILES
 - Informations utiles à rechercher ou mettre à jour dans WEDA.
 - Ne pas dépasser 8 items.
 - Ne pas lister les informations déjà clairement disponibles ou à jour.
+- Ne jamais mentionner le frottis / col / cytologie / HPV-HR avant 25 ans, sauf contexte gynécologique particulier explicitement retrouvé.
 - Chaque ligne doit commencer par [ORANGE], [JAUNE] ou [INFO].
 
 RÈGLES VACCINALES FRANÇAISES 2026 À APPLIQUER STRICTEMENT
@@ -355,11 +375,13 @@ Cancer du sein :
 - Si mammographie retrouvée depuis moins de 2 ans, ne pas mentionner.
 
 Cancer du col de l'utérus / frottis :
+- Avant 25 ans : ne jamais mentionner frottis / dépistage du col / cytologie / HPV-HR, sauf contexte gynécologique particulier explicitement retrouvé.
+- Femmes de 25 ans à moins de 30 ans : afficher seulement la dernière date retrouvée du frottis / dépistage du col / cytologie, sans dire que c'est en retard et sans proposer de le refaire.
+- Si aucune date n'est retrouvée entre 25 et moins de 30 ans : signaler seulement que la dernière date n'est pas retrouvée, en laissant la décision au médecin.
 - Femmes de 30 à 65 ans inclus : vérifier frottis / dépistage du col / test HPV-HR tous les 5 ans.
 - Alerte si aucun frottis / dépistage du col / test HPV-HR retrouvé depuis plus de 5 ans ou si aucune date n'est retrouvée.
 - Si frottis / dépistage du col / test HPV-HR retrouvé depuis moins de 5 ans, ne pas mentionner.
-- Femmes de 25 ans à moins de 30 ans : afficher seulement la dernière date retrouvée du frottis / dépistage du col / cytologie, sans dire que c'est en retard et sans proposer de le refaire.
-- Si aucune date n'est retrouvée entre 25 et moins de 30 ans : signaler seulement que la dernière date n'est pas retrouvée, en laissant la décision au médecin.
+- Après 65 ans : ne pas mentionner systématiquement, sauf contexte gynécologique particulier explicitement retrouvé.
 - Ne jamais utiliser [ROUGE] pour le frottis / dépistage du col.
 
 Dentiste :
@@ -1047,29 +1069,12 @@ STYLE
             return 'info';
         }
 
-        if (section.includes('SYNTHESE RAPIDE')) {
-            return 'info';
-        }
-
-        if (section.includes('DIAGNOSTICS') || section.includes('DIFFERENTIELS')) {
-            return 'jaune';
-        }
-
-        if (section.includes('VIGILANCE CLINIQUE')) {
-            return 'orange';
-        }
-
-        if (section.includes('PREVENTION')) {
-            return 'orange';
-        }
-
-        if (section.includes('SUIVI CHRONIQUE')) {
-            return 'orange';
-        }
-
-        if (section.includes('DONNEES MANQUANTES')) {
-            return 'jaune';
-        }
+        if (section.includes('SYNTHESE RAPIDE')) return 'info';
+        if (section.includes('DIAGNOSTICS') || section.includes('DIFFERENTIELS')) return 'jaune';
+        if (section.includes('VIGILANCE CLINIQUE')) return 'orange';
+        if (section.includes('PREVENTION')) return 'orange';
+        if (section.includes('SUIVI CHRONIQUE')) return 'orange';
+        if (section.includes('DONNEES MANQUANTES')) return 'jaune';
 
         return '';
     }
@@ -1341,15 +1346,8 @@ STYLE
             const dx = event.clientX - startX;
             const dy = event.clientY - startY;
 
-            const nextLeft = Math.min(
-                Math.max(4, startLeft + dx),
-                Math.max(4, window.innerWidth - 80)
-            );
-
-            const nextTop = Math.min(
-                Math.max(4, startTop + dy),
-                Math.max(4, window.innerHeight - 40)
-            );
+            const nextLeft = Math.min(Math.max(4, startLeft + dx), Math.max(4, window.innerWidth - 80));
+            const nextTop = Math.min(Math.max(4, startTop + dy), Math.max(4, window.innerHeight - 40));
 
             panel.style.left = `${nextLeft}px`;
             panel.style.top = `${nextTop}px`;
@@ -1502,17 +1500,19 @@ STYLE
             <div class="weda-copilote-resize-handle resize-sw" data-resize-dir="sw"></div>
 
             <div class="weda-copilote-header" title="Cliquer-glisser pour déplacer">
-                <div class="weda-copilote-title">Copilote WEDA <span class="weda-copilote-version">v${SCRIPT_VERSION}</span></div>
+                <div class="weda-copilote-title">
+                    <span class="weda-copilote-title-main">Copilote WEDA</span>
+                    <span class="weda-copilote-version">v${SCRIPT_VERSION}</span>
+                </div>
                 <div class="weda-copilote-header-buttons">
+                    <button type="button" class="btn-run" title="Relance manuelle même si une analyse automatique existe déjà aujourd’hui">Analyser</button>
+                    <button type="button" class="btn-copy-page" title="Copier le texte extrait de la page">Page</button>
+                    <button type="button" class="btn-copy-result" title="Copier le résultat">Résultat</button>
                     <button type="button" class="btn-collapse" title="Réduire / afficher">—</button>
                 </div>
             </div>
+
             <div class="weda-copilote-body">
-                <div class="weda-copilote-actions">
-                    <button type="button" class="btn-run" title="Relance manuelle même si une analyse automatique existe déjà aujourd’hui">Analyser</button>
-                    <button type="button" class="btn-copy-page">Copier page</button>
-                    <button type="button" class="btn-copy-result">Copier résultat</button>
-                </div>
                 <div class="weda-copilote-result">
                     En attente de l’analyse.
                 </div>
@@ -1566,12 +1566,19 @@ STYLE
             }
 
             #${PANEL_ID}.collapsed {
-                width: 265px !important;
-                height: 38px !important;
-                min-height: 38px;
+                width: 285px !important;
+                height: 30px !important;
+                min-height: 30px;
             }
 
             #${PANEL_ID}.collapsed .weda-copilote-resize-handle {
+                display: none;
+            }
+
+            #${PANEL_ID}.collapsed .btn-run,
+            #${PANEL_ID}.collapsed .btn-copy-page,
+            #${PANEL_ID}.collapsed .btn-copy-result,
+            #${PANEL_ID}.collapsed .weda-copilote-version {
                 display: none;
             }
 
@@ -1646,13 +1653,14 @@ STYLE
             }
 
             #${PANEL_ID} .weda-copilote-header {
-                height: 38px;
+                height: 30px;
                 background: #073b63;
                 color: white;
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                padding: 0 8px 0 12px;
+                gap: 6px;
+                padding: 0 5px 0 8px;
                 cursor: move;
                 user-select: none;
                 box-sizing: border-box;
@@ -1666,32 +1674,40 @@ STYLE
 
             #${PANEL_ID} .weda-copilote-title {
                 font-weight: 700;
-                font-size: 15px;
-                letter-spacing: 0.2px;
+                font-size: 12px;
+                letter-spacing: 0.1px;
                 display: flex;
                 align-items: center;
-                gap: 7px;
+                gap: 5px;
                 min-width: 0;
                 white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                flex: 1 1 auto;
+            }
+
+            #${PANEL_ID} .weda-copilote-title-main {
+                min-width: 0;
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
 
             #${PANEL_ID} .weda-copilote-version {
-                font-size: 11px;
+                font-size: 9.5px;
                 font-weight: 800;
                 color: #ffffff;
                 background: rgba(255, 255, 255, 0.18);
-                border: 1px solid rgba(255, 255, 255, 0.28);
+                border: 1px solid rgba(255, 255, 255, 0.25);
                 border-radius: 999px;
-                padding: 2px 7px;
-                line-height: 1.2;
+                padding: 1px 5px;
+                line-height: 1.15;
+                flex-shrink: 0;
             }
 
             #${PANEL_ID} .weda-copilote-header-buttons {
                 display: flex;
                 align-items: center;
-                gap: 6px;
+                gap: 3px;
                 flex-shrink: 0;
             }
 
@@ -1700,55 +1716,42 @@ STYLE
                 cursor: pointer;
             }
 
-            #${PANEL_ID} .btn-collapse {
-                border: 1px solid rgba(255,255,255,0.45);
+            #${PANEL_ID} .weda-copilote-header-buttons button {
+                border: 1px solid rgba(255,255,255,0.34);
                 background: rgba(255,255,255,0.13);
-                color: #fff;
-                border-radius: 6px;
-                width: 29px;
-                height: 25px;
-                font-size: 16px;
+                color: #ffffff;
+                border-radius: 5px;
+                height: 22px;
+                padding: 0 6px;
+                font-size: 10.5px;
                 font-weight: 700;
-                line-height: 18px;
+                line-height: 20px;
+                white-space: nowrap;
             }
 
-            #${PANEL_ID} .btn-collapse:hover {
+            #${PANEL_ID} .weda-copilote-header-buttons button:hover {
                 background: rgba(255,255,255,0.25);
             }
 
+            #${PANEL_ID} .weda-copilote-header-buttons button:disabled {
+                opacity: 0.55;
+                cursor: not-allowed;
+            }
+
+            #${PANEL_ID} .btn-collapse {
+                width: 24px;
+                padding: 0 !important;
+                font-size: 14px !important;
+                font-weight: 800 !important;
+            }
+
             #${PANEL_ID} .weda-copilote-body {
-                padding: 8px;
-                height: calc(100% - 38px);
+                padding: 6px;
+                height: calc(100% - 30px);
                 overflow: auto;
                 background: #f7fafc;
                 box-sizing: border-box;
                 border-radius: 0 0 9px 9px;
-            }
-
-            #${PANEL_ID} .weda-copilote-actions {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 5px;
-                margin-bottom: 6px;
-            }
-
-            #${PANEL_ID} .weda-copilote-actions button {
-                border: 1px solid #bfd2e5;
-                background: #ffffff;
-                color: #073b63;
-                border-radius: 7px;
-                padding: 5px 8px;
-                font-size: 12px;
-                font-weight: 700;
-            }
-
-            #${PANEL_ID} .weda-copilote-actions button:hover {
-                background: #edf6ff;
-            }
-
-            #${PANEL_ID} .weda-copilote-actions button:disabled {
-                opacity: 0.55;
-                cursor: not-allowed;
             }
 
             #${PANEL_ID} .weda-copilote-result {
@@ -1762,16 +1765,16 @@ STYLE
             }
 
             #${PANEL_ID} .weda-copilote-footer {
-                margin-top: 6px;
+                margin-top: 5px;
             }
 
             #${PANEL_ID} .weda-copilote-status {
                 font-size: 11px;
                 font-weight: 700;
                 border-radius: 7px;
-                padding: 5px 7px;
-                margin-top: 6px;
-                margin-bottom: 4px;
+                padding: 4px 7px;
+                margin-top: 5px;
+                margin-bottom: 3px;
                 background: #e8eef5;
                 color: #17324d;
                 border: 1px solid #d3deea;
@@ -1798,7 +1801,7 @@ STYLE
             #${PANEL_ID} .weda-copilote-meta {
                 font-size: 10px;
                 color: #5d6b78;
-                margin: 0 2px 2px 2px;
+                margin: 0 2px 1px 2px;
                 line-height: 1.25;
             }
 
@@ -1820,7 +1823,7 @@ STYLE
             }
 
             #${PANEL_ID} .weda-copilote-heading {
-                margin: 6px 0 3px 0;
+                margin: 5px 0 3px 0;
                 padding: 3px 6px;
                 background: #073b63;
                 color: #ffffff;

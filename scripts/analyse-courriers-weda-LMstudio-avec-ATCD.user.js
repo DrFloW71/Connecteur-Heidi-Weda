@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.2
+// @version      0.1.10
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -35,9 +35,37 @@
   const LMSTUDIO_TEMPERATURE = 0;
   const LMSTUDIO_MAX_TOKENS = 900;
   const LMSTUDIO_MAX_DOCUMENT_TEXT_LENGTH = 45000;
+  const LMSTUDIO_PDF_IMAGE_FALLBACK_ENABLED = true;
+  const LMSTUDIO_PDF_TEXT_SPARSE_FALLBACK_ENABLED = true;
+  const LMSTUDIO_PDF_TEXT_SPARSE_MAX_CHARS = 900;
+  const LMSTUDIO_PDF_TEXT_SPARSE_MAX_LINES = 10;
+  const LMSTUDIO_PDF_TEXT_SPARSE_MAX_WORDS = 110;
+  const LMSTUDIO_PDF_TEXT_GARBLED_FALLBACK_ENABLED = true;
+  const LMSTUDIO_PDF_TEXT_GARBLED_PRIVATE_USE_MIN_CHARS = 3;
+  const LMSTUDIO_PDF_TEXT_GARBLED_PRIVATE_USE_MIN_RATIO = 0.002;
+  const LMSTUDIO_PDF_TEXT_GARBLED_SYMBOL_MIN_RATIO = 0.08;
+  const LMSTUDIO_PDF_TEXT_GARBLED_MIN_WORDS_FOR_LANGUAGE_CHECK = 60;
+  const LMSTUDIO_PDF_TEXT_GARBLED_MIN_COMMON_WORD_HITS = 4;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_CHARS = 1000;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_WORDS = 80;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_COMMON_WORD_OCCURRENCES = 12;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MAX_COMMON_WORD_RATIO = 0.03;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MIN_CHARS = 1000;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MAX_RATIO = 0.012;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MIN_SYMBOL_RATIO = 0.12;
+  const LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MAX_COMMON_WORD_OCCURRENCES = 3;
+  const LMSTUDIO_ADMINISTRATIVE_TITLE_IMAGE_RETRY_ENABLED = true;
+  const LMSTUDIO_PDF_IMAGE_MAX_PAGES = 4;
+  const LMSTUDIO_PDF_IMAGE_SCALE = 1.65;
+  const LMSTUDIO_PDF_IMAGE_MAX_SIDE_PX = 1800;
+  const LMSTUDIO_PDF_IMAGE_MIME_TYPE = "image/jpeg";
+  const LMSTUDIO_PDF_IMAGE_QUALITY = 0.86;
+  const LMSTUDIO_PDF_IMAGE_MAX_TOTAL_DATA_URL_LENGTH = 10 * 1024 * 1024;
+  const LMSTUDIO_UNUSABLE_PDF_FAIL_CLOSED = true;
+  const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.2";
+  const SCRIPT_VERSION = "0.1.10";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -54,8 +82,8 @@
   const CANCEL_KEY = `${STORAGE_PREFIX}cancel`;
   const STATUS_KEY = `${STORAGE_PREFIX}status`;
   const DEBUG_LOG_KEY = `${STORAGE_PREFIX}debugLog.v1`;
-  const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v1`;
-  const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v1`;
+  const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v6`;
+  const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v6`;
   const AUTO_SEEN_ROWS_KEY = `${STORAGE_PREFIX}autoSeenRows.v1`;
   const HEIDI_COURRIER_TAB_ROLE_KEY = `${STORAGE_PREFIX}heidiTabRole`;
   const HEIDI_COURRIER_SESSION_ID_KEY = `${STORAGE_PREFIX}heidiSessionId`;
@@ -3939,6 +3967,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       pdfAttachmentMimeType: extracted.pdfAttachmentMimeType || "",
       pdfAttachmentByteLength: extracted.pdfAttachmentByteLength || 0,
       pdfTextExtractionEmpty: Boolean(extracted.pdfTextExtractionEmpty),
+      pdfPageImages: Array.isArray(extracted.pdfPageImages) ? extracted.pdfPageImages : [],
+      pdfImagePageCount: Number(extracted.pdfImagePageCount || 0),
+      pdfImageTotalPages: Number(extracted.pdfImageTotalPages || 0),
+      pdfImageFallbackReason: extracted.pdfImageFallbackReason || "",
+      pdfTextExtractionSparse: Boolean(extracted.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(extracted.pdfTextExtractionGarbled),
+      pdfTextUnusable: Boolean(extracted.pdfTextUnusable),
+      pdfUnusableReason: extracted.pdfUnusableReason || "",
+      pdfTextPageCount: Number(extracted.pdfTextPageCount || 0),
     };
   }
 
@@ -3968,13 +4005,82 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       attempt += 1;
 
       try {
-        const rawText = await extractPdfTextFromUrl(displayed.pdfUrl);
+        const extractedText = await extractPdfTextFromUrl(displayed.pdfUrl);
+        const rawText = typeof extractedText === "string" ? extractedText : extractedText.text || "";
+        const pdfTextInfo = buildPdfTextExtractionInfo(rawText, extractedText);
         const documentText = truncateDocumentText(rawText);
 
         if (documentText && documentText.length >= PDF_MIN_TEXT_LENGTH) {
+          const garbledInfo = getGarbledExtractedPdfTextInfo(documentText, pdfTextInfo);
+          appendDebugLog("weda:pdf-text-quality", {
+            attempt,
+            urlKey: displayed.urlKey,
+            textLength: garbledInfo.textLength,
+            lineCount: garbledInfo.lineCount,
+            wordCount: garbledInfo.wordCount,
+            wordDensityRatio: garbledInfo.wordDensityRatio,
+            privateUseCount: garbledInfo.privateUseCount,
+            privateUseRatio: garbledInfo.privateUseRatio,
+            replacementCharCount: garbledInfo.replacementCharCount,
+            symbolRatio: garbledInfo.symbolRatio,
+            commonWordHits: garbledInfo.commonWordHits,
+            commonWordOccurrences: garbledInfo.commonWordOccurrences,
+            commonWordOccurrenceRatio: garbledInfo.commonWordOccurrenceRatio,
+            reason: garbledInfo.reason,
+            shouldFallback: garbledInfo.shouldFallback,
+          });
+
+          if (garbledInfo.shouldFallback) {
+            appendDebugLog("weda:pdf-text-garbled-unusable", {
+              attempt,
+              urlKey: displayed.urlKey,
+              textLength: garbledInfo.textLength,
+              lineCount: garbledInfo.lineCount,
+              wordCount: garbledInfo.wordCount,
+              wordDensityRatio: garbledInfo.wordDensityRatio,
+              privateUseCount: garbledInfo.privateUseCount,
+              privateUseRatio: garbledInfo.privateUseRatio,
+              symbolRatio: garbledInfo.symbolRatio,
+              commonWordHits: garbledInfo.commonWordHits,
+              commonWordOccurrences: garbledInfo.commonWordOccurrences,
+              commonWordOccurrenceRatio: garbledInfo.commonWordOccurrenceRatio,
+              reason: garbledInfo.reason,
+            });
+
+            return buildPdfImageFallbackOrUnusableDocument(displayed, new Error("texte PDF encodé ou illisible"), {
+              reason: "garbled-text",
+              garbledInfo,
+              pdfTextInfo,
+            });
+          }
+
+          const sparseInfo = getSparseExtractedPdfTextInfo(documentText, pdfTextInfo);
+          if (sparseInfo.shouldFallback) {
+            appendDebugLog("weda:pdf-text-sparse-unusable", {
+              attempt,
+              urlKey: displayed.urlKey,
+              textLength: sparseInfo.textLength,
+              lineCount: sparseInfo.lineCount,
+              wordCount: sparseInfo.wordCount,
+              pageCount: sparseInfo.pageCount,
+              reason: sparseInfo.reason,
+            });
+
+            return buildPdfImageFallbackOrUnusableDocument(displayed, new Error("texte PDF partiel ou trop court"), {
+              reason: "sparse-text",
+              sparseInfo,
+              pdfTextInfo,
+            });
+          }
+
           return {
             documentText,
             displayed,
+            sourceType: sparseInfo.shouldFallback ? "pdf-text-sparse" : "pdf",
+            pdfTextExtractionSparse: Boolean(sparseInfo.shouldFallback),
+            pdfTextExtractionGarbled: false,
+            pdfTextPageCount: pdfTextInfo.pageCount || 0,
+            pdfTextInfo,
           };
         }
 
@@ -4033,7 +4139,460 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       }
     }
 
-    throw lastError || new Error("texte du PDF vide ou illisible");
+    return buildPdfImageFallbackOrUnusableDocument(displayed, lastError, {
+      reason: "empty-text",
+    });
+  }
+
+  async function buildPdfImageFallbackOrUnusableDocument(displayed, lastError = null, options = {}) {
+    const fallback = await buildPdfImageFallbackFromDisplayedPdf(displayed, lastError, options);
+
+    if (fallback && Array.isArray(fallback.pdfPageImages) && fallback.pdfPageImages.length) {
+      return fallback;
+    }
+
+    return buildUnusablePdfDocumentFromDisplayedPdf(displayed, lastError, options);
+  }
+
+  function buildUnusablePdfDocumentFromDisplayedPdf(displayed, lastError = null, options = {}) {
+    const reason = options.reason || "unusable-text";
+    const textInfo = options.garbledInfo || options.sparseInfo || options.pdfTextInfo || {};
+    const documentText = buildUnusablePdfDocumentText(displayed, lastError, {
+      ...options,
+      reason,
+      textInfo,
+    });
+
+    appendDebugLog("weda:pdf-text-unusable-no-lmstudio", {
+      urlKey: displayed && displayed.urlKey || "",
+      reason,
+      error: lastError && lastError.message ? lastError.message : "",
+      textLength: Number(textInfo.textLength || 0),
+      lineCount: Number(textInfo.lineCount || 0),
+      wordCount: Number(textInfo.wordCount || 0),
+      wordDensityRatio: Number(textInfo.wordDensityRatio || 0),
+      pageCount: Number(textInfo.pageCount || 0),
+    });
+    setPanelStatus("PDF sans texte exploitable : aucun appel LM Studio, titre de sécurité préparé.");
+
+    return {
+      documentText,
+      displayed,
+      sourceType: "pdf-unusable-text",
+      pdfAttachmentBase64: "",
+      pdfAttachmentName: buildPdfAttachmentFileName(displayed && displayed.pdfUrl || ""),
+      pdfAttachmentMimeType: "application/pdf",
+      pdfAttachmentByteLength: Number(textInfo.byteLength || 0),
+      pdfTextExtractionEmpty: reason === "empty-text",
+      pdfTextExtractionSparse: reason === "sparse-text",
+      pdfTextExtractionGarbled: reason === "garbled-text",
+      pdfTextUnusable: true,
+      pdfUnusableReason: reason,
+      pdfPageImages: [],
+      pdfImagePageCount: 0,
+      pdfImageTotalPages: Number(textInfo.pageCount || 0),
+      pdfImageFallbackReason: "",
+      pdfTextPageCount: Number(textInfo.pageCount || 0),
+      pdfTextInfo: textInfo,
+    };
+  }
+
+  function buildUnusablePdfDocumentText(displayed, lastError = null, options = {}) {
+    const textInfo = options.textInfo || {};
+    return normalizePdfText([
+      UNUSABLE_PDF_TITLE,
+      "Le texte extrait du PDF est inexploitable pour une analyse automatique fiable.",
+      `Cause : ${formatUnusablePdfReason(options.reason || "unusable-text")}.`,
+      `Identifiant PDF local : ${displayed && displayed.urlKey || "pdfurl-" + hashString(displayed && displayed.pdfUrl || "")}.`,
+      Number(textInfo.textLength || 0) ? `Texte extrait rejeté : ${textInfo.textLength} caractères, ${textInfo.lineCount || 0} lignes, ${textInfo.wordCount || 0} mots.` : "",
+      lastError && lastError.message ? `Erreur : ${lastError.message}.` : "",
+    ].filter(Boolean).join("\n"));
+  }
+
+  function formatUnusablePdfReason(reason = "") {
+    const labels = {
+      "empty-text": "aucun texte extractible",
+      "garbled-text": "texte encodé ou illisible",
+      "sparse-text": "texte trop court ou probablement partiel",
+      "unusable-text": "texte inexploitable",
+    };
+
+    return labels[reason] || labels["unusable-text"];
+  }
+
+  async function buildPdfImageFallbackFromDisplayedPdf(displayed, lastError = null, options = {}) {
+    if (!LMSTUDIO_PDF_IMAGE_FALLBACK_ENABLED || !displayed || !displayed.pdfUrl) {
+      return null;
+    }
+
+    const reason = options.reason || "empty-text";
+    const sparseInfo = options.sparseInfo || null;
+    const garbledInfo = options.garbledInfo || null;
+    appendDebugLog("weda:pdf-image-fallback-start", {
+      urlKey: displayed.urlKey || "",
+      error: lastError && lastError.message ? lastError.message : "",
+      reason,
+      maxPages: LMSTUDIO_PDF_IMAGE_MAX_PAGES,
+      scale: LMSTUDIO_PDF_IMAGE_SCALE,
+      sparseInfo,
+      garbledInfo,
+    });
+    setPanelStatus("PDF sans texte exploitable : préparation des pages en images pour LM Studio...");
+
+    try {
+      const rendered = await renderPdfPageImagesFromUrl(displayed.pdfUrl);
+      if (!rendered.images.length) {
+        appendDebugLog("weda:pdf-image-fallback-empty", {
+          urlKey: displayed.urlKey || "",
+          totalPages: rendered.totalPages || 0,
+          byteLength: rendered.byteLength || 0,
+        });
+        return null;
+      }
+
+      const documentText = buildPdfImageFallbackDocumentText(displayed, rendered, lastError, {
+        reason,
+        sparseInfo,
+        garbledInfo,
+      });
+      appendDebugLog("weda:pdf-image-fallback-ready", {
+        urlKey: displayed.urlKey || "",
+        reason,
+        totalPages: rendered.totalPages,
+        renderedPages: rendered.images.map((image) => image.pageNumber),
+        imageCount: rendered.images.length,
+        totalDataUrlLength: rendered.totalDataUrlLength,
+        byteLength: rendered.byteLength || 0,
+      });
+
+      return {
+        documentText,
+        displayed,
+        sourceType: "pdf-image",
+        pdfAttachmentBase64: "",
+        pdfAttachmentName: buildPdfAttachmentFileName(displayed.pdfUrl || ""),
+        pdfAttachmentMimeType: "application/pdf",
+        pdfAttachmentByteLength: rendered.byteLength || 0,
+        pdfTextExtractionEmpty: reason === "empty-text",
+        pdfTextExtractionSparse: reason === "sparse-text" || Boolean(sparseInfo),
+        pdfTextExtractionGarbled: reason === "garbled-text" || Boolean(options.garbledInfo),
+        pdfImageFallbackUsed: true,
+        pdfImageFallbackReason: reason,
+        pdfPageImages: rendered.images,
+        pdfImagePageCount: rendered.images.length,
+        pdfImageTotalPages: rendered.totalPages,
+        pdfTextPageCount: rendered.totalPages || 0,
+      };
+    } catch (error) {
+      appendDebugLog("weda:pdf-image-fallback-error", {
+        urlKey: displayed.urlKey || "",
+        error: error && error.message ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  async function renderPdfPageImagesFromUrl(pdfUrl) {
+    await ensurePdfJsReady();
+    abortIfWorkflowStopped();
+
+    const bytes = await fetchPdfBytes(pdfUrl);
+    const originalBytes = new Uint8Array(bytes);
+    abortIfWorkflowStopped();
+
+    const pdf = await pdfjsLib.getDocument({
+      data: new Uint8Array(originalBytes),
+      disableFontFace: true,
+      useSystemFonts: true,
+    }).promise;
+
+    const images = [];
+    let totalDataUrlLength = 0;
+    const totalPages = pdf.numPages || 0;
+
+    try {
+      const pageNumbers = getPdfImageFallbackPageNumbers(totalPages);
+
+      for (const pageNumber of pageNumbers) {
+        abortIfWorkflowStopped();
+        const image = await renderPdfPageToImageDataUrl(pdf, pageNumber);
+        const nextTotal = totalDataUrlLength + image.dataUrl.length;
+
+        if (images.length && nextTotal > LMSTUDIO_PDF_IMAGE_MAX_TOTAL_DATA_URL_LENGTH) {
+          appendDebugLog("weda:pdf-image-fallback-page-skipped-size", {
+            pageNumber,
+            dataUrlLength: image.dataUrl.length,
+            totalDataUrlLength,
+            maxTotalDataUrlLength: LMSTUDIO_PDF_IMAGE_MAX_TOTAL_DATA_URL_LENGTH,
+          });
+          break;
+        }
+
+        images.push(image);
+        totalDataUrlLength = nextTotal;
+      }
+    } finally {
+      if (pdf && typeof pdf.destroy === "function") {
+        try {
+          await pdf.destroy();
+        } catch (_error) {
+          // La mémoire canvas/PDF sera quand même relâchée par le navigateur.
+        }
+      }
+    }
+
+    return {
+      images,
+      totalPages,
+      byteLength: originalBytes.length,
+      totalDataUrlLength,
+    };
+  }
+
+  function getPdfImageFallbackPageNumbers(totalPages) {
+    const count = Math.max(0, Number(totalPages) || 0);
+    const maxPages = Math.max(1, Number(LMSTUDIO_PDF_IMAGE_MAX_PAGES) || 1);
+
+    if (count <= maxPages) {
+      return Array.from({ length: count }, (_value, index) => index + 1);
+    }
+
+    const headCount = Math.max(1, maxPages - 1);
+    const pages = Array.from({ length: headCount }, (_value, index) => index + 1);
+    pages.push(count);
+    return Array.from(new Set(pages)).slice(0, maxPages);
+  }
+
+  async function renderPdfPageToImageDataUrl(pdf, pageNumber) {
+    const page = await pdf.getPage(pageNumber);
+    const scale = getPdfImageFallbackScale(page);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+
+    canvas.width = width;
+    canvas.height = height;
+
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) {
+      throw new Error("canvas 2D indisponible pour convertir le PDF en image");
+    }
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    await page.render({
+      canvasContext: context,
+      viewport,
+      background: "white",
+    }).promise;
+
+    const dataUrl = canvas.toDataURL(LMSTUDIO_PDF_IMAGE_MIME_TYPE, LMSTUDIO_PDF_IMAGE_QUALITY);
+
+    try {
+      page.cleanup();
+    } catch (_error) {
+      // Best effort : le canvas est vidé juste après.
+    }
+
+    canvas.width = 1;
+    canvas.height = 1;
+
+    return {
+      pageNumber,
+      dataUrl,
+      mimeType: LMSTUDIO_PDF_IMAGE_MIME_TYPE,
+      width,
+      height,
+      dataUrlLength: dataUrl.length,
+    };
+  }
+
+  function getPdfImageFallbackScale(page) {
+    const baseScale = Number(LMSTUDIO_PDF_IMAGE_SCALE) || 1.5;
+    const maxSide = Number(LMSTUDIO_PDF_IMAGE_MAX_SIDE_PX) || 1800;
+    const baseViewport = page.getViewport({ scale: baseScale });
+    const largestSide = Math.max(baseViewport.width || 0, baseViewport.height || 0);
+
+    if (!largestSide || largestSide <= maxSide) {
+      return baseScale;
+    }
+
+    return Math.max(0.5, baseScale * (maxSide / largestSide));
+  }
+
+  function buildPdfImageFallbackDocumentText(displayed, rendered, lastError = null, options = {}) {
+    const renderedPages = rendered.images.map((image) => image.pageNumber).join(", ");
+    const omittedPages = rendered.totalPages > rendered.images.length
+      ? `Pages non jointes au modèle pour limiter la taille : ${rendered.totalPages - rendered.images.length}.`
+      : "";
+    const reason = options.reason || "empty-text";
+    const sparseInfo = options.sparseInfo || null;
+    const garbledInfo = options.garbledInfo || null;
+    const sparseLine = sparseInfo
+      ? `Texte extrait ignoré car probablement partiel : ${sparseInfo.textLength} caractères, ${sparseInfo.lineCount} lignes, ${sparseInfo.wordCount} mots.`
+      : "";
+    const garbledLine = garbledInfo
+      ? `Texte extrait ignoré car probablement encodé/illisible : ${garbledInfo.textLength} caractères, ${garbledInfo.privateUseCount} caractères privés, ratio symboles ${Math.round(garbledInfo.symbolRatio * 1000) / 10} %.`
+      : "";
+
+    return normalizePdfText([
+      reason === "sparse-text"
+        ? "PDF avec texte extractible trop court ou partiel : le courrier est transmis à LM Studio sous forme d'images de pages."
+        : reason === "garbled-text"
+          ? "PDF avec texte extractible encodé ou illisible : le courrier est transmis à LM Studio sous forme d'images de pages."
+          : "PDF sans texte extractible par PDF.js : le courrier est transmis à LM Studio sous forme d'images de pages.",
+      "Le modèle doit analyser visuellement ces images comme un OCR médical, sans inventer ce qui n'est pas lisible.",
+      `Identifiant PDF local : ${displayed.urlKey || "pdfurl-" + hashString(displayed.pdfUrl || "")}.`,
+      `Pages jointes en images : ${renderedPages || "aucune"}/${rendered.totalPages || "?"}.`,
+      sparseLine,
+      garbledLine,
+      omittedPages,
+      lastError && lastError.message ? `Cause du fallback texte : ${lastError.message}.` : "",
+    ].filter(Boolean).join("\n"));
+  }
+
+  function buildPdfTextExtractionInfo(text, pdfInfo = {}) {
+    const normalized = normalizePdfText(text);
+    return {
+      textLength: normalized.length,
+      lineCount: normalized ? normalized.split(/\n+/).filter(Boolean).length : 0,
+      wordCount: countWordsForPdfSparseCheck(normalized),
+      pageCount: Number(pdfInfo && pdfInfo.pageCount) || 0,
+      byteLength: Number(pdfInfo && pdfInfo.byteLength) || 0,
+    };
+  }
+
+  function getGarbledExtractedPdfTextInfo(text, pdfInfo = {}) {
+    const info = buildPdfTextExtractionInfo(text, pdfInfo);
+    const source = String(text || "");
+    const enabled = Boolean(LMSTUDIO_PDF_TEXT_GARBLED_FALLBACK_ENABLED);
+    const privateUseCount = countPdfPrivateUseCharacters(source);
+    const privateUseRatio = info.textLength ? privateUseCount / info.textLength : 0;
+    const replacementCharCount = countRegexMatches(source, /\uFFFD/g);
+    const symbolCount = countPdfGarbledSymbolCharacters(source);
+    const symbolRatio = info.textLength ? symbolCount / info.textLength : 0;
+    const commonWordHits = countPdfCommonFrenchWordHits(source);
+    const commonWordOccurrences = countPdfCommonFrenchWordOccurrences(source);
+    const commonWordOccurrenceRatio = info.wordCount ? commonWordOccurrences / info.wordCount : 0;
+    const wordDensityRatio = info.textLength ? info.wordCount / info.textLength : 0;
+    let reason = "";
+
+    if (enabled && info.pageCount > 0 && info.textLength >= PDF_MIN_TEXT_LENGTH) {
+      if (
+        privateUseCount >= LMSTUDIO_PDF_TEXT_GARBLED_PRIVATE_USE_MIN_CHARS ||
+        privateUseRatio >= LMSTUDIO_PDF_TEXT_GARBLED_PRIVATE_USE_MIN_RATIO
+      ) {
+        reason = "private-use-glyphs";
+      } else if (replacementCharCount >= 3) {
+        reason = "replacement-characters";
+      } else if (
+        info.textLength >= LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MIN_CHARS &&
+        wordDensityRatio <= LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MAX_RATIO &&
+        symbolRatio >= LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MIN_SYMBOL_RATIO &&
+        commonWordOccurrences <= LMSTUDIO_PDF_TEXT_GARBLED_LOW_WORD_DENSITY_MAX_COMMON_WORD_OCCURRENCES
+      ) {
+        reason = "low-word-density-symbol-text";
+      } else if (
+        info.wordCount >= LMSTUDIO_PDF_TEXT_GARBLED_MIN_WORDS_FOR_LANGUAGE_CHECK &&
+        symbolRatio >= LMSTUDIO_PDF_TEXT_GARBLED_SYMBOL_MIN_RATIO &&
+        commonWordHits < LMSTUDIO_PDF_TEXT_GARBLED_MIN_COMMON_WORD_HITS
+      ) {
+        reason = "high-symbol-low-language-text";
+      } else if (
+        info.textLength >= LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_CHARS &&
+        info.wordCount >= LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_WORDS &&
+        commonWordOccurrences < LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MIN_COMMON_WORD_OCCURRENCES &&
+        commonWordOccurrenceRatio < LMSTUDIO_PDF_TEXT_GARBLED_LONG_TEXT_MAX_COMMON_WORD_RATIO
+      ) {
+        reason = "long-low-language-text";
+      }
+    }
+
+    return {
+      ...info,
+      privateUseCount,
+      privateUseRatio,
+      replacementCharCount,
+      symbolCount,
+      symbolRatio,
+      commonWordHits,
+      commonWordOccurrences,
+      commonWordOccurrenceRatio,
+      wordDensityRatio,
+      reason,
+      shouldFallback: Boolean(reason),
+    };
+  }
+
+  function countPdfPrivateUseCharacters(text = "") {
+    return countRegexMatches(String(text || ""), /[\uE000-\uF8FF\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]/gu);
+  }
+
+  function countPdfGarbledSymbolCharacters(text = "") {
+    return countRegexMatches(String(text || ""), /[^\p{L}\p{N}\s.,;:!?%/()+\-'"’°²³µ=<>]/gu);
+  }
+
+  function countPdfCommonFrenchWordHits(text = "") {
+    const words = new Set(normalizeForCompare(text)
+      .split(/[^a-z0-9]+/)
+      .filter((word) => word.length >= 2));
+    return getPdfCommonFrenchWords().filter((word) => words.has(word)).length;
+  }
+
+  function countPdfCommonFrenchWordOccurrences(text = "") {
+    const words = normalizeForCompare(text)
+      .split(/[^a-z0-9]+/)
+      .filter((word) => word.length >= 2);
+    const commonWords = new Set(getPdfCommonFrenchWords());
+    return words.filter((word) => commonWords.has(word)).length;
+  }
+
+  function getPdfCommonFrenchWords() {
+    return [
+      "de", "du", "des", "le", "la", "les", "un", "une", "et", "est", "avec", "pour",
+      "dans", "sur", "par", "pas", "sans", "patient", "patiente", "monsieur", "madame",
+      "docteur", "medecin", "medical", "compte", "rendu", "consultation", "examen",
+      "traitement", "douleur", "diagnostic", "conclusion", "arthrose", "radiographie",
+      "scanner", "irm", "genou", "hanche", "rachis", "lombaire", "cervical", "thoracique",
+      "pulmonaire", "prostate", "suspicion",
+    ];
+  }
+
+  function countRegexMatches(text = "", pattern) {
+    const matches = String(text || "").match(pattern);
+    return matches ? matches.length : 0;
+  }
+
+  function getSparseExtractedPdfTextInfo(text, pdfInfo = {}) {
+    const info = buildPdfTextExtractionInfo(text, pdfInfo);
+    const enabled = Boolean(LMSTUDIO_PDF_TEXT_SPARSE_FALLBACK_ENABLED);
+    let reason = "";
+
+    if (enabled && info.pageCount > 0) {
+      if (info.textLength < PDF_MIN_TEXT_LENGTH) {
+        reason = "below-min-text-length";
+      } else if (info.textLength < 260) {
+        reason = "very-short-text";
+      } else if (
+        info.textLength <= LMSTUDIO_PDF_TEXT_SPARSE_MAX_CHARS &&
+        info.lineCount <= LMSTUDIO_PDF_TEXT_SPARSE_MAX_LINES &&
+        info.wordCount <= LMSTUDIO_PDF_TEXT_SPARSE_MAX_WORDS
+      ) {
+        reason = "short-low-density-text";
+      }
+    }
+
+    return {
+      ...info,
+      reason,
+      shouldFallback: Boolean(reason),
+    };
+  }
+
+  function countWordsForPdfSparseCheck(text) {
+    const matches = normalizePdfText(text).match(/[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}/g);
+    return matches ? matches.length : 0;
   }
 
   function buildMessageBodyFallbackFromPdfError(error, displayed) {
@@ -4201,7 +4760,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       throw error;
     }
 
-    return text;
+    return {
+      text,
+      pageCount: pdf.numPages || 0,
+      byteLength: originalBytes.length,
+      fetchInfo: pdfFetchInfo,
+      urlKey: "pdfurl-" + hashString(pdfUrl),
+    };
   }
 
   async function ensurePdfJsReady() {
@@ -4819,14 +5384,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const item = rowOverride || getSelectedBiologyItem();
     const urlKey = getDisplayedPdfUrlKey();
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
-    const keys = [
-      urlKey,
-      item && item.key,
-      item && item.stableKey,
+    const keys = buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
       stateMatchesItem && state.currentUrlKey,
       stateMatchesItem && state.lastTitleKey,
-    ].filter(Boolean);
+      urlKey,
+    ]);
 
     return {
       keys: Array.from(new Set(keys)),
@@ -4938,10 +5501,18 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return Array.from(new Set([
       ...(Array.isArray(rememberedKeys) ? rememberedKeys : [rememberedKeys]),
       rememberedEntry && rememberedEntry.key,
-      item && item.key,
-      item && item.stableKey,
       ...context.keys,
     ].filter(Boolean)));
+  }
+
+  function buildWedaDocumentMemoryKeys(values = []) {
+    return Array.from(new Set((Array.isArray(values) ? values : [values])
+      .map((value) => String(value || "").trim())
+      .filter(isStrongWedaDocumentMemoryKey)));
+  }
+
+  function isStrongWedaDocumentMemoryKey(value = "") {
+    return /^(?:pdftext|pdfurl|messagebody)-[a-z0-9]+$/i.test(String(value || "").trim());
   }
 
   function haveSharedTitleKeys(left, right) {
@@ -4969,11 +5540,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const urlKey = getDisplayedPdfUrlKey();
-    const rememberedEntry = getRememberedTitleForKeys([
+    const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
+    const rememberedEntry = getRememberedTitleForKeys(buildWedaDocumentMemoryKeys([
+      stateMatchesItem && state.currentContentKey,
+      stateMatchesItem && state.currentUrlKey,
+      stateMatchesItem && state.lastTitleKey,
       urlKey,
-      item && item.key,
-      item && item.stableKey,
-    ]);
+    ]));
     const remembered = rememberedEntry.title;
 
     if (!remembered) {
@@ -5283,11 +5856,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const urlKey = getDisplayedPdfUrlKey();
-    const rememberedEntry = getRememberedSpecialtyForKeys([
+    const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
+    const rememberedEntry = getRememberedSpecialtyForKeys(buildWedaDocumentMemoryKeys([
+      stateMatchesItem && state.currentContentKey,
+      stateMatchesItem && state.currentUrlKey,
+      stateMatchesItem && state.lastTitleKey,
       urlKey,
-      item && item.key,
-      item && item.stableKey,
-    ]);
+    ]));
     const remembered = rememberedEntry.selection;
 
     if (!remembered) {
@@ -5387,14 +5962,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const item = rowOverride || getSelectedBiologyItem();
     const urlKey = getDisplayedPdfUrlKey();
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
-    const keys = [
-      urlKey,
-      item && item.key,
-      item && item.stableKey,
+    const keys = buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
       stateMatchesItem && state.currentUrlKey,
       stateMatchesItem && state.lastTitleKey,
-    ].filter(Boolean);
+      urlKey,
+    ]);
 
     return {
       keys: Array.from(new Set(keys)),
@@ -5804,6 +6377,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
       const documentText = displayedDocument.tableText;
       const contentKey = displayedDocument.contentKey;
+      const hasPdfImageFallback = Array.isArray(displayedDocument.pdfPageImages) && displayedDocument.pdfPageImages.length > 0;
 
       if (importPreparation.titleInputRequired && !findWedaTitleInput()) {
         throw new Error("champ titre indisponible après ouverture Un patient");
@@ -5818,11 +6392,25 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         pdfAttachment: Boolean(displayedDocument.pdfAttachmentBase64),
         pdfAttachmentByteLength: displayedDocument.pdfAttachmentByteLength || 0,
         pdfTextExtractionEmpty: Boolean(displayedDocument.pdfTextExtractionEmpty),
+        pdfImageFallback: hasPdfImageFallback,
+        pdfImagePageCount: displayedDocument.pdfImagePageCount || 0,
+        pdfImageTotalPages: displayedDocument.pdfImageTotalPages || 0,
+        pdfImageFallbackReason: displayedDocument.pdfImageFallbackReason || "",
+        pdfTextExtractionSparse: Boolean(displayedDocument.pdfTextExtractionSparse),
+        pdfTextExtractionGarbled: Boolean(displayedDocument.pdfTextExtractionGarbled),
+        pdfTextUnusable: Boolean(displayedDocument.pdfTextUnusable),
+        pdfUnusableReason: displayedDocument.pdfUnusableReason || "",
+        pdfTextPageCount: displayedDocument.pdfTextPageCount || 0,
         documentLines: countBiologyLinesForLog(documentText, "pdf"),
         documentLength: documentText.length,
       });
 
-      if (!documentText || documentText.length < 20) {
+      if (shouldFailClosedForDisplayedDocument(displayedDocument, documentText)) {
+        await handleUnusableDisplayedDocument(row, rows, displayedDocument, contentKey);
+        return;
+      }
+
+      if ((!documentText || documentText.length < 20) && !hasPdfImageFallback) {
         throw new Error("Le texte du PDF est vide ou illisible ; LM Studio local ne peut pas analyser le PDF joint sans texte extrait.");
       }
 
@@ -5852,12 +6440,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         pdfAttachmentMimeType: displayedDocument.pdfAttachmentMimeType || "",
         pdfAttachmentByteLength: displayedDocument.pdfAttachmentByteLength || 0,
         pdfTextExtractionEmpty: Boolean(displayedDocument.pdfTextExtractionEmpty),
+        pdfTextExtractionSparse: Boolean(displayedDocument.pdfTextExtractionSparse),
+        pdfTextExtractionGarbled: Boolean(displayedDocument.pdfTextExtractionGarbled),
+        pdfTextPageCount: displayedDocument.pdfTextPageCount || 0,
+        pdfPageImages: Array.isArray(displayedDocument.pdfPageImages) ? displayedDocument.pdfPageImages : [],
+        pdfImagePageCount: displayedDocument.pdfImagePageCount || 0,
+        pdfImageTotalPages: displayedDocument.pdfImageTotalPages || 0,
+        pdfImageFallbackReason: displayedDocument.pdfImageFallbackReason || "",
         prompt: LMSTUDIO_PROMPT_ACTIVE,
         createdAt: Date.now(),
       };
 
       GM_deleteValue(RESULT_KEY);
-      GM_setValue(JOB_KEY, job);
+      GM_setValue(JOB_KEY, buildStoredLmStudioJob(job));
       appendDebugLog("weda:job-created", {
         jobId,
         rowIndex: row.index,
@@ -5867,6 +6462,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         pdfAttachment: Boolean(displayedDocument.pdfAttachmentBase64),
         pdfAttachmentByteLength: displayedDocument.pdfAttachmentByteLength || 0,
         pdfTextExtractionEmpty: Boolean(displayedDocument.pdfTextExtractionEmpty),
+        pdfImageFallback: hasPdfImageFallback,
+        pdfImagePageCount: displayedDocument.pdfImagePageCount || 0,
+        pdfImageTotalPages: displayedDocument.pdfImageTotalPages || 0,
+        pdfImageFallbackReason: displayedDocument.pdfImageFallbackReason || "",
+        pdfTextExtractionSparse: Boolean(displayedDocument.pdfTextExtractionSparse),
+        pdfTextExtractionGarbled: Boolean(displayedDocument.pdfTextExtractionGarbled),
+        pdfTextUnusable: Boolean(displayedDocument.pdfTextUnusable),
+        pdfUnusableReason: displayedDocument.pdfUnusableReason || "",
+        pdfTextPageCount: displayedDocument.pdfTextPageCount || 0,
         documentLines: countBiologyLinesForLog(documentText, "pdf"),
         documentLength: documentText.length,
       });
@@ -5907,6 +6511,113 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
       skipOrFailCurrentDocument("Impossible de lire le courrier : " + error.message);
     }
+  }
+
+  function shouldFailClosedForDisplayedDocument(displayedDocument, documentText = "") {
+    if (!LMSTUDIO_UNUSABLE_PDF_FAIL_CLOSED || !displayedDocument) {
+      return false;
+    }
+
+    const hasPdfImageFallback = Array.isArray(displayedDocument.pdfPageImages) && displayedDocument.pdfPageImages.length > 0;
+    if (hasPdfImageFallback) {
+      return false;
+    }
+
+    return Boolean(
+      displayedDocument.pdfTextUnusable ||
+      displayedDocument.pdfTextExtractionGarbled ||
+      displayedDocument.pdfTextExtractionEmpty ||
+      displayedDocument.sourceType === "pdf-unusable-text" ||
+      (displayedDocument.pdfTextExtractionSparse && displayedDocument.sourceType === "pdf-text-sparse") ||
+      normalizePdfText(documentText).length < PDF_MIN_TEXT_LENGTH
+    );
+  }
+
+  async function handleUnusableDisplayedDocument(row, rows, displayedDocument, contentKey) {
+    const jobId = createId("courrier-local");
+    const result = buildUnusablePdfLocalResult(jobId, row, displayedDocument, contentKey);
+
+    GM_deleteValue(JOB_KEY);
+    GM_deleteValue(RESULT_KEY);
+    appendDebugLog("weda:pdf-unusable-local-result", {
+      jobId,
+      rowIndex: row ? row.index : null,
+      contentKey,
+      urlKey: displayedDocument && displayedDocument.urlKey || "",
+      sourceType: displayedDocument && displayedDocument.sourceType || "",
+      reason: displayedDocument && displayedDocument.pdfUnusableReason || "",
+      pdfTextExtractionEmpty: Boolean(displayedDocument && displayedDocument.pdfTextExtractionEmpty),
+      pdfTextExtractionSparse: Boolean(displayedDocument && displayedDocument.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(displayedDocument && displayedDocument.pdfTextExtractionGarbled),
+    });
+
+    setState({
+      running: true,
+      phase: "waitingLmStudio",
+      currentJobId: jobId,
+      currentContentKey: contentKey,
+      currentPdfUrl: displayedDocument && displayedDocument.pdfUrl || "",
+      currentUrlKey: displayedDocument && displayedDocument.urlKey || "",
+      allowUnchangedContentKey: "",
+      message: "PDF sans texte exploitable : insertion d'un titre de sécurité, sans appel LM Studio.",
+    });
+
+    setPanelStatus("PDF sans texte exploitable : aucun appel LM Studio.");
+    await handleLmStudioResult(result);
+  }
+
+  function buildUnusablePdfLocalResult(jobId, row, displayedDocument, contentKey) {
+    const raw = [
+      "<TITRE_COURRIER>",
+      UNUSABLE_PDF_TITLE,
+      "</TITRE_COURRIER>",
+      "<SPECIALITE_COURRIER>",
+      "</SPECIALITE_COURRIER>",
+      "<ANTECEDENT_CIM10>",
+      "STATUT: NON",
+      "SECTION: medical",
+      "LIBELLE:",
+      "CODE:",
+      "DATE:",
+      "CERTITUDE: PDF sans texte exploitable",
+      "SOURCE:",
+      "</ANTECEDENT_CIM10>",
+    ].join("\n");
+
+    return {
+      jobId,
+      ok: true,
+      raw,
+      title: UNUSABLE_PDF_TITLE,
+      specialtyCode: "",
+      skipSpecialty: true,
+      antecedent: {
+        status: "NON",
+        section: "medical",
+        label: "",
+        code: "",
+        date: "",
+        certainty: "PDF sans texte exploitable",
+        source: "",
+      },
+      sourceText: "",
+      rowIndex: row ? row.index : null,
+      rowStableKey: row ? row.stableKey || "" : "",
+      rowIdentity: row ? row.identityLabel || "" : "",
+      contentKey: contentKey || "",
+      urlKey: displayedDocument && displayedDocument.urlKey || "",
+      pdfUrl: displayedDocument && displayedDocument.pdfUrl || "",
+      model: "local-fail-closed",
+      sourceType: displayedDocument && displayedDocument.sourceType || "pdf-unusable-text",
+      pdfTextUnusable: true,
+      pdfUnusableReason: displayedDocument && displayedDocument.pdfUnusableReason || "unusable-text",
+      pdfTextExtractionEmpty: Boolean(displayedDocument && displayedDocument.pdfTextExtractionEmpty),
+      pdfTextExtractionSparse: Boolean(displayedDocument && displayedDocument.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(displayedDocument && displayedDocument.pdfTextExtractionGarbled),
+      pdfImageFallback: false,
+      pdfImageFallbackReason: "",
+      createdAt: Date.now(),
+    };
   }
 
   function skipOrFailCurrentDocument(message) {
@@ -6292,13 +7003,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       contentKey: target.contentKey,
       urlKey: target.urlKey || displayedUrlKey,
     };
-
-    [
+    const titleMemoryKeys = buildWedaDocumentMemoryKeys([
       target.contentKey,
       target.urlKey || displayedUrlKey,
-      targetRow.key,
-      targetRow.stableKey,
-    ].forEach((key) => rememberTitle(key, title, titleMetadata));
+    ]);
+
+    titleMemoryKeys.forEach((key) => rememberTitle(key, title, titleMetadata));
+
+    if (!titleMemoryKeys.length) {
+      appendDebugLog("weda:title-memory-skip-weak-keys", {
+        jobId: result.jobId,
+        targetRowIndex: targetRow.index,
+        rowStableKey: targetRow.stableKey,
+        hasContentKey: Boolean(target.contentKey),
+        hasUrlKey: Boolean(target.urlKey || displayedUrlKey),
+      });
+    }
 
     const titleInputTarget = {
       pdfUrl: target.pdfUrl || displayedPdfUrl,
@@ -6364,6 +7084,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     const patientContext = resolveWedaPatientContextForAntecedent(input, result, titleInputTarget);
 
+    const inputCurrentTitle = sanitizeTitle(input.value);
+
     appendDebugLog("weda:title-fill", {
       jobId: result.jobId,
       contentKey: target.contentKey,
@@ -6373,7 +7095,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       inputIndex: getWedaTitleInputIndex(input),
       titleInputs: (document.querySelector("#messageContainer") || document).querySelectorAll("input.docTitle, input[placeholder='Titre du document'], input[title*='titre']").length,
       associatedWithPdf: isWedaTitleInputAssociatedWithPdf(input, titleInputTarget.pdfUrl),
-      inputCurrentLength: sanitizeTitle(input.value).length,
+      inputCurrentLength: inputCurrentTitle.length,
+      inputCurrentHash: inputCurrentTitle ? hashString(inputCurrentTitle) : "",
     });
 
     setState({
@@ -6396,13 +7119,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     setNativeInputValue(input, title);
     triggerWedaTitleSave(input);
 
-    const specialtySelection = await fillWedaSpecialtyFromHeidi(title, result.jobId, targetRow, {
-      titleInput: input,
-      pdfUrl: titleInputTarget.pdfUrl,
-      urlKey: target.urlKey || displayedUrlKey,
-      raw: result.raw || "",
-      sourceText: result.sourceText || "",
-    }, result.specialtyCode || "");
+    let specialtySelection = null;
+    if (result.skipSpecialty) {
+      appendDebugLog("weda:specialty-skip-unusable-pdf", {
+        jobId: result.jobId,
+        targetRowIndex: targetRow.index,
+        reason: result.pdfUnusableReason || "",
+      });
+    } else {
+      specialtySelection = await fillWedaSpecialtyFromHeidi(title, result.jobId, targetRow, {
+        titleInput: input,
+        pdfUrl: titleInputTarget.pdfUrl,
+        urlKey: target.urlKey || displayedUrlKey,
+        raw: result.raw || "",
+        sourceText: result.sourceText || "",
+      }, result.specialtyCode || "");
+    }
 
     if (specialtySelection) {
       const specialtyMetadata = {
@@ -6413,12 +7145,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         urlKey: target.urlKey || displayedUrlKey,
         title,
       };
-      [
+      const specialtyMemoryKeys = buildWedaDocumentMemoryKeys([
         target.contentKey,
         target.urlKey || displayedUrlKey,
-        targetRow.key,
-        targetRow.stableKey,
-      ].forEach((key) => rememberSpecialty(key, specialtySelection, specialtyMetadata));
+      ]);
+
+      specialtyMemoryKeys.forEach((key) => rememberSpecialty(key, specialtySelection, specialtyMetadata));
+
+      if (!specialtyMemoryKeys.length) {
+        appendDebugLog("weda:specialty-memory-skip-weak-keys", {
+          jobId: result.jobId,
+          targetRowIndex: targetRow.index,
+          rowStableKey: targetRow.stableKey,
+          hasContentKey: Boolean(target.contentKey),
+          hasUrlKey: Boolean(target.urlKey || displayedUrlKey),
+        });
+      }
+
       appendDebugLog("weda:specialty-remembered", {
         jobId: result.jobId,
         targetRowIndex: targetRow.index,
@@ -6753,11 +7496,20 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function runLmStudioJob(job) {
+    const pdfImageCount = getLmStudioPdfPageImages(job).length;
+    let activeJobForError = job;
     appendDebugLog("lmstudio:run-start", {
       jobId: job.id,
       contentKey: job.contentKey,
       urlKey: job.urlKey || "",
       sourceType: job.sourceType || "pdf",
+      pdfImageFallback: pdfImageCount > 0,
+      pdfImagePageCount: pdfImageCount,
+      pdfImageTotalPages: job.pdfImageTotalPages || 0,
+      pdfImageFallbackReason: job.pdfImageFallbackReason || "",
+      pdfTextExtractionSparse: Boolean(job.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(job.pdfTextExtractionGarbled),
+      pdfTextPageCount: job.pdfTextPageCount || 0,
       documentLines: countBiologyLinesForLog(job.tableText, "pdf"),
       documentLength: String(job.tableText || "").length,
       apiUrl: LMSTUDIO_CHAT_COMPLETIONS_URL,
@@ -6768,16 +7520,54 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       const model = await getLmStudioModelId();
 
       updateLmStudioStatus(job.id, "Analyse LM Studio en cours...");
-      const response = await requestLmStudioChatCompletion(job, model);
-      const answer = extractLmStudioAnswer(response);
-      const parsedResult = parseHeidiCourrierAtcdOutput(answer);
-      const title = sanitizeHeidiCourrierTitle(parsedResult.title || "", parsedResult.specialtyCode || "");
+      let activeJob = job;
+      activeJobForError = activeJob;
+      let response = await requestLmStudioChatCompletion(activeJob, model);
+      let answer = extractLmStudioAnswer(response);
+      let parsedResult = parseHeidiCourrierAtcdOutput(answer);
+      let title = sanitizeHeidiCourrierTitle(parsedResult.title || "", parsedResult.specialtyCode || "");
+      let imageRetryReason = "";
+
+      if (shouldRetryLmStudioResultWithPdfImages(job, {
+        answer,
+        title,
+        parsedResult,
+      })) {
+        const retryJob = await buildLmStudioPdfImageRetryJob(job, "administrative-no-useful-info", {
+          title,
+          answer,
+        });
+
+        if (retryJob) {
+          imageRetryReason = retryJob.pdfImageFallbackReason || "administrative-no-useful-info";
+          activeJob = retryJob;
+          updateLmStudioStatus(job.id, "Réponse texte peu fiable : nouvelle analyse LM Studio en mode image...");
+          appendDebugLog("lmstudio:image-retry-start", {
+            jobId: job.id,
+            reason: imageRetryReason,
+            previousTitleLength: title.length,
+            previousAnswerLength: answer.length,
+            imageCount: getLmStudioPdfPageImages(retryJob).length,
+            imagePages: getLmStudioPdfPageImages(retryJob).map((image) => image.pageNumber),
+          });
+          activeJobForError = activeJob;
+          response = await requestLmStudioChatCompletion(activeJob, model);
+          answer = extractLmStudioAnswer(response);
+          parsedResult = parseHeidiCourrierAtcdOutput(answer);
+          title = sanitizeHeidiCourrierTitle(parsedResult.title || "", parsedResult.specialtyCode || "");
+        }
+      }
 
       appendDebugLog("lmstudio:answer-received", {
         jobId: job.id,
         model,
         answerLength: answer.length,
         titleLength: title.length,
+        sourceType: activeJob.sourceType || "pdf",
+        imageRetryReason,
+        pdfImageFallback: getLmStudioPdfPageImages(activeJob).length > 0,
+        pdfImageFallbackReason: activeJob.pdfImageFallbackReason || "",
+        pdfTextExtractionGarbled: Boolean(activeJob.pdfTextExtractionGarbled),
         hasTaggedTitle: Boolean(extractTaggedBlock(answer, "TITRE_COURRIER")),
         hasTaggedSpecialty: Boolean(extractTaggedBlock(answer, "SPECIALITE_COURRIER")),
         hasTaggedAtcd: Boolean(extractTaggedBlock(answer, "ANTECEDENT_CIM10")),
@@ -6802,7 +7592,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         title,
         specialtyCode: parsedResult.specialtyCode || "",
         antecedent: parsedResult.antecedent || null,
-        sourceText: truncateResultSourceText(job.tableText || ""),
+        sourceText: truncateResultSourceText(activeJob.tableText || ""),
         rowIndex: job.rowIndex,
         rowStableKey: job.rowStableKey || "",
         rowIdentity: job.rowIdentity || "",
@@ -6810,20 +7600,39 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         urlKey: job.urlKey || "",
         pdfUrl: job.pdfUrl || "",
         model,
+        sourceType: activeJob.sourceType || job.sourceType || "pdf",
+        pdfImageFallback: getLmStudioPdfPageImages(activeJob).length > 0,
+        pdfImageFallbackReason: activeJob.pdfImageFallbackReason || "",
+        pdfTextExtractionGarbled: Boolean(activeJob.pdfTextExtractionGarbled),
+        imageRetryReason,
         createdAt: Date.now(),
       };
     } catch (error) {
+      const errorMessage = buildLmStudioErrorMessage(error, activeJobForError);
       appendDebugLog("lmstudio:run-error", {
         jobId: job.id,
-        error: error.message,
+        error: errorMessage,
+        pdfImageFallback: getLmStudioPdfPageImages(activeJobForError).length > 0,
       });
 
       GM_deleteValue(JOB_KEY);
 
+      if (getLmStudioPdfPageImages(activeJobForError).length) {
+        appendDebugLog("lmstudio:image-fail-closed-local-result", {
+          jobId: job.id,
+          sourceType: activeJobForError.sourceType || "",
+          imageFallbackReason: activeJobForError.pdfImageFallbackReason || "",
+          imageCount: getLmStudioPdfPageImages(activeJobForError).length,
+          error: errorMessage,
+        });
+
+        return buildUnusablePdfLocalResultFromLmStudioImageJob(job.id, activeJobForError, errorMessage);
+      }
+
       return {
         jobId: job.id,
         ok: false,
-        error: error.message || "erreur LM Studio inconnue",
+        error: errorMessage,
         rowIndex: job.rowIndex,
         rowStableKey: job.rowStableKey || "",
         rowIdentity: job.rowIdentity || "",
@@ -6833,6 +7642,144 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         createdAt: Date.now(),
       };
     }
+  }
+
+  function buildUnusablePdfLocalResultFromLmStudioImageJob(jobId, job = {}, errorMessage = "") {
+    const row = {
+      index: job.rowIndex,
+      stableKey: job.rowStableKey || "",
+      identityLabel: job.rowIdentity || "",
+    };
+    const displayedDocument = {
+      sourceType: "pdf-image-fail-closed",
+      urlKey: job.urlKey || "",
+      pdfUrl: job.pdfUrl || "",
+      pdfUnusableReason: job.pdfImageFallbackReason || "image-analysis-failed",
+      pdfTextExtractionEmpty: Boolean(job.pdfTextExtractionEmpty),
+      pdfTextExtractionSparse: Boolean(job.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(job.pdfTextExtractionGarbled),
+    };
+    const result = buildUnusablePdfLocalResult(jobId, row, displayedDocument, job.contentKey || "");
+
+    return {
+      ...result,
+      sourceType: displayedDocument.sourceType,
+      pdfImageFallback: true,
+      pdfImageFallbackReason: job.pdfImageFallbackReason || "image-analysis-failed",
+      pdfImageAnalysisError: errorMessage,
+    };
+  }
+
+  function shouldRetryLmStudioResultWithPdfImages(job = {}, result = {}) {
+    if (!LMSTUDIO_ADMINISTRATIVE_TITLE_IMAGE_RETRY_ENABLED || !job || !job.pdfUrl) {
+      return false;
+    }
+
+    if (getLmStudioPdfPageImages(job).length) {
+      return false;
+    }
+
+    const title = result.title || "";
+    const answer = result.answer || "";
+    const parsedResult = result.parsedResult || {};
+    const specialtyCode = parseHeidiSpecialtyCode(parsedResult.specialtyCode || "");
+
+    if (!looksLikeAdministrativeNoUsefulInfoAnswer(title, answer, specialtyCode)) {
+      return false;
+    }
+
+    return isLmStudioJobTextProbablyPartial(job);
+  }
+
+  function looksLikeAdministrativeNoUsefulInfoAnswer(title = "", answer = "", specialtyCode = "") {
+    const source = normalizeForCompare([title, answer].filter(Boolean).join("\n")).replace(/['’]/g, " ");
+
+    return (
+      /document administratif sans information medicale utile/.test(source) ||
+      /\bsans information medicale utile\b/.test(source) ||
+      (
+        parseHeidiSpecialtyCode(specialtyCode) === "Papier Administratif" &&
+        /\b(?:administratif|papier administratif)\b/.test(source) &&
+        /\b(?:aucune|sans|pas d)\b.{0,50}\binformation medicale utile\b/.test(source)
+      )
+    );
+  }
+
+  function isLmStudioJobTextProbablyPartial(job = {}) {
+    if (
+      job.pdfTextExtractionSparse ||
+      job.pdfTextExtractionGarbled ||
+      job.pdfImageFallbackReason === "sparse-text" ||
+      job.pdfImageFallbackReason === "garbled-text"
+    ) {
+      return true;
+    }
+
+    const sparseInfo = getSparseExtractedPdfTextInfo(job.tableText || "", {
+      pageCount: job.pdfTextPageCount || job.pdfImageTotalPages || 1,
+      byteLength: job.pdfAttachmentByteLength || 0,
+    });
+    const garbledInfo = getGarbledExtractedPdfTextInfo(job.tableText || "", {
+      pageCount: job.pdfTextPageCount || job.pdfImageTotalPages || 1,
+      byteLength: job.pdfAttachmentByteLength || 0,
+    });
+
+    return Boolean(sparseInfo.shouldFallback || garbledInfo.shouldFallback);
+  }
+
+  async function buildLmStudioPdfImageRetryJob(job = {}, reason = "retry-image", context = {}) {
+    if (!job.pdfUrl || getLmStudioPdfPageImages(job).length) {
+      return null;
+    }
+
+    const displayed = {
+      pdfUrl: job.pdfUrl,
+      urlKey: job.urlKey || (job.pdfUrl ? "pdfurl-" + hashString(job.pdfUrl) : ""),
+      selectedOk: true,
+    };
+    const sparseInfo = getSparseExtractedPdfTextInfo(job.tableText || "", {
+      pageCount: job.pdfTextPageCount || job.pdfImageTotalPages || 1,
+      byteLength: job.pdfAttachmentByteLength || 0,
+    });
+    const garbledInfo = getGarbledExtractedPdfTextInfo(job.tableText || "", {
+      pageCount: job.pdfTextPageCount || job.pdfImageTotalPages || 1,
+      byteLength: job.pdfAttachmentByteLength || 0,
+    });
+    const fallback = await buildPdfImageFallbackFromDisplayedPdf(displayed, new Error("réponse LM Studio administrative après texte PDF pauvre"), {
+      reason,
+      sparseInfo: sparseInfo.shouldFallback ? sparseInfo : null,
+      garbledInfo: garbledInfo.shouldFallback ? garbledInfo : null,
+    });
+
+    if (!fallback || !fallback.pdfPageImages || !fallback.pdfPageImages.length) {
+      appendDebugLog("lmstudio:image-retry-unavailable", {
+        jobId: job.id,
+        reason,
+        titleLength: context.title ? String(context.title).length : 0,
+        sparseText: sparseInfo,
+        garbledText: garbledInfo,
+      });
+      return null;
+    }
+
+    return {
+      ...job,
+      tableText: fallback.documentText,
+      tableHtml: "",
+      sourceType: fallback.sourceType || "pdf-image",
+      pdfAttachmentBase64: "",
+      pdfAttachmentName: fallback.pdfAttachmentName || job.pdfAttachmentName || "",
+      pdfAttachmentMimeType: fallback.pdfAttachmentMimeType || job.pdfAttachmentMimeType || "application/pdf",
+      pdfAttachmentByteLength: fallback.pdfAttachmentByteLength || job.pdfAttachmentByteLength || 0,
+      pdfTextExtractionEmpty: Boolean(fallback.pdfTextExtractionEmpty),
+      pdfTextExtractionSparse: Boolean(fallback.pdfTextExtractionSparse || sparseInfo.shouldFallback),
+      pdfTextExtractionGarbled: Boolean(fallback.pdfTextExtractionGarbled || garbledInfo.shouldFallback),
+      pdfTextPageCount: fallback.pdfTextPageCount || job.pdfTextPageCount || 0,
+      pdfPageImages: fallback.pdfPageImages || [],
+      pdfImagePageCount: fallback.pdfImagePageCount || 0,
+      pdfImageTotalPages: fallback.pdfImageTotalPages || 0,
+      pdfImageFallbackReason: reason,
+    };
   }
 
   async function getLmStudioModelId() {
@@ -6875,6 +7822,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function requestLmStudioChatCompletion(job, model) {
+    const userContent = buildLmStudioUserMessageContent(job);
     const payload = {
       model,
       temperature: LMSTUDIO_TEMPERATURE,
@@ -6887,7 +7835,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         },
         {
           role: "user",
-          content: buildLmStudioUserPrompt(job),
+          content: userContent,
         },
       ],
     };
@@ -6895,7 +7843,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     appendDebugLog("lmstudio:request", {
       jobId: job.id,
       model,
-      promptLength: payload.messages[1].content.length,
+      promptLength: getLmStudioUserContentTextLength(userContent),
+      pdfImageFallback: Array.isArray(userContent),
+      imageCount: countLmStudioUserContentImages(userContent),
+      imagePages: getLmStudioPdfPageImages(job).map((image) => image.pageNumber),
+      imageFallbackReason: job.pdfImageFallbackReason || "",
+      pdfTextExtractionGarbled: Boolean(job.pdfTextExtractionGarbled),
       maxTokens: LMSTUDIO_MAX_TOKENS,
       temperature: LMSTUDIO_TEMPERATURE,
     });
@@ -6914,6 +7867,105 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function buildLmStudioUserPrompt(job) {
     const prompt = stripTrailingBiologySignal(job.prompt || LMSTUDIO_PROMPT_ACTIVE);
     return `${prompt}\n\n${buildHeidiContextText(truncateLmStudioDocumentText(job.tableText || ""))}`;
+  }
+
+  function buildLmStudioUserMessageContent(job) {
+    const images = getLmStudioPdfPageImages(job);
+    if (!images.length) {
+      return buildLmStudioUserPrompt(job);
+    }
+
+    const text = [
+      buildLmStudioUserPrompt(job),
+      buildLmStudioPdfImageInstruction(job),
+    ].join("\n\n");
+
+    return [
+      {
+        type: "text",
+        text,
+      },
+      ...images.map((image) => ({
+        type: "image_url",
+        image_url: {
+          url: image.dataUrl,
+        },
+      })),
+    ];
+  }
+
+  function getLmStudioPdfPageImages(job = {}) {
+    return Array.isArray(job.pdfPageImages)
+      ? job.pdfPageImages.filter((image) => image && image.dataUrl)
+      : [];
+  }
+
+  function buildLmStudioPdfImageInstruction(job = {}) {
+    if (job.pdfImageFallbackReason === "sparse-text") {
+      return "IMPORTANT : le PDF n'a fourni qu'un texte partiel ou trop court. Les images jointes ci-dessous sont les pages du courrier. Ignore le texte partiel s'il contredit l'image, analyse visuellement ces images comme un OCR médical, puis réponds uniquement avec les trois blocs XML demandés.";
+    }
+
+    if (job.pdfImageFallbackReason === "garbled-text") {
+      return "IMPORTANT : le texte extrait du PDF est encodé ou illisible et ne doit pas être utilisé. Les images jointes ci-dessous sont les pages du courrier. Lis-les visuellement comme un OCR médical, puis réponds uniquement avec les trois blocs XML demandés.";
+    }
+
+    if (job.pdfImageFallbackReason === "administrative-no-useful-info") {
+      return "IMPORTANT : une première analyse du texte extrait a conclu à tort ou possiblement à tort à un document administratif sans information médicale utile. Les images jointes ci-dessous sont les pages du courrier. Repars des images, lis-les visuellement comme un OCR médical, puis réponds uniquement avec les trois blocs XML demandés.";
+    }
+
+    return "IMPORTANT : le PDF n'a pas fourni de texte extractible. Les images jointes ci-dessous sont les pages du courrier. Analyse-les visuellement comme un OCR médical, puis réponds uniquement avec les trois blocs XML demandés.";
+  }
+
+  function getLmStudioUserContentTextLength(content) {
+    if (typeof content === "string") {
+      return content.length;
+    }
+
+    if (!Array.isArray(content)) {
+      return 0;
+    }
+
+    return content.reduce((total, part) => total + String(part && part.text || "").length, 0);
+  }
+
+  function countLmStudioUserContentImages(content) {
+    if (!Array.isArray(content)) {
+      return 0;
+    }
+
+    return content.filter((part) => part && part.type === "image_url").length;
+  }
+
+  function buildStoredLmStudioJob(job = {}) {
+    const images = getLmStudioPdfPageImages(job);
+    if (!images.length) {
+      return job;
+    }
+
+    return {
+      ...job,
+      pdfPageImages: images.map((image) => ({
+        pageNumber: image.pageNumber,
+        mimeType: image.mimeType,
+        width: image.width,
+        height: image.height,
+        dataUrlLength: image.dataUrlLength || String(image.dataUrl || "").length,
+      })),
+    };
+  }
+
+  function buildLmStudioErrorMessage(error, job = {}) {
+    const message = error && error.message ? error.message : "erreur LM Studio inconnue";
+
+    if (!getLmStudioPdfPageImages(job).length) {
+      return message;
+    }
+
+    if (/vision|image|image_url|unsupported|schema|invalid|400|422|content/i.test(message)) {
+      return message + " | PDF envoyé en images : vérifiez qu'un modèle vision/VLM est chargé dans LM Studio et que l'API accepte les images.";
+    }
+
+    return message;
   }
 
   function truncateLmStudioDocumentText(value) {
@@ -12340,7 +13392,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function isSensitiveDebugKey(key) {
-    return /^(?:patient|nom|prenom|birth|naissance|identity|rowIdentity|title|titre|lastTitle|tableText|tableHtml|prompt|raw|answer|pdfAttachmentBase64)$/i.test(String(key || ""));
+    return /^(?:patient|nom|prenom|birth|naissance|identity|rowIdentity|title|titre|lastTitle|tableText|tableHtml|prompt|raw|answer|pdfAttachmentBase64|pdfPageImages|pdfPageImageDataUrls|dataUrl|data_url|imageUrl|image_url)$/i.test(String(key || ""));
   }
 
   function sanitizeDebugString(value, maxLength = 400) {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WEDA HPRIM -> SMS MadeforMed
 // @namespace    https://secure.weda.fr/
-// @version      1.2.2
+// @version      1.2.3
 // @description  PageDown sur WEDA HPRIM : affecte la biologie active, recherche le patient exact nom+prénom dans MadeforMed et envoie un SMS standardisé.
 // @author       Florian Ronez + ChatGPT
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -22,7 +22,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.2.2';
+    const VERSION = '1.2.3';
     const LOG_PREFIX = '[AUTO-HPRIM-SMS]';
 
     const MADEFORMED_URL = 'https://pro.madeformed.com/agenda';
@@ -241,7 +241,39 @@
             box.style.lineHeight = '1.35';
             box.style.whiteSpace = 'pre-wrap';
             box.style.boxShadow = '0 4px 18px rgba(122,16,32,0.25)';
-            box.textContent = message;
+
+            const text = document.createElement('div');
+            text.textContent = message;
+
+            const closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.setAttribute('aria-label', 'Fermer l’alerte');
+            closeBtn.textContent = 'x';
+            closeBtn.style.position = 'absolute';
+            closeBtn.style.top = '6px';
+            closeBtn.style.right = '8px';
+            closeBtn.style.width = '24px';
+            closeBtn.style.height = '24px';
+            closeBtn.style.border = '0';
+            closeBtn.style.borderRadius = '12px';
+            closeBtn.style.background = 'transparent';
+            closeBtn.style.color = '#7a1020';
+            closeBtn.style.fontSize = '18px';
+            closeBtn.style.fontWeight = '900';
+            closeBtn.style.lineHeight = '20px';
+            closeBtn.style.cursor = 'pointer';
+            closeBtn.style.padding = '0';
+            closeBtn.addEventListener('click', ev => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                box.remove();
+                GM_deleteValue(KEY_WEDA_WARNING);
+            });
+
+            box.style.position = 'sticky';
+            box.style.paddingRight = '44px';
+            box.appendChild(text);
+            box.appendChild(closeBtn);
 
             const form = document.querySelector('form') || document.body;
             if (form.firstChild) {
@@ -299,7 +331,7 @@
                 el.style.bottom = '14px';
                 el.style.zIndex = '2147483647';
                 el.style.maxWidth = '520px';
-                el.style.padding = '12px 16px';
+                el.style.padding = '12px 44px 12px 16px';
                 el.style.borderRadius = '12px';
                 el.style.background = '#06345f';
                 el.style.color = '#fff';
@@ -309,6 +341,38 @@
                 el.style.boxShadow = '0 6px 22px rgba(0,0,0,0.35)';
                 el.style.lineHeight = '1.35';
                 el.style.whiteSpace = 'pre-wrap';
+
+                const text = document.createElement('div');
+                text.id = 'auto-hprim-sms-notify-text';
+
+                const closeBtn = document.createElement('button');
+                closeBtn.id = 'auto-hprim-sms-notify-close';
+                closeBtn.type = 'button';
+                closeBtn.setAttribute('aria-label', 'Fermer l’alerte');
+                closeBtn.textContent = 'x';
+                closeBtn.style.position = 'absolute';
+                closeBtn.style.top = '6px';
+                closeBtn.style.right = '8px';
+                closeBtn.style.width = '24px';
+                closeBtn.style.height = '24px';
+                closeBtn.style.border = '0';
+                closeBtn.style.borderRadius = '12px';
+                closeBtn.style.background = 'rgba(255,255,255,0.12)';
+                closeBtn.style.color = '#fff';
+                closeBtn.style.fontSize = '18px';
+                closeBtn.style.fontWeight = '900';
+                closeBtn.style.lineHeight = '20px';
+                closeBtn.style.cursor = 'pointer';
+                closeBtn.style.padding = '0';
+                closeBtn.addEventListener('click', ev => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    clearTimeout(el.__autoHprimSmsTimer);
+                    el.style.display = 'none';
+                });
+
+                el.appendChild(text);
+                el.appendChild(closeBtn);
                 document.body.appendChild(el);
             }
 
@@ -322,11 +386,12 @@
                 el.style.background = '#06345f';
             }
 
-            el.textContent = message;
+            const text = el.querySelector('#auto-hprim-sms-notify-text') || el;
+            text.textContent = message;
             el.style.display = 'block';
 
+            clearTimeout(el.__autoHprimSmsTimer);
             if (durationMs > 0) {
-                clearTimeout(el.__autoHprimSmsTimer);
                 el.__autoHprimSmsTimer = setTimeout(() => {
                     el.style.display = 'none';
                 }, durationMs);
