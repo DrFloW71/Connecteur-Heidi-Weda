@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.10
+// @version      0.1.11
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -65,7 +65,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.10";
+  const SCRIPT_VERSION = "0.1.11";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -150,6 +150,13 @@
   const IMPORT_MESSAGE_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart.ng-star-inserted > div.flexColStart.mt10.width100.ng-star-inserted > div.mt5.flexRow.ng-star-inserted > div > table > tr.ng-star-inserted > td:nth-child(5) > a";
   const IMPORT_PATIENT_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart > div > div.btnImport.importPatient.targetSupprimer, #messageContainer .btnImport.importPatient.targetSupprimer";
   const PDF_PARSER_RESET_SELECTOR = "#pdfParserResetButton";
+  const WEDA_MSSANTE_RECONNECT_SELECTOR = [
+    "#form1 > div.flex-box > we-main > connection-pro-sante-connect > div > div.info-connexion-pro-sante-connect.not-connected",
+    "connection-pro-sante-connect .info-connexion-pro-sante-connect.not-connected",
+    "connection-pro-sante-connect .not-connected",
+  ].join(", ");
+  const WEDA_MSSANTE_RECONNECT_CHECK_MS = 15000;
+  const WEDA_MSSANTE_RECONNECT_COOLDOWN_MS = 60 * 1000;
   const SELECTOR_WEDA_HELPER_PATIENT_NAME = "#pdfParserPatientName";
   const PATIENT_IMPORT_SELECTION_MIN_SCORE = 280;
   const PATIENT_IMPORT_SELECTION_AMBIGUITY_MARGIN = 120;
@@ -166,7 +173,7 @@
   const SELECTOR_WEDA_COMMENT = "#ContentPlaceHolder1_TextBoxAntecedentCommentaire";
   const SELECTOR_WEDA_DATE_PONCTUELLE = "#ContentPlaceHolder1_TextBoxAntecedentDatePonctuel";
   const SELECTOR_WEDA_VALID = "#ContentPlaceHolder1_ButtonValid";
-  const AUTO_INTERVAL_MS = 5 * 60 * 1000;
+  const AUTO_INTERVAL_MS = 60 * 1000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -217,6 +224,9 @@
   let titleManualEditCommitTimer = null;
   let autoRefreshTimer = null;
   let autoHeartbeatTimer = null;
+  let wedaMssanteReconnectTimer = null;
+  let wedaMssanteReconnectObserver = null;
+  let lastWedaMssanteReconnectAt = 0;
   let currentHeidiTab = null;
   let currentWedaAtcdWorkerTab = null;
   let currentWedaAtcdWorkerTabJobId = "";
@@ -433,8 +443,76 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     setupRememberedTitleAutofill();
     window.setTimeout(() => applyRememberedDocumentFieldsForSelectedRow({ autoSave: true }), 900);
+    setupWedaMssanteAutoReconnect();
     setupAutoHeartbeat();
     handleAutoOnLoad();
+  }
+
+  function setupWedaMssanteAutoReconnect() {
+    attemptWedaMssanteReconnect("init");
+
+    if (!wedaMssanteReconnectTimer) {
+      wedaMssanteReconnectTimer = window.setInterval(() => {
+        attemptWedaMssanteReconnect("interval");
+      }, WEDA_MSSANTE_RECONNECT_CHECK_MS);
+    }
+
+    if (!wedaMssanteReconnectObserver && typeof MutationObserver !== "undefined") {
+      const root = document.querySelector("connection-pro-sante-connect") || document.body;
+      if (root) {
+        wedaMssanteReconnectObserver = new MutationObserver(() => {
+          attemptWedaMssanteReconnect("mutation");
+        });
+        wedaMssanteReconnectObserver.observe(root, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class", "style", "hidden", "aria-hidden"],
+        });
+      }
+    }
+  }
+
+  function attemptWedaMssanteReconnect(reason = "check") {
+    const target = findWedaMssanteReconnectTarget();
+    if (!target) {
+      return false;
+    }
+
+    const now = Date.now();
+    const elapsed = now - lastWedaMssanteReconnectAt;
+    if (lastWedaMssanteReconnectAt && elapsed < WEDA_MSSANTE_RECONNECT_COOLDOWN_MS) {
+      return false;
+    }
+
+    lastWedaMssanteReconnectAt = now;
+    appendDebugLog("weda:mssante-reconnect-click", {
+      reason,
+      text: normalizeText(target.textContent || "").slice(0, 180),
+    });
+    setPanelStatus("Connexion MSSanté inactive : tentative de reconnexion Pro Santé Connect...");
+    clickButtonLikeUser(target);
+    return true;
+  }
+
+  function findWedaMssanteReconnectTarget() {
+    const candidates = Array.from(document.querySelectorAll(WEDA_MSSANTE_RECONNECT_SELECTOR))
+      .filter((element, index, list) => element && list.indexOf(element) === index);
+
+    return candidates.find(isWedaMssanteReconnectTarget) || null;
+  }
+
+  function isWedaMssanteReconnectTarget(element) {
+    if (!element || !isElementVisible(element)) {
+      return false;
+    }
+
+    const className = String(element.getAttribute("class") || "");
+    const text = normalizeForCompare(element.textContent || "");
+
+    return className.includes("not-connected") &&
+      /connexion\s+mssante\s+inactive/.test(text) &&
+      /pro\s+sante\s+connect/.test(text);
   }
 
   function createWedaPanel() {
@@ -453,7 +531,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE COURRIERS LM STUDIO + ATCD</button>
-        <button type="button" id="wbh-auto">MODE AUTO 5 MIN</button>
+        <button type="button" id="wbh-auto">MODE AUTO 1 MIN</button>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-show-logs">Logs</button>
         <button type="button" id="wbh-copy-logs">Copier logs</button>
@@ -785,7 +863,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 5 MIN";
+      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 1 MIN";
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
     }

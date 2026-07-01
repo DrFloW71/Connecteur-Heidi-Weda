@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antécédents CIM-10 WEDA avec LM Studio AVEC colorisation
 // @namespace    http://tampermonkey.net/
-// @version      6.2.3
+// @version      6.2.4
 // @description  Touche Début/Home : exporte les antécédents WEDA non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @all-frames   true
@@ -25,7 +25,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.3-LMstudio-avec-colorisation';
+    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.4-LMstudio-avec-colorisation';
 
     const HOST_WEDA = 'secure.weda.fr';
     const HOST_HEIDI = 'scribe.heidihealth.com';
@@ -2537,6 +2537,7 @@ END_ATCD`;
             || /^(heidi$|heidi_retry|heidi_empty_payload|heidi_unparsed_result|heidi_runner_blocked|heidi_runner_takeover|heidi_force_finalize_visible_result|parse_heidi_result)/.test(name)
             || /^(worker_lock|worker_tab_takeover|import_error|import_progress_repaired|import_stall_recovery|import_stall_skip_to_quality|import_stall_force_quality|import_stall_recovery_failed|import_flow_recovery_scheduled|import_done_with_errors)/.test(name)
             || /^(quality_control|quality_control_stalled|quality_control_failed|quality_control_unrecoverable|quality_reimport_error|quality_full_retry)/.test(name)
+            || /^(cim10_code_correction|cim10_category_fallback)/.test(name)
             || /^(comment_date_repair_conflict|comment_date_repair_failed)/.test(name)
             || /^(weda_duplicate_cleanup|weda_duplicate_cleanup_failed)/.test(name)
             || /^(weda_color|weda_color_failed)/.test(name)
@@ -2961,6 +2962,7 @@ END_ATCD`;
             'targetedReimportCount',
             'skippedCount',
             'missingCount',
+            'missingSummary',
             'expectedCount',
             'foundCount',
             'stalledForMs',
@@ -9905,6 +9907,37 @@ ${HEIDI_ASK_AI_PROMPT}`
             };
         }
 
+        if (/^[A-Z][0-9][0-9A-Z]$/.test(cleanCode)) {
+            const bestCategoryChild = await searchBestCim10ParentInWeda(cleanCode, referenceName || cleanCode);
+            if (bestCategoryChild) {
+                logImportEvent('warning', 'cim10_category_fallback', `${cleanCode} introuvable directement : sélection du sous-code ${bestCategoryChild.matchedCode}.`, {
+                    originalCode,
+                    cleanCode,
+                    referenceName,
+                    selectedCode: bestCategoryChild.matchedCode,
+                    selectedLabel: bestCategoryChild.matchedLabel,
+                    similarityScore: bestCategoryChild.similarityScore,
+                    candidates: bestCategoryChild.candidates
+                });
+
+                showBadge(
+                    `Fallback CIM-10 catégorie utilisé.\n` +
+                    `Heidi : ${cleanCode} ${referenceName || ''}\n` +
+                    `CIM-10 : ${bestCategoryChild.matchedCode} ${bestCategoryChild.matchedLabel}\n` +
+                    `Score similarité : ${bestCategoryChild.similarityScore}`,
+                    { duration: 10000 }
+                );
+
+                return {
+                    ...bestCategoryChild,
+                    originalCode,
+                    correctedFromCode: codeCorrection ? originalCode : '',
+                    usedCodeCorrection: !!codeCorrection,
+                    correctionReason: codeCorrection ? codeCorrection.reason : ''
+                };
+            }
+        }
+
         if (parentCodes.length) {
             showBadge(
                 `CIM10 exacte introuvable : ${cleanCode}\n` +
@@ -13750,9 +13783,7 @@ ${HEIDI_ASK_AI_PROMPT}`
         }
 
         if (block.section && block.section !== item.section) return itemMatches;
-        if (!block.section) return itemMatches;
-
-        return true;
+        return itemMatches;
     }
 
     function shouldIncludeFamilialNoControleDuplicates(item, options = {}) {
