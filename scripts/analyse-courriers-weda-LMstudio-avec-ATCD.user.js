@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.11
+// @version      0.1.25
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -34,6 +34,7 @@
   const LMSTUDIO_REQUEST_TIMEOUT_MS = 300000;
   const LMSTUDIO_TEMPERATURE = 0;
   const LMSTUDIO_MAX_TOKENS = 900;
+  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 220;
   const LMSTUDIO_MAX_DOCUMENT_TEXT_LENGTH = 45000;
   const LMSTUDIO_PDF_IMAGE_FALLBACK_ENABLED = true;
   const LMSTUDIO_PDF_TEXT_SPARSE_FALLBACK_ENABLED = true;
@@ -65,7 +66,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.11";
+  const SCRIPT_VERSION = "0.1.25";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -79,11 +80,13 @@
   const WEDA_ATCD_WORKER_LOCK_KEY = `${STORAGE_PREFIX}wedaAtcdWorkerLock`;
   const WEDA_ATCD_CLOSE_REQUEST_KEY = `${STORAGE_PREFIX}wedaAtcdCloseRequest`;
   const PATIENT_IMPORT_CONTEXT_KEY = `${STORAGE_PREFIX}patientImportContext.v1`;
+  const DUPLICATE_PDF_REGISTRY_KEY = `${STORAGE_PREFIX}duplicatePdfRegistry.v1`;
   const CANCEL_KEY = `${STORAGE_PREFIX}cancel`;
   const STATUS_KEY = `${STORAGE_PREFIX}status`;
   const DEBUG_LOG_KEY = `${STORAGE_PREFIX}debugLog.v1`;
   const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v6`;
   const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v6`;
+  const PATIENTS_KEY = `${STORAGE_PREFIX}rememberedPatients.v1`;
   const AUTO_SEEN_ROWS_KEY = `${STORAGE_PREFIX}autoSeenRows.v1`;
   const HEIDI_COURRIER_TAB_ROLE_KEY = `${STORAGE_PREFIX}heidiTabRole`;
   const HEIDI_COURRIER_SESSION_ID_KEY = `${STORAGE_PREFIX}heidiSessionId`;
@@ -149,14 +152,34 @@
   ].join(", ");
   const IMPORT_MESSAGE_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart.ng-star-inserted > div.flexColStart.mt10.width100.ng-star-inserted > div.mt5.flexRow.ng-star-inserted > div > table > tr.ng-star-inserted > td:nth-child(5) > a";
   const IMPORT_PATIENT_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart > div > div.btnImport.importPatient.targetSupprimer, #messageContainer .btnImport.importPatient.targetSupprimer";
+  const DELETE_SELECTED_MESSAGES_SELECTOR = "#weInboxContainer > div.flexCenter.messageListToolsContainer > div:nth-child(2) > a:nth-child(1)";
   const PDF_PARSER_RESET_SELECTOR = "#pdfParserResetButton";
+  const WEDA_FIND_PATIENT_PANEL_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PanelFindPatient";
+  const WEDA_FIND_PATIENT_MODE_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient";
+  const WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche";
+  const WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient";
+  const WEDA_FIND_PATIENT_GRID_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld";
+  const WEDA_FIND_PATIENT_NAME_MODE_VALUE = "Nom";
+  const WEDA_FIND_PATIENT_MODE_WAIT_MS = 6000;
+  const WEDA_FIND_PATIENT_MODE_SETTLE_MS = 900;
+  const WEDA_FIND_PATIENT_RESULT_WAIT_MS = 9000;
+  const WEDA_FIND_PATIENT_SEARCH_SETTLE_MS = 900;
+  const WEDA_FIND_PATIENT_SELECTION_SETTLE_MS = 1200;
+  const WEDA_FIND_PATIENT_MIN_SCORE = 420;
+  const WEDA_FIND_PATIENT_AMBIGUITY_MARGIN = 160;
+  const WEDA_FIND_PATIENT_RESCUE_DUPLICATE_SUPPRESS_MS = 5000;
+  const WEDA_STRICT_DUPLICATE_MIN_PDF_BYTES = 1024;
+  const WEDA_STRICT_DUPLICATE_MIN_TEXT_CHARS = 900;
+  const WEDA_STRICT_DUPLICATE_DELETE_WAIT_MS = 7000;
+  const WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS = 1400;
   const WEDA_MSSANTE_RECONNECT_SELECTOR = [
     "#form1 > div.flex-box > we-main > connection-pro-sante-connect > div > div.info-connexion-pro-sante-connect.not-connected",
     "connection-pro-sante-connect .info-connexion-pro-sante-connect.not-connected",
     "connection-pro-sante-connect .not-connected",
   ].join(", ");
   const WEDA_MSSANTE_RECONNECT_CHECK_MS = 15000;
-  const WEDA_MSSANTE_RECONNECT_COOLDOWN_MS = 60 * 1000;
+  const WEDA_MSSANTE_RECONNECT_ATTEMPT_KEY = `${STORAGE_PREFIX}mssanteReconnectAttempt.v1`;
+  const WEDA_MSSANTE_RECONNECT_SKIP_LOG_INTERVAL_MS = 10 * 60 * 1000;
   const SELECTOR_WEDA_HELPER_PATIENT_NAME = "#pdfParserPatientName";
   const PATIENT_IMPORT_SELECTION_MIN_SCORE = 280;
   const PATIENT_IMPORT_SELECTION_AMBIGUITY_MARGIN = 120;
@@ -186,6 +209,11 @@
   const TITLE_INPUT_WAIT_AFTER_PATIENT_MS = 10000;
   const TITLE_PRIORITY_WATCH_INTERVAL_MS = 700;
   const PATIENT_IMPORT_SETTLE_MS = 800;
+  const PATIENT_IMPORT_CLICK_ATTEMPT_DELAYS_MS = [0, 450, 1200];
+  const PATIENT_IMPORT_CLICK_VERIFY_MS = 700;
+  const PATIENT_IMPORT_TITLE_ONLY_CONFIRM_MS = 650;
+  const MANUAL_ARCHIVE_NEXT_SETTLE_MS = 900;
+  const MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS = 8000;
   const WEDA_ROW_OPEN_RETRY_DELAYS_MS = [3500, 9000];
   const NEXT_AFTER_SAVE_MS = 4200;
   const NEXT_AFTER_RELOAD_SAVE_MS = 2500;
@@ -214,19 +242,23 @@
   const HEIDI_CONTEXT_HIDDEN_SETTLE_MS = 8000;
   const MAX_REMEMBERED_TITLES = 5000;
   const MAX_REMEMBERED_SPECIALTIES = 5000;
+  const MAX_REMEMBERED_PATIENTS = 5000;
   const REMEMBERED_TITLE_TOUCH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+  const REMEMBERED_PATIENT_TOUCH_INTERVAL_MS = 12 * 60 * 60 * 1000;
   const MAX_AUTO_SEEN_ROWS = 1000;
   const MAX_DEBUG_LOG_ENTRIES = 800;
 
   let titleAutofillInterval = null;
   let titleAutofillInputOpening = false;
+  let rememberedPatientAutofillInProgress = false;
+  let manualArchiveNextTimer = null;
   let titleManualEditState = null;
   let titleManualEditCommitTimer = null;
   let autoRefreshTimer = null;
   let autoHeartbeatTimer = null;
   let wedaMssanteReconnectTimer = null;
   let wedaMssanteReconnectObserver = null;
-  let lastWedaMssanteReconnectAt = 0;
+  let wedaMssanteReconnectClickAttempted = false;
   let currentHeidiTab = null;
   let currentWedaAtcdWorkerTab = null;
   let currentWedaAtcdWorkerTabJobId = "";
@@ -237,6 +269,7 @@
   let lastPatientImportPerformanceStartTime = 0;
   let lastPatientImportSelectionIssue = null;
   let lastPatientImportSelectionContext = null;
+  const wedaFindPatientRescueAttemptKeys = new Map();
 
   const LMSTUDIO_PROMPT_ACTIVE = `Tu dois produire trois blocs balisés, et uniquement ces trois blocs.
 
@@ -442,6 +475,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     setupRememberedTitleAutofill();
+    setupManualArchiveNextNavigation();
     window.setTimeout(() => applyRememberedDocumentFieldsForSelectedRow({ autoSave: true }), 900);
     setupWedaMssanteAutoReconnect();
     setupAutoHeartbeat();
@@ -449,7 +483,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function setupWedaMssanteAutoReconnect() {
+    if (wedaMssanteReconnectClickAttempted || hasWedaMssanteReconnectAlreadyAttempted()) {
+      wedaMssanteReconnectClickAttempted = true;
+      maybeLogWedaMssanteReconnectAlreadyAttempted("setup");
+      return;
+    }
+
     attemptWedaMssanteReconnect("init");
+
+    if (wedaMssanteReconnectClickAttempted || hasWedaMssanteReconnectAlreadyAttempted()) {
+      return;
+    }
 
     if (!wedaMssanteReconnectTimer) {
       wedaMssanteReconnectTimer = window.setInterval(() => {
@@ -473,19 +517,34 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
   }
 
+  function stopWedaMssanteAutoReconnectWatchers() {
+    if (wedaMssanteReconnectTimer) {
+      window.clearInterval(wedaMssanteReconnectTimer);
+      wedaMssanteReconnectTimer = null;
+    }
+
+    if (wedaMssanteReconnectObserver) {
+      wedaMssanteReconnectObserver.disconnect();
+      wedaMssanteReconnectObserver = null;
+    }
+  }
+
   function attemptWedaMssanteReconnect(reason = "check") {
+    if (wedaMssanteReconnectClickAttempted || hasWedaMssanteReconnectAlreadyAttempted()) {
+      wedaMssanteReconnectClickAttempted = true;
+      stopWedaMssanteAutoReconnectWatchers();
+      maybeLogWedaMssanteReconnectAlreadyAttempted(reason);
+      return false;
+    }
+
     const target = findWedaMssanteReconnectTarget();
     if (!target) {
       return false;
     }
 
-    const now = Date.now();
-    const elapsed = now - lastWedaMssanteReconnectAt;
-    if (lastWedaMssanteReconnectAt && elapsed < WEDA_MSSANTE_RECONNECT_COOLDOWN_MS) {
-      return false;
-    }
-
-    lastWedaMssanteReconnectAt = now;
+    wedaMssanteReconnectClickAttempted = true;
+    rememberWedaMssanteReconnectAttempt(reason, target);
+    stopWedaMssanteAutoReconnectWatchers();
     appendDebugLog("weda:mssante-reconnect-click", {
       reason,
       text: normalizeText(target.textContent || "").slice(0, 180),
@@ -493,6 +552,51 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     setPanelStatus("Connexion MSSanté inactive : tentative de reconnexion Pro Santé Connect...");
     clickButtonLikeUser(target);
     return true;
+  }
+
+  function hasWedaMssanteReconnectAlreadyAttempted() {
+    return Boolean(getWedaMssanteReconnectAttempt());
+  }
+
+  function getWedaMssanteReconnectAttempt() {
+    const attempt = GM_getValue(WEDA_MSSANTE_RECONNECT_ATTEMPT_KEY, null);
+    return attempt && typeof attempt === "object" && Number(attempt.clickedAt || 0) ? attempt : null;
+  }
+
+  function rememberWedaMssanteReconnectAttempt(reason = "", target = null) {
+    GM_setValue(WEDA_MSSANTE_RECONNECT_ATTEMPT_KEY, {
+      clickedAt: Date.now(),
+      reason,
+      version: getScriptVersion(),
+      path: location.pathname,
+      targetTextHash: hashString(normalizeText(target && target.textContent || "")),
+      lastSkipLogAt: 0,
+    });
+  }
+
+  function maybeLogWedaMssanteReconnectAlreadyAttempted(reason = "") {
+    const attempt = getWedaMssanteReconnectAttempt();
+    if (!attempt) {
+      return;
+    }
+
+    const now = Date.now();
+    const lastSkipLogAt = Number(attempt.lastSkipLogAt || 0);
+    if (lastSkipLogAt && now - lastSkipLogAt < WEDA_MSSANTE_RECONNECT_SKIP_LOG_INTERVAL_MS) {
+      return;
+    }
+
+    GM_setValue(WEDA_MSSANTE_RECONNECT_ATTEMPT_KEY, {
+      ...attempt,
+      lastSkipLogAt: now,
+    });
+    appendDebugLog("weda:mssante-reconnect-skip-already-attempted", {
+      reason,
+      clickedAt: attempt.clickedAt || 0,
+      ageMs: now - Number(attempt.clickedAt || 0),
+      clickReason: attempt.reason || "",
+      version: attempt.version || "",
+    });
   }
 
   function findWedaMssanteReconnectTarget() {
@@ -1195,6 +1299,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     GM_deleteValue(JOB_KEY);
     GM_deleteValue(RESULT_KEY);
+    resetWedaDuplicatePdfRegistry("auto-recovered");
     requestWorkflowCancellation("reprise auto après cycle bloqué", state.currentJobId || "");
     closeCurrentHeidiTab();
 
@@ -1230,6 +1335,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       if (state.mode === "auto") {
         GM_deleteValue(JOB_KEY);
         GM_deleteValue(RESULT_KEY);
+        resetWedaDuplicatePdfRegistry("auto-disabled");
         requestWorkflowCancellation("mode auto désactivé", state.currentJobId || "");
         closeCurrentHeidiTab();
       }
@@ -1375,6 +1481,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
+    resetWedaDuplicatePdfRegistry("auto-workflow-start");
     setState({
       running: true,
       mode: "auto",
@@ -1456,6 +1563,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     GM_deleteValue(RESULT_KEY);
     GM_deleteValue(JOB_KEY);
+    resetWedaDuplicatePdfRegistry("manual-start");
     clearWorkflowCancellation();
 
     setState({
@@ -1480,6 +1588,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const state = getState();
     GM_deleteValue(JOB_KEY);
     GM_deleteValue(RESULT_KEY);
+    resetWedaDuplicatePdfRegistry("stop");
     requestWorkflowCancellation("arrêt manuel", state.currentJobId || "");
     appendDebugLog("weda:stop-requested", {
       state,
@@ -1504,7 +1613,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function clearRememberedTitles() {
-    const confirmed = window.confirm("Effacer tous les titres et spécialités mémorisés par le script ?");
+    const confirmed = window.confirm("Effacer tous les titres, spécialités et patients mémorisés par le script ?");
 
     if (!confirmed) {
       return;
@@ -1512,7 +1621,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     GM_deleteValue(TITLES_KEY);
     GM_deleteValue(SPECIALTIES_KEY);
-    setPanelStatus("Mémoire des titres et spécialités effacée.");
+    GM_deleteValue(PATIENTS_KEY);
+    setPanelStatus("Mémoire des titres, spécialités et patients effacée.");
   }
 
   function resumeWedaWorkflow() {
@@ -1536,6 +1646,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     if (state.phase === "savingTitle") {
       setPanelStatus("Titre transmis à Weda, préparation du courrier suivant...");
       window.setTimeout(() => goToNextBiology(state.currentJobId), NEXT_AFTER_RELOAD_SAVE_MS);
+      return;
+    }
+
+    if (state.phase === "deletingDuplicate") {
+      setPanelStatus("Suppression d'un doublon strict, reprise de la liste...");
+      window.setTimeout(() => continueAfterStrictDuplicateDeletion(), WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS);
       return;
     }
 
@@ -1664,6 +1780,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const state = getState();
 
     return selected || findBiologyRowByStableKey(state.currentStableKey, rows) || rows[state.currentIndex] || null;
+  }
+
+  function getStrictSelectedBiologyItem() {
+    return getBiologyRows().find((item) => item.row.classList.contains("selected")) || null;
   }
 
   function getSelectedBiologyIndex() {
@@ -3117,6 +3237,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         birthDateMatch: selected.birthDateMatch,
         strongBirthDateMatch: selected.strongBirthDateMatch,
         nameMatch: selected.nameMatch,
+        patientLabel: selected.patientLabel || "",
+        birthDate: selected.birthDate || "",
         patientContext: selected.patientContext || buildWedaPatientContextFromImportCandidate(selected),
       };
     }
@@ -3611,6 +3733,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       patientId: context.patientId,
       patientUrl: context.patientUrl,
       patientLabel: context.patientLabel || "",
+      birthDate: selection.birthDate || "",
+      identity: buildWedaRememberedPatientIdentityFromSelection(selection, context),
       source: context.source || "patient-import-selection",
       openMode: context.openMode || "direct-patient-url",
       jobId: options.jobId || "",
@@ -3622,6 +3746,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     lastPatientImportSelectionContext = entry;
     GM_setValue(PATIENT_IMPORT_CONTEXT_KEY, entry);
+    rememberWedaPatientForDocument(
+      buildWedaRememberedPatientIdentityFromSelection(selection, context),
+      {
+        ...selection,
+        patientId: context.patientId || "",
+        patientUrl: context.patientUrl || "",
+        patientLabel: context.patientLabel || selection.patientLabel || "",
+      },
+      options,
+      source || "patient-import-selection"
+    );
     appendDebugLog("weda:patient-import-context-remembered", {
       source,
       selectionReason: selection.reason || "",
@@ -3688,7 +3823,332 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       };
     }
 
+    const rememberedPatient = getRememberedWedaPatientForOptions({
+      ...options,
+      result,
+    });
+
+    if (rememberedPatient && rememberedPatient.entry && rememberedPatient.entry.patientId && rememberedPatient.entry.patientUrl) {
+      return {
+        patientId: rememberedPatient.entry.patientId,
+        patientUrl: rememberedPatient.entry.patientUrl,
+        patientLabel: rememberedPatient.entry.patientLabel || "",
+        source: rememberedPatient.entry.source || "remembered-patient",
+        openMode: rememberedPatient.entry.openMode || "direct-patient-url",
+      };
+    }
+
     return findWedaPatientContextForCurrentMessage(anchor);
+  }
+
+  function rememberCurrentPatientImportContextForDocument(options = {}) {
+    const row = options.row || null;
+    const context = getRememberedPatientImportContext({
+      contentKey: options.contentKey || "",
+      urlKey: options.urlKey || "",
+      rowStableKey: options.rowStableKey || (row ? row.stableKey : ""),
+    });
+
+    if (!context) {
+      return null;
+    }
+
+    const expectedStableKey = options.rowStableKey || (row ? row.stableKey : "");
+    if (context.rowStableKey && expectedStableKey && context.rowStableKey !== expectedStableKey) {
+      return null;
+    }
+
+    const scopedContext = Boolean(context.rowStableKey || context.contentKey || context.urlKey || context.jobId);
+    if (!scopedContext && Date.now() - Number(context.createdAt || 0) > PATIENT_IMPORT_SELECTION_ISSUE_MAX_AGE_MS) {
+      return null;
+    }
+
+    const identity = normalizeWedaFindPatientIdentity(context.identity || {
+      fullName: context.patientLabel || "",
+      birthDate: context.birthDate || "",
+      source: context.source || "patient-import-context",
+    });
+
+    return rememberWedaPatientForDocument(identity, {
+      patientId: context.patientId || "",
+      patientUrl: context.patientUrl || "",
+      patientLabel: context.patientLabel || "",
+      birthDate: context.birthDate || "",
+      openMode: context.openMode || "",
+      reason: context.source || "patient-import-context",
+      score: 0,
+      scoreGap: 0,
+    }, {
+      ...options,
+      rowStableKey: options.rowStableKey || (row ? row.stableKey : ""),
+    }, "patient-import-context-promoted");
+  }
+
+  function buildWedaRememberedPatientIdentityFromSelection(selection = {}, context = {}) {
+    return normalizeWedaFindPatientIdentity({
+      fullName: selection.patientLabel || context.patientLabel || "",
+      familyName: selection.familyName || "",
+      givenName: selection.givenName || "",
+      birthDate: selection.birthDate || "",
+      source: selection.reason ? "selection-" + selection.reason : "selection",
+    });
+  }
+
+  function rememberWedaPatientForDocument(identity = {}, selection = {}, options = {}, source = "patient-selection") {
+    const normalizedIdentity = normalizeWedaFindPatientIdentity(identity);
+    if (!hasUsableWedaFindPatientIdentity(normalizedIdentity)) {
+      appendDebugLog("weda:patient-memory-skip-unusable-identity", {
+        source,
+        hasFamilyName: Boolean(normalizedIdentity.familyName),
+        hasGivenName: Boolean(normalizedIdentity.givenName),
+        hasBirthDate: Boolean(normalizedIdentity.birthDate),
+      });
+      return null;
+    }
+
+    const context = buildWedaPatientMemoryContext(options);
+    if (!context.keys.length) {
+      appendDebugLog("weda:patient-memory-skip-weak-keys", {
+        source,
+        rowIndex: context.rowIndex,
+        rowStableKey: context.rowStableKey,
+        hasContentKey: Boolean(context.contentKey),
+        hasUrlKey: Boolean(context.urlKey),
+      });
+      return null;
+    }
+
+    const patients = GM_getValue(PATIENTS_KEY, {});
+    const now = Date.now();
+    const patientLabel = normalizeText(selection.patientLabel || normalizedIdentity.searchLabel || "");
+    const entryPatch = {
+      identity: normalizedIdentity,
+      patientLabel,
+      birthDate: normalizedIdentity.birthDate || normalizePatientBirthDate(selection.birthDate || ""),
+      maidenName: normalizeText(selection.maidenName || ""),
+      patientId: selection.patientId || "",
+      patientUrl: selection.patientUrl || "",
+      source,
+      openMode: selection.openMode || (selection.patientUrl ? "direct-patient-url" : ""),
+      selectionReason: selection.reason || "",
+      selectedIndex: Number.isFinite(Number(selection.selectedIndex)) ? Number(selection.selectedIndex) : null,
+      score: Number(selection.score || 0),
+      scoreGap: Number(selection.scoreGap || 0),
+      rowKey: context.rowKey || "",
+      rowStableKey: context.rowStableKey || "",
+      rowIdentity: context.rowIdentity || "",
+      pdfUrlHash: context.pdfUrlHash || "",
+      contentKey: context.contentKey || "",
+      urlKey: context.urlKey || "",
+      updatedAt: now,
+      lastUsedAt: now,
+    };
+
+    context.keys.forEach((key) => {
+      const previous = patients[key] || {};
+      patients[key] = {
+        ...previous,
+        ...entryPatch,
+        createdAt: previous.createdAt || now,
+      };
+    });
+
+    GM_setValue(PATIENTS_KEY, pruneRememberedPatients(patients));
+    appendDebugLog("weda:patient-memory-remembered", {
+      source,
+      rowIndex: context.rowIndex,
+      rowStableKey: context.rowStableKey,
+      keys: context.keys,
+      hasPatientId: Boolean(entryPatch.patientId),
+      hasPatientUrl: Boolean(entryPatch.patientUrl),
+      hasBirthDate: Boolean(entryPatch.birthDate),
+      selectionReason: entryPatch.selectionReason,
+      score: entryPatch.score,
+      scoreGap: entryPatch.scoreGap,
+    });
+
+    return {
+      keys: context.keys,
+      entry: entryPatch,
+    };
+  }
+
+  function buildWedaPatientMemoryContext(options = {}) {
+    const state = getState();
+    const rows = getBiologyRows();
+    const item = options.row ||
+      (options.rowStableKey ? findBiologyRowByStableKey(options.rowStableKey, rows) : null) ||
+      getStrictSelectedBiologyItem() ||
+      getSelectedBiologyItem();
+    const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
+    const explicitUrlKey = options.urlKey || (options.pdfUrl ? "pdfurl-" + hashString(options.pdfUrl) : "");
+    const displayedUrlKey = getDisplayedPdfUrlKey();
+    const contentKey = options.contentKey || (stateMatchesItem ? state.currentContentKey || "" : "");
+    const urlKey = explicitUrlKey || (stateMatchesItem ? state.currentUrlKey || "" : "") || displayedUrlKey;
+    const keys = buildWedaDocumentMemoryKeys([
+      options.contentKey,
+      options.urlKey,
+      contentKey,
+      urlKey,
+      stateMatchesItem && state.lastTitleKey,
+      displayedUrlKey,
+    ]);
+
+    return {
+      keys,
+      rowIndex: item ? item.index : state.currentIndex,
+      rowKey: item ? item.key : state.currentRowKey,
+      rowStableKey: options.rowStableKey || (item ? item.stableKey : state.currentStableKey) || "",
+      rowIdentity: item ? item.identityLabel : "",
+      pdfUrlHash: hashString(options.pdfUrl || getDisplayedPdfUrl() || ""),
+      contentKey,
+      urlKey,
+    };
+  }
+
+  function getRememberedWedaPatientForOptions(options = {}) {
+    const result = options.result || {};
+    const context = buildWedaPatientMemoryContext({
+      ...options,
+      contentKey: options.contentKey || result.contentKey || "",
+      urlKey: options.urlKey || result.urlKey || "",
+      rowStableKey: options.rowStableKey || result.rowStableKey || "",
+      pdfUrl: options.pdfUrl || result.pdfUrl || "",
+    });
+    const lookupKeys = context.keys;
+
+    for (const key of lookupKeys) {
+      const entry = getRememberedWedaPatientEntry(key);
+      if (!entry || !isRememberedWedaPatientCompatibleWithContext(entry, context)) {
+        continue;
+      }
+
+      const identity = normalizeWedaFindPatientIdentity(entry.identity || {
+        familyName: entry.familyName || "",
+        givenName: entry.givenName || "",
+        fullName: entry.patientLabel || "",
+        birthDate: entry.birthDate || "",
+        source: entry.source || "remembered-patient",
+      });
+
+      if (!hasUsableWedaFindPatientIdentity(identity)) {
+        continue;
+      }
+
+      return {
+        key,
+        keys: lookupKeys,
+        entry,
+        identity,
+      };
+    }
+
+    return null;
+  }
+
+  function getRememberedWedaPatientEntry(key) {
+    if (!key) {
+      return null;
+    }
+
+    const patients = GM_getValue(PATIENTS_KEY, {});
+    const entry = patients[key];
+    if (!entry) {
+      return null;
+    }
+
+    const identity = normalizeWedaFindPatientIdentity(entry.identity || {
+      fullName: entry.patientLabel || "",
+      birthDate: entry.birthDate || "",
+      source: entry.source || "remembered-patient",
+    });
+    if (!hasUsableWedaFindPatientIdentity(identity)) {
+      delete patients[key];
+      GM_setValue(PATIENTS_KEY, patients);
+      appendDebugLog("weda:patient-memory-dropped", {
+        key,
+        reason: "unusable-identity",
+      });
+      return null;
+    }
+
+    return {
+      ...entry,
+      key,
+      identity,
+    };
+  }
+
+  function isRememberedWedaPatientCompatibleWithContext(entry = {}, context = {}) {
+    const expectedStableKey = String(context.rowStableKey || "").trim();
+    const rememberedStableKey = String(entry.rowStableKey || "").trim();
+    if (expectedStableKey && rememberedStableKey && expectedStableKey !== rememberedStableKey) {
+      return false;
+    }
+
+    const expectedRowKey = String(context.rowKey || "").trim();
+    const rememberedRowKey = String(entry.rowKey || "").trim();
+    const sameStableDuplicateOccurrence = Boolean(expectedStableKey && rememberedStableKey && expectedStableKey === rememberedStableKey);
+    if (expectedRowKey && rememberedRowKey && expectedRowKey !== rememberedRowKey && !sameStableDuplicateOccurrence) {
+      return false;
+    }
+
+    const expectedIdentity = normalizeForCompare(context.rowIdentity || "");
+    const rememberedIdentity = normalizeForCompare(entry.rowIdentity || "");
+    return !(expectedIdentity && rememberedIdentity && expectedIdentity !== rememberedIdentity);
+  }
+
+  function touchRememberedPatientKeys(keys) {
+    const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
+    if (!lookupKeys.length) {
+      return;
+    }
+
+    const patients = GM_getValue(PATIENTS_KEY, {});
+    const now = Date.now();
+    let changed = false;
+
+    lookupKeys.forEach((key) => {
+      const entry = patients[key];
+      if (!entry) {
+        return;
+      }
+
+      const lastUsedAt = Number(entry.lastUsedAt || 0);
+      if (lastUsedAt && now - lastUsedAt < REMEMBERED_PATIENT_TOUCH_INTERVAL_MS) {
+        return;
+      }
+
+      patients[key] = {
+        ...entry,
+        lastUsedAt: now,
+      };
+      changed = true;
+    });
+
+    if (changed) {
+      GM_setValue(PATIENTS_KEY, pruneRememberedPatients(patients));
+    }
+  }
+
+  function pruneRememberedPatients(patients) {
+    const entries = Object.entries(patients || {})
+      .filter(([_key, entry]) => entry && hasUsableWedaFindPatientIdentity(normalizeWedaFindPatientIdentity(entry.identity || {
+        fullName: entry.patientLabel || "",
+        birthDate: entry.birthDate || "",
+      })))
+      .sort((left, right) => getRememberedPatientSortTime(right[1]) - getRememberedPatientSortTime(left[1]))
+      .slice(0, MAX_REMEMBERED_PATIENTS);
+
+    return Object.fromEntries(entries);
+  }
+
+  function getRememberedPatientSortTime(entry) {
+    return Math.max(
+      Number(entry && entry.lastUsedAt) || 0,
+      Number(entry && entry.updatedAt) || 0,
+      Number(entry && entry.createdAt) || 0
+    );
   }
 
   function uniqueStrings(values) {
@@ -3763,7 +4223,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
     setPanelStatus("Champ titre absent : tentative via Un patient...");
     lastPatientImportPerformanceStartTime = getCurrentPerformanceTime();
-    clickButtonLikeUser(patientButton);
+    await clickImportPatientButtonWithRetry(patientButton, jobId, reason, options);
     await sleep(PATIENT_IMPORT_SETTLE_MS);
 
     let input = findWedaTitleInput(options);
@@ -3812,6 +4272,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     input = input || await waitForOptionalTitleInput(TITLE_INPUT_WAIT_AFTER_PATIENT_MS, "le champ titre après sélection patient", options);
+    const findPatientPanel = findWedaFindPatientPanel();
+    const findPatientPanelActionable = Boolean(findPatientPanel && isWedaFindPatientPanelActionable(findPatientPanel));
+    if (findPatientPanel && (!input || (findPatientPanelActionable && hasExplicitWedaFindPatientIdentitySource(options)))) {
+      const rescuedInput = await rescueWedaFindPatientPanelWithDocumentIdentity({
+        ...options,
+        jobId,
+        reason: `${reason}-find-patient-panel`,
+      });
+      input = rescuedInput || null;
+    } else if (findPatientPanel && input && !findPatientPanelActionable) {
+      appendDebugLog("weda:import-patient-panel-non-actionable-with-title-input", {
+        jobId,
+        reason,
+        titleInputIndex: getWedaTitleInputIndex(input),
+      });
+    }
+
     if (!input) {
       appendDebugLog("weda:import-title-missing-after-patient", {
         jobId,
@@ -3821,6 +4298,1160 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     return input;
+  }
+
+  async function clickImportPatientButtonWithRetry(patientButton, jobId = "", reason = "", options = {}) {
+    let lastOpenState = getPatientImportOpenState(options);
+    if (isPatientImportOpenStateConfirmed(lastOpenState, 0)) {
+      return {
+        ...lastOpenState,
+        confirmed: true,
+      };
+    }
+
+    for (let attemptIndex = 0; attemptIndex < PATIENT_IMPORT_CLICK_ATTEMPT_DELAYS_MS.length; attemptIndex += 1) {
+      const delay = PATIENT_IMPORT_CLICK_ATTEMPT_DELAYS_MS[attemptIndex];
+      if (delay) {
+        await sleep(delay);
+      }
+
+      if (jobId && !isCurrentJobStillActive(jobId, ["waitingLmStudio", "savingTitle"])) {
+        appendDebugLog("weda:import-patient-click-cancelled", {
+          jobId,
+          reason,
+          attempt: attemptIndex + 1,
+        });
+        return lastOpenState;
+      }
+
+      const freshButton = findImportPatientButton() || patientButton;
+      if (!freshButton || !document.contains(freshButton)) {
+        appendDebugLog("weda:import-patient-click-retry-missing-button", {
+          jobId,
+          reason,
+          attempt: attemptIndex + 1,
+        });
+        return lastOpenState;
+      }
+
+      appendDebugLog("weda:import-patient-click-attempt", {
+        jobId,
+        reason,
+        attempt: attemptIndex + 1,
+        button: freshButton,
+      });
+      clickImportPatientButtonLikeUser(freshButton);
+
+      lastOpenState = await waitForPatientImportOpenState(PATIENT_IMPORT_CLICK_VERIFY_MS, options);
+      if (lastOpenState.confirmed) {
+        appendDebugLog("weda:import-patient-click-confirmed", {
+          jobId,
+          reason,
+          attempt: attemptIndex + 1,
+          state: lastOpenState,
+        });
+        return lastOpenState;
+      }
+
+      dispatchImportPatientKeyboardShortcut();
+      lastOpenState = await waitForPatientImportOpenState(PATIENT_IMPORT_CLICK_VERIFY_MS, options);
+      if (lastOpenState.confirmed) {
+        appendDebugLog("weda:import-patient-shortcut-confirmed", {
+          jobId,
+          reason,
+          attempt: attemptIndex + 1,
+          state: lastOpenState,
+        });
+        return lastOpenState;
+      }
+    }
+
+    appendDebugLog("weda:import-patient-click-not-confirmed", {
+      jobId,
+      reason,
+      attempts: PATIENT_IMPORT_CLICK_ATTEMPT_DELAYS_MS.length,
+      state: lastOpenState,
+    });
+    return lastOpenState;
+  }
+
+  function clickImportPatientButtonLikeUser(button) {
+    try {
+      button.scrollIntoView({ block: "center", inline: "center" });
+    } catch (_error) {
+      // Le bouton reste tenté même si le scroll échoue.
+    }
+
+    try {
+      button.focus();
+    } catch (_error) {
+      // Les événements pointeur ci-dessous peuvent suffire.
+    }
+
+    dispatchPointerLikeEvents(button);
+
+    try {
+      button.click();
+    } catch (_error) {
+      // Les événements précédents ont déjà été tentés.
+    }
+  }
+
+  async function waitForPatientImportOpenState(timeoutMs = PATIENT_IMPORT_CLICK_VERIFY_MS, options = {}) {
+    const startedAt = Date.now();
+    let state = getPatientImportOpenState(options);
+
+    let titleOnlySeenAt = isPatientImportTitleOnlyOpenState(state) ? Date.now() : 0;
+
+    while (!isPatientImportOpenStateConfirmed(state, titleOnlySeenAt) && Date.now() - startedAt < timeoutMs) {
+      await sleep(120);
+      state = getPatientImportOpenState(options);
+      if (isPatientImportTitleOnlyOpenState(state)) {
+        titleOnlySeenAt = titleOnlySeenAt || Date.now();
+      } else {
+        titleOnlySeenAt = 0;
+      }
+    }
+
+    const confirmed = isPatientImportOpenStateConfirmed(state, titleOnlySeenAt);
+    return {
+      ...state,
+      confirmed,
+      titleOnlySeenMs: titleOnlySeenAt ? Date.now() - titleOnlySeenAt : 0,
+    };
+  }
+
+  function getPatientImportOpenState(options = {}) {
+    const titleInput = findWedaTitleInput(options);
+    const findPatientPanel = findWedaFindPatientPanel();
+    const importLinkCount = collectImportMessageLinkCandidates()
+      .filter((candidate) => candidate && candidate.link && isElementVisible(candidate.link)).length;
+    const findPatientPanelActionable = Boolean(findPatientPanel && isWedaFindPatientPanelActionable(findPatientPanel));
+
+    return {
+      opened: Boolean(titleInput || findPatientPanel || importLinkCount),
+      hasTitleInput: Boolean(titleInput),
+      hasFindPatientPanel: Boolean(findPatientPanel),
+      findPatientPanelActionable,
+      importLinkCount,
+    };
+  }
+
+  function isPatientImportTitleOnlyOpenState(state = {}) {
+    return Boolean(state.hasTitleInput && !state.hasFindPatientPanel && !state.importLinkCount);
+  }
+
+  function isPatientImportOpenStateConfirmed(state = {}, titleOnlySeenAt = 0) {
+    if (!state.opened) {
+      return false;
+    }
+
+    if (state.hasFindPatientPanel || state.importLinkCount) {
+      return true;
+    }
+
+    return Boolean(
+      state.hasTitleInput &&
+      titleOnlySeenAt &&
+      Date.now() - titleOnlySeenAt >= PATIENT_IMPORT_TITLE_ONLY_CONFIRM_MS
+    );
+  }
+
+  function dispatchImportPatientKeyboardShortcut() {
+    const keyboardOptions = {
+      key: "s",
+      code: "KeyS",
+      keyCode: 83,
+      which: 83,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    };
+    const targets = [
+      document.activeElement,
+      document.body,
+      document,
+      window,
+    ].filter(Boolean)
+      .filter((target, index, list) => list.indexOf(target) === index);
+
+    targets.forEach((target) => {
+      ["keydown", "keyup"].forEach((eventName) => {
+        try {
+          target.dispatchEvent(new KeyboardEvent(eventName, keyboardOptions));
+        } catch (_error) {
+          // Le raccourci clavier est un filet de sécurité best effort.
+        }
+      });
+    });
+  }
+
+  async function rescueWedaFindPatientPanelWithDocumentIdentity(options = {}) {
+    const panel = findWedaFindPatientPanel();
+    if (!panel) {
+      return null;
+    }
+
+    const sourceText = getWedaFindPatientIdentitySourceText(options);
+    const rememberedPatient = getRememberedWedaPatientForOptions(options);
+    const identity = rememberedPatient && hasUsableWedaFindPatientIdentity(rememberedPatient.identity)
+      ? {
+        ...rememberedPatient.identity,
+        source: "remembered-patient",
+      }
+      : await resolveWedaFindPatientSearchIdentity({
+        ...options,
+        sourceText,
+      });
+
+    if (!hasUsableWedaFindPatientIdentity(identity)) {
+      const issue = {
+        blocked: true,
+        reason: "missing-find-patient-identity",
+        at: Date.now(),
+        message: "Recherche patient WEDA bloquée : identité du patient introuvable dans le courrier.",
+        candidateCount: 0,
+        topScore: 0,
+        scoreGap: 0,
+        hasBirthDateHint: false,
+        source: options.reason || "find-patient-panel",
+      };
+      recordPatientImportSelectionIssue(issue);
+      appendDebugLog("weda:find-patient-identity-missing", {
+        jobId: options.jobId || "",
+        reason: options.reason || "",
+        sourceLength: sourceText.length,
+        hasImagePages: getLmStudioPdfPageImages(options).length > 0,
+      });
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    const rescueKey = buildWedaFindPatientRescueKey(options, identity);
+    const previousAttemptAt = Number(wedaFindPatientRescueAttemptKeys.get(rescueKey) || 0);
+    if (previousAttemptAt && Date.now() - previousAttemptAt < WEDA_FIND_PATIENT_RESCUE_DUPLICATE_SUPPRESS_MS) {
+      appendDebugLog("weda:find-patient-rescue-skip-duplicate", {
+        jobId: options.jobId || "",
+        reason: options.reason || "",
+        rescueKey,
+        previousAttemptAgeMs: Date.now() - previousAttemptAt,
+      });
+      return null;
+    }
+    wedaFindPatientRescueAttemptKeys.set(rescueKey, Date.now());
+    pruneWedaFindPatientRescueAttemptKeys();
+
+    appendDebugLog("weda:find-patient-rescue-start", {
+      jobId: options.jobId || "",
+      reason: options.reason || "",
+      rescueKey,
+      source: identity.source || "",
+      remembered: Boolean(rememberedPatient),
+      rememberedKey: rememberedPatient ? rememberedPatient.key : "",
+      hasFamilyName: Boolean(identity.familyName),
+      hasGivenName: Boolean(identity.givenName),
+      hasBirthDate: Boolean(identity.birthDate),
+      searchLength: identity.searchLabel.length,
+    });
+    setPanelStatus("Patient WEDA non identifié : recherche à partir de l'identité du courrier...");
+
+    const input = await ensureWedaFindPatientNameSearchInput();
+    if (!input) {
+      const issue = buildWedaFindPatientIssue("missing-search-input", identity, 0, 0, 0);
+      recordPatientImportSelectionIssue(issue);
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    setWedaFindPatientSearchInputValue(input, identity.searchLabel);
+    const searchButton = findWedaFindPatientSearchButton();
+    if (!searchButton) {
+      const issue = buildWedaFindPatientIssue("missing-search-button", identity, 0, 0, 0);
+      recordPatientImportSelectionIssue(issue);
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    appendDebugLog("weda:find-patient-search-click", {
+      jobId: options.jobId || "",
+      reason: options.reason || "",
+      hasBirthDate: Boolean(identity.birthDate),
+      searchLength: identity.searchLabel.length,
+    });
+    clickButtonLikeUser(searchButton);
+
+    let selection = null;
+    const searchStartedAt = Date.now();
+    try {
+      selection = await waitFor(() => {
+        if (Date.now() - searchStartedAt < WEDA_FIND_PATIENT_SEARCH_SETTLE_MS) {
+          return null;
+        }
+
+        const candidates = collectWedaFindPatientGridCandidates();
+        if (!candidates.length) {
+          return null;
+        }
+        const currentSelection = resolveWedaFindPatientGridSelection(identity, candidates);
+        return currentSelection && currentSelection.link ? currentSelection : null;
+      }, {
+        timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
+        interval: 400,
+        description: "les résultats de recherche patient WEDA",
+      });
+    } catch (_error) {
+      selection = resolveWedaFindPatientGridSelection(identity, collectWedaFindPatientGridCandidates());
+    }
+
+    if (!selection || !selection.link) {
+      const issue = buildWedaFindPatientIssue(
+        selection && selection.reason || "no-grid-selection",
+        identity,
+        selection && selection.candidateCount || 0,
+        selection && selection.topScore || 0,
+        selection && selection.scoreGap || 0
+      );
+      recordPatientImportSelectionIssue(issue);
+      appendDebugLog("weda:find-patient-selection-blocked", {
+        jobId: options.jobId || "",
+        reason: issue.reason,
+        candidateCount: issue.candidateCount || 0,
+        topScore: issue.topScore || 0,
+        scoreGap: issue.scoreGap || 0,
+        hasBirthDateHint: Boolean(issue.hasBirthDateHint),
+      });
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    clearPatientImportSelectionIssue();
+    appendDebugLog("weda:find-patient-row-click", {
+      jobId: options.jobId || "",
+      reason: options.reason || "",
+      selectionReason: selection.reason || "",
+      candidateCount: selection.candidateCount || 0,
+      selectedIndex: selection.selectedIndex,
+      score: selection.score || 0,
+      scoreGap: selection.scoreGap || 0,
+      birthDateMatch: Boolean(selection.birthDateMatch),
+      nameMatch: Boolean(selection.nameMatch),
+    });
+    setPanelStatus("Patient WEDA retrouvé, sélection de la fiche patient...");
+    clickButtonLikeUser(selection.link);
+
+    const appliedInput = await waitForWedaFindPatientSelectionApplied(options);
+    if (appliedInput) {
+      rememberWedaPatientForDocument(identity, selection, options, rememberedPatient ? "remembered-find-patient-selection" : "find-patient-selection");
+      if (rememberedPatient) {
+        touchRememberedPatientKeys(rememberedPatient.keys);
+      }
+    }
+
+    return appliedInput;
+  }
+
+  function pruneWedaFindPatientRescueAttemptKeys() {
+    const now = Date.now();
+    Array.from(wedaFindPatientRescueAttemptKeys.entries()).forEach(([key, at]) => {
+      if (now - Number(at || 0) > WEDA_FIND_PATIENT_RESCUE_DUPLICATE_SUPPRESS_MS * 6) {
+        wedaFindPatientRescueAttemptKeys.delete(key);
+      }
+    });
+  }
+
+  function findWedaFindPatientPanel() {
+    const panel = document.querySelector(WEDA_FIND_PATIENT_PANEL_SELECTOR);
+    return isWedaFindPatientPanelOpen(panel) ? panel : null;
+  }
+
+  function isWedaFindPatientPanelOpen(panel) {
+    if (!panel || panel.hidden || panel.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+
+    const style = window.getComputedStyle ? window.getComputedStyle(panel) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0)) {
+      return false;
+    }
+
+    const rect = typeof panel.getBoundingClientRect === "function" ? panel.getBoundingClientRect() : null;
+    return !rect || (rect.width > 0 && rect.height > 0);
+  }
+
+  function isWedaFindPatientPanelActionable(panel = findWedaFindPatientPanel()) {
+    if (!panel) {
+      return false;
+    }
+
+    return Boolean(
+      findWedaFindPatientSearchInput(panel) ||
+      findWedaFindPatientModeSelect(panel) ||
+      findWedaFindPatientSearchButton(panel) ||
+      collectWedaFindPatientGridCandidates().length
+    );
+  }
+
+  function findWedaFindPatientSearchInput() {
+    const panel = arguments.length ? arguments[0] : findWedaFindPatientPanel();
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+    const fallbackRoots = (panel ? [panel] : [document]).filter(Boolean);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    const candidates = fallbackRoots
+      .flatMap((root) => Array.from(root.querySelectorAll("input, textarea")))
+      .filter((input, index, list) => input && list.indexOf(input) === index)
+      .filter(isWedaFindPatientSearchInputCandidate)
+      .map((input, index) => ({
+        input,
+        index,
+        score: scoreWedaFindPatientSearchInput(input),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return candidates[0] ? candidates[0].input : null;
+  }
+
+  function isWedaFindPatientSearchInputCandidate(input) {
+    if (!input || !isElementVisible(input) || input.disabled || input.readOnly) {
+      return false;
+    }
+
+    const type = String(input.getAttribute("type") || "text").toLowerCase();
+    if (["hidden", "checkbox", "radio", "button", "submit", "reset"].includes(type)) {
+      return false;
+    }
+
+    if (input.matches && input.matches("input.docTitle, textarea.docTitle, input[placeholder='Titre du document']")) {
+      return false;
+    }
+
+    return scoreWedaFindPatientSearchInput(input) > 0;
+  }
+
+  function scoreWedaFindPatientSearchInput(input) {
+    const descriptor = normalizeForCompare([
+      input.id || "",
+      input.name || "",
+      input.getAttribute("placeholder") || "",
+      input.getAttribute("title") || "",
+      input.getAttribute("aria-label") || "",
+    ].join(" "));
+    const contextText = normalizeForCompare(input.closest && input.closest("tr, div, fieldset, form")
+      ? input.closest("tr, div, fieldset, form").textContent || ""
+      : "");
+    let score = 0;
+
+    if (/textboxrecherche|text_box_recherche|recherche/.test(descriptor)) {
+      score += 1000;
+    }
+
+    if (/\b(?:patient|nom|prenom|pr[eé]nom)\b/.test(descriptor)) {
+      score += 500;
+    }
+
+    if (/\b(?:rechercher|recherche|patient|nom|prenom|pr[eé]nom)\b/.test(contextText)) {
+      score += 180;
+    }
+
+    return score;
+  }
+
+  function findWedaFindPatientModeSelect(panel = findWedaFindPatientPanel()) {
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+    const fallbackRoots = (panel ? [panel] : [document]).filter(Boolean);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_MODE_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    const candidates = fallbackRoots
+      .flatMap((root) => Array.from(root.querySelectorAll("select")))
+      .filter((select, index, list) => select && list.indexOf(select) === index)
+      .filter((select) => isElementVisible(select) && scoreWedaFindPatientModeSelect(select) > 0)
+      .map((select, index) => ({
+        select,
+        index,
+        score: scoreWedaFindPatientModeSelect(select),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return candidates[0] ? candidates[0].select : null;
+  }
+
+  function scoreWedaFindPatientModeSelect(select) {
+    const descriptor = normalizeForCompare([
+      select.id || "",
+      select.name || "",
+      select.getAttribute("title") || "",
+      select.getAttribute("aria-label") || "",
+    ].join(" "));
+    const optionText = normalizeForCompare(Array.from(select.options || [])
+      .map((option) => option.textContent || option.label || option.value || "")
+      .join(" "));
+    let score = 0;
+
+    if (/dropdownlistrech(?:e|er)chepatient|findpatient|recherchepatient/.test(descriptor)) {
+      score += 1000;
+    }
+
+    if (/\b(?:nom|patient|prenom|pr[eé]nom)\b/.test(optionText)) {
+      score += 500;
+    }
+
+    return score;
+  }
+
+  function findWedaFindPatientSearchButton() {
+    const panel = arguments.length ? arguments[0] : findWedaFindPatientPanel();
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+    const fallbackRoots = (panel ? [panel] : [document]).filter(Boolean);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    const candidates = fallbackRoots
+      .flatMap((root) => Array.from(root.querySelectorAll("button, input[type='button'], input[type='submit'], a")))
+      .filter((button, index, list) => button && list.indexOf(button) === index)
+      .filter((button) => isElementVisible(button) && scoreWedaFindPatientSearchButton(button) > 0)
+      .map((button, index) => ({
+        button,
+        index,
+        score: scoreWedaFindPatientSearchButton(button),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return candidates[0] ? candidates[0].button : null;
+  }
+
+  function scoreWedaFindPatientSearchButton(button) {
+    const descriptor = normalizeForCompare([
+      button.id || "",
+      button.name || "",
+      button.value || "",
+      button.textContent || "",
+      button.getAttribute("title") || "",
+      button.getAttribute("aria-label") || "",
+    ].join(" "));
+    let score = 0;
+
+    if (/buttonrecherchepatient|recherchepatient/.test(descriptor)) {
+      score += 1000;
+    }
+
+    if (/\b(?:rechercher|recherche|chercher|search)\b/.test(descriptor)) {
+      score += 500;
+    }
+
+    return score;
+  }
+
+  function summarizeWedaFindPatientPanel(panel = findWedaFindPatientPanel()) {
+    const root = panel || document;
+    const visibleInputs = Array.from(root.querySelectorAll("input, textarea"))
+      .filter((input) => input && isElementVisible(input));
+    const visibleSelects = Array.from(root.querySelectorAll("select"))
+      .filter((select) => select && isElementVisible(select));
+    const visibleButtons = Array.from(root.querySelectorAll("button, input[type='button'], input[type='submit'], a"))
+      .filter((button) => button && isElementVisible(button));
+
+    return {
+      hasPanel: Boolean(panel),
+      panelVisible: Boolean(panel && isWedaFindPatientPanelOpen(panel)),
+      exactSearchInput: Boolean(root.querySelector(WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR)),
+      exactModeSelect: Boolean(root.querySelector(WEDA_FIND_PATIENT_MODE_SELECTOR)),
+      exactSearchButton: Boolean(root.querySelector(WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR)),
+      visibleInputCount: visibleInputs.length,
+      visibleSelectCount: visibleSelects.length,
+      visibleButtonCount: visibleButtons.length,
+      panelTextHash: panel ? hashString(normalizeText(panel.textContent || "")) : "",
+      panelTextSample: panel ? normalizeText(panel.textContent || "").slice(0, 180) : "",
+    };
+  }
+
+  async function ensureWedaFindPatientNameSearchInput() {
+    const panel = findWedaFindPatientPanel();
+    let select = findWedaFindPatientModeSelect(panel);
+    if (!select) {
+      try {
+        select = await waitFor(() => findWedaFindPatientModeSelect(), {
+          timeout: WEDA_FIND_PATIENT_MODE_WAIT_MS,
+          interval: 300,
+          description: "la liste de mode de recherche patient WEDA",
+        });
+      } catch (_error) {
+        select = findWedaFindPatientModeSelect();
+      }
+    }
+
+    if (!select || !isElementVisible(select)) {
+      appendDebugLog("weda:find-patient-mode-select-missing", summarizeWedaFindPatientPanel(panel));
+      return null;
+    }
+
+    const modeSwitched = await ensureWedaFindPatientNameModeSelected(select);
+    if (modeSwitched === null) {
+      return null;
+    }
+
+    const input = await waitForWedaFindPatientNameSearchInput(
+      modeSwitched ? "le champ de recherche patient par nom après changement de mode" : "le champ de recherche patient par nom"
+    );
+    if (input) {
+      return input;
+    }
+
+    const freshSelect = findWedaFindPatientModeSelect();
+    if (freshSelect && freshSelect.name) {
+      callWedaPostBack(freshSelect.name, "");
+    }
+
+    const inputAfterPostback = await waitForWedaFindPatientNameSearchInput("le champ de recherche patient par nom après postback");
+    if (inputAfterPostback) {
+      return inputAfterPostback;
+    }
+
+    const latestSelect = findWedaFindPatientModeSelect();
+    appendDebugLog("weda:find-patient-search-input-timeout", {
+      selectedMode: latestSelect ? latestSelect.value || "" : "",
+      expectedMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+    });
+    return null;
+  }
+
+  async function ensureWedaFindPatientNameModeSelected(select) {
+    const currentMode = String(select && select.value || "");
+    if (currentMode === WEDA_FIND_PATIENT_NAME_MODE_VALUE) {
+      return false;
+    }
+
+    const nameOption = Array.from(select.options || [])
+      .find((option) => String(option.value || "") === WEDA_FIND_PATIENT_NAME_MODE_VALUE);
+    if (!nameOption) {
+      appendDebugLog("weda:find-patient-name-mode-option-missing", {
+        currentMode,
+        expectedMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+        availableModes: Array.from(select.options || [])
+          .map((option) => String(option.value || ""))
+          .filter(Boolean)
+          .slice(0, 40),
+      });
+      return null;
+    }
+
+    appendDebugLog("weda:find-patient-mode-switch", {
+      fromMode: currentMode,
+      toMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+      optionText: normalizeText(nameOption.textContent || nameOption.label || ""),
+    });
+
+    Array.from(select.options || []).forEach((option) => {
+      option.selected = option === nameOption;
+    });
+    setNativeSelectValue(select, WEDA_FIND_PATIENT_NAME_MODE_VALUE);
+    dispatchWedaSelectValueEvents(select);
+    await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
+    return true;
+  }
+
+  async function waitForWedaFindPatientNameSearchInput(description) {
+    try {
+      return await waitFor(() => {
+        if (isWedaAsyncPostBackActive()) {
+          return null;
+        }
+
+        const select = findWedaFindPatientModeSelect();
+        if (!select || select.value !== WEDA_FIND_PATIENT_NAME_MODE_VALUE) {
+          return null;
+        }
+        return findWedaFindPatientSearchInput();
+      }, {
+        timeout: WEDA_FIND_PATIENT_MODE_WAIT_MS,
+        interval: 300,
+        description,
+      });
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function isWedaAsyncPostBackActive() {
+    try {
+      const sys = (typeof unsafeWindow !== "undefined" && unsafeWindow.Sys) || window.Sys;
+      const prm = sys && sys.WebForms && sys.WebForms.PageRequestManager && sys.WebForms.PageRequestManager.getInstance
+        ? sys.WebForms.PageRequestManager.getInstance()
+        : null;
+      return Boolean(prm && typeof prm.get_isInAsyncPostBack === "function" && prm.get_isInAsyncPostBack());
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function setWedaFindPatientSearchInputValue(input, value) {
+    input.focus();
+    setNativeInputValue(input, value);
+
+    try {
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: value,
+      }));
+    } catch (_error) {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  function getWedaFindPatientIdentitySourceText(options = {}) {
+    const values = [
+      options.sourceText || "",
+      options.documentText || "",
+      options.tableText || "",
+      extractWedaMessageBodyFallbackText(),
+    ].filter(Boolean);
+
+    if (!values.length) {
+      const messageContainer = document.querySelector("#messageContainer");
+      if (messageContainer) {
+        values.push(getVisibleText(messageContainer));
+      }
+    }
+
+    return truncatePatientImportSourceText(values.join("\n\n"));
+  }
+
+  async function resolveWedaFindPatientSearchIdentity(options = {}) {
+    const heuristic = extractWedaFindPatientIdentityHeuristically(options.sourceText || "");
+    if (hasUsableWedaFindPatientIdentity(heuristic)) {
+      return heuristic;
+    }
+
+    if (!options.sourceText && !getLmStudioPdfPageImages(options).length) {
+      return heuristic;
+    }
+
+    try {
+      const lmStudioIdentity = await requestLmStudioPatientIdentity(options);
+      if (hasUsableWedaFindPatientIdentity(lmStudioIdentity)) {
+        return lmStudioIdentity;
+      }
+      return lmStudioIdentity || heuristic;
+    } catch (error) {
+      appendDebugLog("lmstudio:patient-identity-error", {
+        error: error && error.message ? error.message : String(error),
+        sourceLength: String(options.sourceText || "").length,
+        imageCount: getLmStudioPdfPageImages(options).length,
+      });
+      return heuristic;
+    }
+  }
+
+  function extractWedaFindPatientIdentityHeuristically(sourceText = "") {
+    const source = normalizeMultilineText(extractLikelyPatientIdentitySourceText(sourceText) || sourceText);
+    const compact = normalizeText(source);
+    const birthDate = extractPatientBirthDateHints(source, { allowLooseParentheses: true })[0] || "";
+
+    const fieldMatch = compact.match(/\bnom(?:\s+de\s+naissance)?\s*[:\-]\s*([^:;\n,]{2,80})\s+(?:pr[eé]nom|prenom)\s*[:\-]\s*([^:;\n,]{2,80})/i);
+    if (fieldMatch) {
+      return normalizeWedaFindPatientIdentity({
+        familyName: fieldMatch[1],
+        givenName: fieldMatch[2],
+        birthDate,
+        source: "heuristic-fields",
+      });
+    }
+
+    const inlineMatch = compact.match(/\b(?:patient|patiente|b[ée]n[ée]ficiaire|assur[ée]e?|concerne|identit[ée])\s*[:\-]\s*(?:m(?:me|adame|onsieur)?\.?\s*)?([A-ZÀ-ÖØ-Ý][A-ZÀ-ÖØ-Ý' -]{1,80})\s+([A-ZÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ' -]{1,60})/);
+    if (inlineMatch) {
+      return normalizeWedaFindPatientIdentity({
+        familyName: inlineMatch[1],
+        givenName: inlineMatch[2],
+        birthDate,
+        source: "heuristic-inline",
+      });
+    }
+
+    return normalizeWedaFindPatientIdentity({
+      birthDate,
+      source: "heuristic-empty",
+    });
+  }
+
+  async function requestLmStudioPatientIdentity(options = {}) {
+    const model = await getLmStudioModelId();
+    const userContent = buildLmStudioPatientIdentityUserContent(options);
+    const payload = {
+      model,
+      temperature: 0,
+      max_tokens: LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS,
+      stream: false,
+      messages: [
+        {
+          role: "system",
+          content: "Tu extrais uniquement l'identité administrative du patient concerné. Réponds uniquement avec le bloc XML demandé, sans commentaire.",
+        },
+        {
+          role: "user",
+          content: userContent,
+        },
+      ],
+    };
+
+    appendDebugLog("lmstudio:patient-identity-request", {
+      model,
+      promptLength: getLmStudioUserContentTextLength(userContent),
+      imageCount: countLmStudioUserContentImages(userContent),
+      maxTokens: LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS,
+    });
+
+    const response = await gmJsonRequest({
+      method: "POST",
+      url: LMSTUDIO_CHAT_COMPLETIONS_URL,
+      timeout: LMSTUDIO_REQUEST_TIMEOUT_MS,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      data: JSON.stringify(payload),
+    });
+    const answer = extractLmStudioAnswer(response);
+    const identity = parseLmStudioPatientIdentityOutput(answer);
+
+    appendDebugLog("lmstudio:patient-identity-answer", {
+      answerLength: answer.length,
+      hasFamilyName: Boolean(identity.familyName),
+      hasGivenName: Boolean(identity.givenName),
+      hasBirthDate: Boolean(identity.birthDate),
+    });
+
+    return identity;
+  }
+
+  function buildLmStudioPatientIdentityUserContent(options = {}) {
+    const sourceText = truncateLmStudioDocumentText(options.sourceText || "");
+    const prompt = [
+      "Le panneau WEDA de recherche patient est ouvert parce que le patient du courrier n'a pas été identifié automatiquement.",
+      "Analyse le courrier et extrais uniquement l'identité du patient concerné par le document.",
+      "N'invente rien. Si une information est absente ou incertaine, laisse le champ vide.",
+      "Format obligatoire, sans texte autour :",
+      "<PATIENT_IDENTITE>",
+      "NOM: nom de famille du patient, en majuscules si possible",
+      "PRENOM: prénom usuel du patient",
+      "DATE_NAISSANCE: JJ/MM/AAAA si explicitement présent, sinon vide",
+      "</PATIENT_IDENTITE>",
+      "",
+      "COURRIER:",
+      sourceText || "[texte non disponible, utiliser les images jointes si présentes]",
+    ].join("\n");
+    const images = getLmStudioPdfPageImages(options);
+
+    if (!images.length) {
+      return prompt;
+    }
+
+    return [
+      {
+        type: "text",
+        text: `${prompt}\n\nIMPORTANT : si le texte est incomplet ou illisible, lis les images du courrier ci-dessous comme OCR visuel.`,
+      },
+      ...images.map((image) => ({
+        type: "image_url",
+        image_url: {
+          url: image.dataUrl,
+        },
+      })),
+    ];
+  }
+
+  function parseLmStudioPatientIdentityOutput(answer = "") {
+    const block = extractTaggedBlock(answer, "PATIENT_IDENTITE") || answer;
+    const fields = parseSimpleKeyValueBlock(block);
+
+    return normalizeWedaFindPatientIdentity({
+      familyName: fields.NOM || fields.NOM_PATIENT || fields.PATIENT_NOM || "",
+      givenName: fields.PRENOM || fields.PRENOM_PATIENT || fields.PATIENT_PRENOM || "",
+      birthDate: fields.DATE_NAISSANCE || fields.NAISSANCE || fields.DATE_DE_NAISSANCE || "",
+      source: "lmstudio",
+    });
+  }
+
+  function normalizeWedaFindPatientIdentity(identity = {}) {
+    let familyName = cleanWedaFindPatientNamePart(identity.familyName || identity.nom || "");
+    let givenName = cleanWedaFindPatientNamePart(identity.givenName || identity.prenom || "");
+    const fullName = cleanWedaFindPatientNamePart(identity.fullName || identity.patientLabel || "");
+
+    if ((!familyName || !givenName) && fullName) {
+      const parsed = parsePatientImportName(fullName);
+      familyName = familyName || parsed.familyName;
+      givenName = givenName || parsed.givenName;
+    }
+
+    if (!givenName && familyName.split(/\s+/).length >= 2) {
+      const parsed = parsePatientImportName(familyName);
+      familyName = parsed.familyName || familyName;
+      givenName = parsed.givenName || "";
+    }
+
+    familyName = cleanWedaFindPatientNamePart(familyName).toUpperCase();
+    givenName = cleanWedaFindPatientNamePart(givenName);
+    const birthDate = normalizePatientBirthDate(identity.birthDate || identity.dateNaissance || "");
+    const searchLabel = normalizeText([familyName, givenName].filter(Boolean).join(" "));
+
+    return {
+      familyName,
+      givenName,
+      birthDate,
+      searchLabel,
+      source: identity.source || "",
+    };
+  }
+
+  function cleanWedaFindPatientNamePart(value = "") {
+    return normalizeText(value)
+      .replace(/\b(?:m|mr|mme|madame|monsieur|mlle|melle)\.?\b/gi, "")
+      .replace(/\b(?:n[ée]e?|date\s+de\s+naissance|naissance|dob)\b[\s\S]*$/i, "")
+      .replace(/\b(?:nom|pr[eé]nom|patient|patiente|identit[ée]|b[ée]n[ée]ficiaire|assur[ée]e?|concerne)\b\s*[:\-]?/gi, "")
+      .replace(/[()[\]{}<>]/g, " ")
+      .replace(/\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}/g, "")
+      .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ' -]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function hasUsableWedaFindPatientIdentity(identity = {}) {
+    return Boolean(identity && identity.searchLabel && identity.familyName && (identity.givenName || identity.birthDate));
+  }
+
+  function hasExplicitWedaFindPatientIdentitySource(options = {}) {
+    return Boolean(
+      normalizePdfText([options.sourceText || "", options.documentText || "", options.tableText || ""].join("\n")).length ||
+      getLmStudioPdfPageImages(options).length
+    );
+  }
+
+  function buildWedaFindPatientRescueKey(options = {}, identity = {}) {
+    return [
+      options.jobId || "",
+      options.contentKey || "",
+      options.urlKey || "",
+      options.rowStableKey || "",
+      options.pdfUrl ? hashString(options.pdfUrl) : "",
+      hashString([identity.searchLabel || "", identity.birthDate || ""].join("|")),
+    ].filter(Boolean).join("|") || hashString(Date.now() + "|" + Math.random());
+  }
+
+  function collectWedaFindPatientGridCandidates() {
+    const grid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
+    if (!grid || !isElementVisible(grid)) {
+      return [];
+    }
+
+    return Array.from(grid.querySelectorAll("tr"))
+      .filter((row) => row && !row.classList.contains("grid-header"))
+      .map((row, index) => buildWedaFindPatientGridCandidate(row, index))
+      .filter((candidate) => candidate && candidate.link && (candidate.patientLabel || candidate.birthDate));
+  }
+
+  function buildWedaFindPatientGridCandidate(row, index) {
+    const cells = Array.from(row.children || []).filter((cell) => /^(?:td|th)$/i.test(cell.tagName || ""));
+    const patientLink = row.querySelector("a[id*='LinkButtonOldPatientGetNomPrenom']") ||
+      (cells[2] ? cells[2].querySelector("a") : null);
+    const birthDateLink = row.querySelector("a[id*='LinkButtonOldPatienDateNaissance']") ||
+      (cells[3] ? cells[3].querySelector("a") : null);
+    const maidenNameLink = row.querySelector("a[id*='LinkButtonOldPatientNomJeuneFille']") ||
+      (cells[6] ? cells[6].querySelector("a") : null);
+    const patientLabel = cleanPatientImportLabel(patientLink ? patientLink.textContent : (cells[2] ? cells[2].textContent : ""));
+    const birthDate = normalizePatientBirthDate(birthDateLink ? birthDateLink.textContent : (cells[3] ? cells[3].textContent : ""));
+    const maidenName = cleanPatientImportLabel(maidenNameLink ? maidenNameLink.textContent : (cells[6] ? cells[6].textContent : ""));
+
+    return {
+      row,
+      link: patientLink || row.querySelector("a[href*='WebForm_DoPostBackWithOptions']"),
+      index,
+      patientLabel,
+      birthDate,
+      maidenName,
+      nameParts: parsePatientImportName(patientLabel),
+    };
+  }
+
+  function resolveWedaFindPatientGridSelection(identity = {}, candidates = collectWedaFindPatientGridCandidates()) {
+    if (!candidates.length) {
+      return {
+        link: null,
+        blocked: false,
+        reason: "missing-results",
+        candidateCount: 0,
+      };
+    }
+
+    const scored = candidates
+      .map((candidate) => {
+        const score = scoreWedaFindPatientGridCandidate(candidate, identity);
+        return {
+          ...candidate,
+          score: score.value,
+          nameMatch: score.nameMatch,
+          birthDateMatch: score.birthDateMatch,
+        };
+      })
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+    const best = scored[0] || null;
+    const second = scored[1] || null;
+    const scoreGap = best && second ? best.score - second.score : best ? best.score : 0;
+    const birthMatches = scored.filter((candidate) => candidate.birthDateMatch);
+    const nameMatches = scored.filter((candidate) => candidate.nameMatch);
+    let selected = null;
+    let reason = "";
+
+    if (birthMatches.length === 1 && birthMatches[0].score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = birthMatches[0];
+      reason = "unique-birth-date";
+    } else if (nameMatches.length === 1 && nameMatches[0].score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = nameMatches[0];
+      reason = "unique-name";
+    } else if (scored.length === 1 && best.score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = best;
+      reason = "single-result";
+    } else if (
+      best &&
+      best.score >= WEDA_FIND_PATIENT_MIN_SCORE &&
+      (!second || scoreGap >= WEDA_FIND_PATIENT_AMBIGUITY_MARGIN)
+    ) {
+      selected = best;
+      reason = "best-score";
+    }
+
+    if (!selected) {
+      return {
+        link: null,
+        blocked: true,
+        reason: best && best.score > 0 ? "ambiguous-find-patient-selection" : "no-find-patient-match",
+        candidateCount: scored.length,
+        topScore: best ? best.score : 0,
+        scoreGap,
+        hasBirthDateHint: Boolean(identity.birthDate),
+      };
+    }
+
+    return {
+      link: selected.link,
+      reason,
+      candidateCount: scored.length,
+      selectedIndex: selected.index,
+      score: selected.score,
+      scoreGap,
+      birthDateMatch: selected.birthDateMatch,
+      nameMatch: selected.nameMatch,
+      patientLabel: selected.patientLabel || "",
+      birthDate: selected.birthDate || "",
+      maidenName: selected.maidenName || "",
+    };
+  }
+
+  function scoreWedaFindPatientGridCandidate(candidate = {}, identity = {}) {
+    let value = 0;
+    let nameMatch = false;
+    let birthDateMatch = false;
+    const labelText = normalizePatientCompareText([candidate.patientLabel, candidate.maidenName].filter(Boolean).join(" "));
+    const candidateName = candidate.nameParts || parsePatientImportName(candidate.patientLabel || "");
+    const candidateFamily = normalizePatientCompareText(candidateName.familyName || "").trim();
+    const candidateGiven = normalizePatientCompareText(candidateName.givenName || "").trim();
+    const family = normalizePatientCompareText(identity.familyName || "").trim();
+    const given = normalizePatientCompareText(identity.givenName || "").trim();
+    const full = normalizePatientCompareText(identity.searchLabel || "").trim();
+
+    if (identity.birthDate && candidate.birthDate === identity.birthDate) {
+      value += 1200;
+      birthDateMatch = true;
+    }
+
+    if (full && labelText.includes(` ${full} `)) {
+      value += 850;
+      nameMatch = true;
+    }
+
+    if (family && given && labelText.includes(` ${family} `) && labelText.includes(` ${given} `)) {
+      value += 650;
+      nameMatch = true;
+    }
+
+    if (family && candidateFamily === family) {
+      value += 260;
+      nameMatch = true;
+    } else if (family && labelText.includes(` ${family} `)) {
+      value += 160;
+    }
+
+    if (given && candidateGiven === given) {
+      value += 220;
+      nameMatch = true;
+    } else if (given && labelText.includes(` ${given} `)) {
+      value += 120;
+    }
+
+    return {
+      value,
+      nameMatch,
+      birthDateMatch,
+    };
+  }
+
+  function buildWedaFindPatientIssue(reason, identity = {}, candidateCount = 0, topScore = 0, scoreGap = 0) {
+    const message = reason === "ambiguous-find-patient-selection"
+      ? "Recherche patient WEDA bloquée : plusieurs patients restent plausibles."
+      : reason === "no-find-patient-match"
+        ? "Recherche patient WEDA bloquée : aucun résultat ne correspond clairement au courrier."
+        : "Recherche patient WEDA bloquée : impossible de sélectionner automatiquement le patient.";
+
+    return {
+      blocked: true,
+      reason,
+      at: Date.now(),
+      message,
+      candidateCount,
+      topScore,
+      scoreGap,
+      hasBirthDateHint: Boolean(identity.birthDate),
+      source: "find-patient-panel",
+    };
+  }
+
+  async function waitForWedaFindPatientSelectionApplied(options = {}) {
+    try {
+      await waitFor(() => !findWedaFindPatientPanel(), {
+        timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
+        interval: 400,
+        description: "la fermeture de la recherche patient WEDA",
+      });
+    } catch (_error) {
+      appendDebugLog("weda:find-patient-panel-still-open-after-click", {
+        reason: options.reason || "",
+        hasTitleInput: Boolean(findWedaTitleInput(options)),
+        candidateCount: collectWedaFindPatientGridCandidates().length,
+      });
+      return null;
+    }
+
+    await sleep(WEDA_FIND_PATIENT_SELECTION_SETTLE_MS);
+    return waitForOptionalTitleInput(TITLE_INPUT_WAIT_AFTER_PATIENT_MS, "le champ titre après recherche patient WEDA", options);
   }
 
   async function waitForOptionalTitleInput(timeout, description, options = {}) {
@@ -3840,6 +5471,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     let input = findWedaTitleInput(options);
 
     if (input) {
+      const findPatientPanel = findWedaFindPatientPanel();
+      const findPatientPanelActionable = Boolean(findPatientPanel && isWedaFindPatientPanelActionable(findPatientPanel));
+      if (findPatientPanel && findPatientPanelActionable && hasExplicitWedaFindPatientIdentitySource(options)) {
+        return rescueWedaFindPatientPanelWithDocumentIdentity({
+          ...options,
+          jobId,
+          reason: "ensure-title-input-existing-find-patient-panel",
+        });
+      }
+      if (findPatientPanel && !findPatientPanelActionable && hasExplicitWedaFindPatientIdentitySource(options)) {
+        appendDebugLog("weda:title-input-existing-find-patient-panel-non-actionable", {
+          jobId,
+          titleInputIndex: getWedaTitleInputIndex(input),
+          rowStableKey: options.rowStableKey || "",
+        });
+      }
       return input;
     }
 
@@ -3874,8 +5521,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       clickButtonLikeUser(importMessageLink);
 
       input = await waitForOptionalTitleInput(TITLE_INPUT_WAIT_AFTER_IMPORT_MS, "le champ titre après import du message", options);
-      if (input) {
+      if (input && !findWedaFindPatientPanel()) {
         return input;
+      }
+
+      if (findWedaFindPatientPanel()) {
+        input = await rescueWedaFindPatientPanelWithDocumentIdentity({
+          ...options,
+          jobId,
+          reason: "ensure-title-input-find-patient-panel",
+        });
+        if (input) {
+          return input;
+        }
       }
     } else if (importMessageSelection.blocked) {
       appendDebugLog("weda:import-message-selection-blocked", {
@@ -3945,8 +5603,41 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
 
     patientImportBeforePdfStableKey = row ? row.stableKey : "";
-    const input = await openPatientImportForCurrentMessage("", "before-pdf-missing-import-message");
+    const input = await openPatientImportForCurrentMessage("", "before-pdf-missing-import-message", {
+      rowStableKey: row ? row.stableKey : "",
+    });
+    const findPatientPanel = findWedaFindPatientPanel();
+    if (input && findPatientPanel) {
+      const findPatientPanelActionable = isWedaFindPatientPanelActionable(findPatientPanel);
+      appendDebugLog(findPatientPanelActionable
+        ? "weda:pre-pdf-find-patient-panel-with-title-input"
+        : "weda:pre-pdf-find-patient-panel-non-actionable-with-title-input", {
+        rowIndex: row ? row.index : null,
+        rowStableKey: row ? row.stableKey : "",
+        titleInputIndex: getWedaTitleInputIndex(input),
+      });
+      return {
+        patientImportOpened: true,
+        titleInputRequired: true,
+        pdfPerformanceStartTime: lastPatientImportPerformanceStartTime,
+        findPatientPanelPending: findPatientPanelActionable,
+      };
+    }
+
     if (!input) {
+      if (findWedaFindPatientPanel()) {
+        appendDebugLog("weda:pre-pdf-find-patient-panel-pending", {
+          rowIndex: row ? row.index : null,
+          rowStableKey: row ? row.stableKey : "",
+        });
+        return {
+          patientImportOpened: true,
+          titleInputRequired: true,
+          pdfPerformanceStartTime: lastPatientImportPerformanceStartTime,
+          findPatientPanelPending: true,
+        };
+      }
+
       const patientImportIssue = getLastPatientImportSelectionIssue();
       throw new Error(patientImportIssue && patientImportIssue.blocked
         ? patientImportIssue.message
@@ -4055,6 +5746,934 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       pdfUnusableReason: extracted.pdfUnusableReason || "",
       pdfTextPageCount: Number(extracted.pdfTextPageCount || 0),
     };
+  }
+
+  async function handleStrictDuplicateDisplayedDocument(row, displayedDocument, documentText = "", rows = getBiologyRows()) {
+    if (!row || !displayedDocument || !displayedDocument.pdfUrl) {
+      return false;
+    }
+
+    const fingerprint = await buildStrictDuplicatePdfFingerprint(displayedDocument, documentText, row);
+    if (!fingerprint || !fingerprint.ok) {
+      return false;
+    }
+
+    const registry = getWedaDuplicatePdfRegistry();
+    const previousMatch = findWedaDuplicatePdfPreviousMatch(registry, fingerprint, row);
+    const previousEntry = previousMatch ? previousMatch.entry : null;
+
+    if (!previousEntry) {
+      const sameRowRegistered = hasSameWedaDuplicateRowRegistered(registry, fingerprint, row);
+      registerWedaDuplicatePdfFingerprint(registry, row, displayedDocument, fingerprint);
+      saveWedaDuplicatePdfRegistry(registry);
+      appendDebugLog(sameRowRegistered ? "weda:duplicate-pdf-registry-refreshed" : "weda:duplicate-pdf-registered", {
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+        keys: fingerprint.keys || [],
+        byteLength: fingerprint.byteLength,
+        textHash: fingerprint.textHash || "",
+        textLength: fingerprint.textLength || 0,
+        textDuplicateKey: fingerprint.textKey || "",
+        contentKey: fingerprint.contentKey || "",
+        sourceType: fingerprint.sourceType || "",
+      });
+      return false;
+    }
+
+    if (!isStrictDuplicatePdfFingerprintMatch(previousEntry, fingerprint)) {
+      appendDebugLog("weda:duplicate-pdf-hash-collision-ignored", {
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        previousRowIndex: previousEntry.rowIndex,
+        previousRowStableKey: previousEntry.rowStableKey || "",
+        key: previousMatch.key || fingerprint.key,
+        byteLength: fingerprint.byteLength,
+        previousByteLength: previousEntry.byteLength || 0,
+        textHash: fingerprint.textHash || "",
+        previousTextHash: previousEntry.textHash || "",
+        textLength: fingerprint.textLength || 0,
+        previousTextLength: previousEntry.textLength || 0,
+      });
+      return false;
+    }
+
+    const currentIsOlder = isCurrentWedaRowOlderThanDuplicateEntry(row, previousEntry);
+    const previousIsOlder = isWedaDuplicateEntryOlderThanCurrentRow(previousEntry, row);
+    const matchMode = getStrictDuplicatePdfFingerprintMatchMode(previousEntry, fingerprint);
+
+    appendDebugLog("weda:duplicate-pdf-strict-match", {
+      rowIndex: row.index,
+      rowStableKey: row.stableKey,
+      previousRowIndex: previousEntry.rowIndex,
+      previousRowStableKey: previousEntry.rowStableKey || "",
+      key: previousMatch.key || fingerprint.key,
+      matchMode,
+      byteLength: fingerprint.byteLength,
+      previousByteLength: previousEntry.byteLength || 0,
+      textLength: fingerprint.textLength || 0,
+      previousTextLength: previousEntry.textLength || 0,
+      currentIsOlder,
+      previousIsOlder,
+      currentDate: row.date || "",
+      previousDate: previousEntry.rowDate || "",
+    });
+
+    if (currentIsOlder) {
+      const deleted = await deleteCurrentStrictDuplicateRow(row, previousEntry, fingerprint, rows);
+      if (deleted) {
+        return true;
+      }
+
+      appendDebugLog("weda:duplicate-pdf-delete-failed-continue-analysis", {
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    if (previousIsOlder) {
+      registerWedaDuplicatePdfFingerprint(registry, row, displayedDocument, fingerprint);
+      saveWedaDuplicatePdfRegistry(registry);
+      appendDebugLog("weda:duplicate-pdf-older-previous-not-deleted", {
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        previousRowIndex: previousEntry.rowIndex,
+        previousRowStableKey: previousEntry.rowStableKey || "",
+        key: previousMatch.key || fingerprint.key,
+        matchMode,
+        reason: "older-row-not-current",
+      });
+      return false;
+    }
+
+    appendDebugLog("weda:duplicate-pdf-age-ambiguous-no-delete", {
+      rowIndex: row.index,
+      rowStableKey: row.stableKey,
+      previousRowIndex: previousEntry.rowIndex,
+      previousRowStableKey: previousEntry.rowStableKey || "",
+      key: fingerprint.key,
+      currentDate: row.date || "",
+      previousDate: previousEntry.rowDate || "",
+    });
+    return false;
+  }
+
+  async function buildStrictDuplicatePdfFingerprint(displayedDocument, documentText = "", row = null) {
+    try {
+      const pdfUrl = displayedDocument && displayedDocument.pdfUrl || "";
+      if (!pdfUrl) {
+        return { ok: false, reason: "missing-pdf-url" };
+      }
+
+      const bytes = await fetchPdfBytes(pdfUrl);
+      abortIfWorkflowStopped();
+
+      const byteLength = bytes.length || 0;
+      const header = bytesToAscii(bytes.slice(0, 5));
+      if (byteLength < WEDA_STRICT_DUPLICATE_MIN_PDF_BYTES || header !== "%PDF-") {
+        appendDebugLog("weda:duplicate-pdf-fingerprint-skipped", {
+          rowIndex: row ? row.index : null,
+          reason: header === "%PDF-" ? "too-small" : "not-a-pdf",
+          byteLength,
+          header,
+        });
+        return { ok: false, reason: header === "%PDF-" ? "too-small" : "not-a-pdf" };
+      }
+
+      const byteHash = await hashBytes(bytes);
+      const normalizedText = normalizePdfText(documentText);
+      const textAllowed = isStrictDuplicatePdfTextFingerprintAllowed(displayedDocument, normalizedText);
+      const textHash = textAllowed ? await hashText(normalizedText) : "";
+      const byteKey = byteHash ? "pdfsha256-" + byteHash : "";
+      const textKey = textHash ? "pdftextsha256-" + textHash : "";
+
+      return {
+        ok: Boolean(byteKey || textKey),
+        key: byteKey || textKey,
+        byteKey,
+        textKey,
+        keys: getStrictDuplicatePdfFingerprintKeys({
+          byteKey,
+          textKey,
+        }),
+        byteHash,
+        byteLength,
+        textHash,
+        textLength: normalizedText.length,
+        textAllowed,
+        urlKey: displayedDocument.urlKey || (pdfUrl ? "pdfurl-" + hashString(pdfUrl) : ""),
+        contentKey: displayedDocument.contentKey || "",
+        sourceType: displayedDocument.sourceType || "",
+        pdfTextExtractionSparse: Boolean(displayedDocument.pdfTextExtractionSparse),
+        pdfTextExtractionGarbled: Boolean(displayedDocument.pdfTextExtractionGarbled),
+        pdfTextUnusable: Boolean(displayedDocument.pdfTextUnusable),
+        pdfTextPageCount: Number(displayedDocument.pdfTextPageCount || 0),
+      };
+    } catch (error) {
+      appendDebugLog("weda:duplicate-pdf-fingerprint-error", {
+        rowIndex: row ? row.index : null,
+        rowStableKey: row ? row.stableKey : "",
+        error: error && error.message ? error.message : String(error),
+      });
+      return { ok: false, reason: "fingerprint-error" };
+    }
+  }
+
+  function isStrictDuplicatePdfTextFingerprintAllowed(displayedDocument = {}, normalizedText = "") {
+    return Boolean(
+      normalizedText &&
+      normalizedText.length >= WEDA_STRICT_DUPLICATE_MIN_TEXT_CHARS &&
+      displayedDocument.sourceType === "pdf" &&
+      !displayedDocument.pdfTextExtractionEmpty &&
+      !displayedDocument.pdfTextExtractionSparse &&
+      !displayedDocument.pdfTextExtractionGarbled &&
+      !displayedDocument.pdfTextUnusable
+    );
+  }
+
+  async function hashBytes(bytes) {
+    const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+
+    if (typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.digest === "function") {
+      const buffer = source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
+      const digest = await crypto.subtle.digest("SHA-256", buffer);
+      return bytesToHex(new Uint8Array(digest));
+    }
+
+    return "fallback-" + hashString(uint8ArrayToBase64(source));
+  }
+
+  async function hashText(value = "") {
+    const text = String(value || "");
+    if (!text) {
+      return "";
+    }
+
+    if (typeof TextEncoder !== "undefined") {
+      return hashBytes(new TextEncoder().encode(text));
+    }
+
+    return "fallback-" + hashString(text);
+  }
+
+  function bytesToHex(bytes) {
+    return Array.from(bytes || [])
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  function getWedaDuplicatePdfRegistry() {
+    const registry = GM_getValue(DUPLICATE_PDF_REGISTRY_KEY, {});
+    return registry && typeof registry === "object" && !Array.isArray(registry) ? registry : {};
+  }
+
+  function saveWedaDuplicatePdfRegistry(registry) {
+    GM_setValue(DUPLICATE_PDF_REGISTRY_KEY, registry && typeof registry === "object" ? registry : {});
+  }
+
+  function resetWedaDuplicatePdfRegistry(reason = "") {
+    GM_deleteValue(DUPLICATE_PDF_REGISTRY_KEY);
+    appendDebugLog("weda:duplicate-pdf-registry-reset", { reason });
+  }
+
+  function buildWedaDuplicatePdfRegistryEntry(row, displayedDocument, fingerprint) {
+    return {
+      key: fingerprint.key,
+      byteKey: fingerprint.byteKey || "",
+      textKey: fingerprint.textKey || "",
+      keys: fingerprint.keys || [],
+      byteHash: fingerprint.byteHash,
+      byteLength: fingerprint.byteLength,
+      textHash: fingerprint.textHash || "",
+      textLength: fingerprint.textLength || 0,
+      textAllowed: Boolean(fingerprint.textAllowed),
+      contentKey: fingerprint.contentKey || displayedDocument.contentKey || "",
+      urlKey: fingerprint.urlKey || displayedDocument.urlKey || "",
+      sourceType: fingerprint.sourceType || displayedDocument.sourceType || "",
+      pdfTextExtractionSparse: Boolean(fingerprint.pdfTextExtractionSparse),
+      pdfTextExtractionGarbled: Boolean(fingerprint.pdfTextExtractionGarbled),
+      pdfTextUnusable: Boolean(fingerprint.pdfTextUnusable),
+      pdfTextPageCount: Number(fingerprint.pdfTextPageCount || displayedDocument.pdfTextPageCount || 0),
+      rowIndex: row ? row.index : null,
+      rowKey: row ? row.key || "" : "",
+      rowStableKey: row ? row.stableKey || "" : "",
+      rowIdentity: row ? row.identityLabel || "" : "",
+      rowDate: row ? row.date || "" : "",
+      rowAgeTimestamp: row ? parseWedaMessageDateTimestamp(row.date || "") : null,
+      pdfUrlHash: hashString(displayedDocument && displayedDocument.pdfUrl || ""),
+      registeredAt: Date.now(),
+    };
+  }
+
+  function registerWedaDuplicatePdfFingerprint(registry, row, displayedDocument, fingerprint) {
+    const entry = buildWedaDuplicatePdfRegistryEntry(row, displayedDocument, fingerprint);
+    getStrictDuplicatePdfFingerprintKeys(fingerprint).forEach((key) => {
+      registry[key] = {
+        ...entry,
+        registryKey: key,
+      };
+    });
+    return entry;
+  }
+
+  function getStrictDuplicatePdfFingerprintKeys(fingerprint = {}) {
+    return Array.from(new Set([
+      fingerprint.byteKey || fingerprint.key || "",
+      fingerprint.textKey || "",
+    ].filter(Boolean)));
+  }
+
+  function findWedaDuplicatePdfPreviousMatch(registry = {}, fingerprint = {}, row = null) {
+    for (const key of getStrictDuplicatePdfFingerprintKeys(fingerprint)) {
+      const entry = registry[key];
+      if (entry && !isSameWedaDuplicateRow(entry, row)) {
+        return {
+          key,
+          entry,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function hasSameWedaDuplicateRowRegistered(registry = {}, fingerprint = {}, row = null) {
+    return getStrictDuplicatePdfFingerprintKeys(fingerprint)
+      .some((key) => registry[key] && isSameWedaDuplicateRow(registry[key], row));
+  }
+
+  function isSameWedaDuplicateRow(entry = {}, row = null) {
+    if (!entry || !row) {
+      return false;
+    }
+
+    return Boolean(
+      (entry.rowKey && row.key && entry.rowKey === row.key) ||
+      (entry.rowStableKey && row.stableKey && entry.rowStableKey === row.stableKey && Number(entry.rowIndex) === Number(row.index))
+    );
+  }
+
+  function isStrictDuplicatePdfFingerprintMatch(entry = {}, fingerprint = {}) {
+    if (!entry || !fingerprint) {
+      return false;
+    }
+
+    return Boolean(getStrictDuplicatePdfFingerprintMatchMode(entry, fingerprint));
+  }
+
+  function getStrictDuplicatePdfFingerprintMatchMode(entry = {}, fingerprint = {}) {
+    if (isStrictDuplicatePdfBinaryMatch(entry, fingerprint)) {
+      return "binary";
+    }
+
+    if (isStrictDuplicatePdfTextMatch(entry, fingerprint)) {
+      return "text";
+    }
+
+    return "";
+  }
+
+  function isStrictDuplicatePdfBinaryMatch(entry = {}, fingerprint = {}) {
+    return Boolean(
+      entry.byteHash &&
+      fingerprint.byteHash &&
+      entry.byteHash === fingerprint.byteHash &&
+      Number(entry.byteLength || 0) === Number(fingerprint.byteLength || 0)
+    );
+  }
+
+  function isStrictDuplicatePdfTextMatch(entry = {}, fingerprint = {}) {
+    if (
+      !entry.textAllowed ||
+      !fingerprint.textAllowed ||
+      !entry.textHash ||
+      !fingerprint.textHash ||
+      entry.textHash !== fingerprint.textHash
+    ) {
+      return false;
+    }
+
+    if (
+      Number(entry.textLength || 0) < WEDA_STRICT_DUPLICATE_MIN_TEXT_CHARS ||
+      Number(fingerprint.textLength || 0) < WEDA_STRICT_DUPLICATE_MIN_TEXT_CHARS
+    ) {
+      return false;
+    }
+
+    if (entry.sourceType !== "pdf" || fingerprint.sourceType !== "pdf") {
+      return false;
+    }
+
+    if (
+      entry.pdfTextExtractionSparse ||
+      fingerprint.pdfTextExtractionSparse ||
+      entry.pdfTextExtractionGarbled ||
+      fingerprint.pdfTextExtractionGarbled ||
+      entry.pdfTextUnusable ||
+      fingerprint.pdfTextUnusable
+    ) {
+      return false;
+    }
+
+    const entryPageCount = Number(entry.pdfTextPageCount || 0);
+    const fingerprintPageCount = Number(fingerprint.pdfTextPageCount || 0);
+    return !(entryPageCount && fingerprintPageCount && entryPageCount !== fingerprintPageCount);
+  }
+
+  function isCurrentWedaRowOlderThanDuplicateEntry(row, entry = {}) {
+    const currentTimestamp = parseWedaMessageDateTimestamp(row && row.date || "");
+    const previousTimestamp = Number(entry.rowAgeTimestamp || 0);
+
+    if (currentTimestamp && previousTimestamp && currentTimestamp !== previousTimestamp) {
+      return currentTimestamp < previousTimestamp;
+    }
+
+    const currentIndex = Number(row && row.index);
+    const previousIndex = Number(entry.rowIndex);
+    return Number.isFinite(currentIndex) && Number.isFinite(previousIndex) && currentIndex > previousIndex;
+  }
+
+  function isWedaDuplicateEntryOlderThanCurrentRow(entry = {}, row = null) {
+    const currentTimestamp = parseWedaMessageDateTimestamp(row && row.date || "");
+    const previousTimestamp = Number(entry.rowAgeTimestamp || 0);
+
+    if (currentTimestamp && previousTimestamp && currentTimestamp !== previousTimestamp) {
+      return previousTimestamp < currentTimestamp;
+    }
+
+    const currentIndex = Number(row && row.index);
+    const previousIndex = Number(entry.rowIndex);
+    return Number.isFinite(currentIndex) && Number.isFinite(previousIndex) && previousIndex > currentIndex;
+  }
+
+  function parseWedaMessageDateTimestamp(value = "") {
+    const raw = normalizeText(value);
+    if (!raw) {
+      return 0;
+    }
+
+    const normalized = normalizeForCompare(raw);
+    const timeMatch = raw.match(/\b(\d{1,2})[:h](\d{2})\b/i);
+    const hour = timeMatch ? Number(timeMatch[1]) : 0;
+    const minute = timeMatch ? Number(timeMatch[2]) : 0;
+    const setTime = (date) => {
+      date.setHours(Number.isFinite(hour) ? hour : 0, Number.isFinite(minute) ? minute : 0, 0, 0);
+      return date.getTime();
+    };
+
+    if (/\baujourd/.test(normalized)) {
+      return setTime(new Date());
+    }
+
+    if (/\bhier\b/.test(normalized)) {
+      const date = new Date();
+      date.setDate(date.getDate() - 1);
+      return setTime(date);
+    }
+
+    const dateMatch = raw.match(/\b(\d{1,2})[\/.-](\d{1,2})(?:[\/.-](\d{2,4}))?\b/);
+    if (!dateMatch) {
+      const parsed = Date.parse(raw);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    const day = Number(dateMatch[1]);
+    const month = Number(dateMatch[2]);
+    let year = dateMatch[3] ? Number(dateMatch[3]) : new Date().getFullYear();
+
+    if (year < 100) {
+      year += year >= 30 ? 1900 : 2000;
+    }
+
+    if (!day || !month || day > 31 || month > 12 || !year) {
+      return 0;
+    }
+
+    return setTime(new Date(year, month - 1, day));
+  }
+
+  async function deleteCurrentStrictDuplicateRow(row, previousEntry, fingerprint, rows = getBiologyRows()) {
+    if (!row || !row.row || !document.contains(row.row)) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "row-missing",
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    if (findWedaFindPatientPanel()) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "find-patient-panel-open",
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    const checkbox = findWedaMessageRowCheckbox(row);
+    const otherChecked = getCheckedWedaMessageListCheckboxes()
+      .filter((candidate) => candidate !== checkbox);
+
+    if (!checkbox || !isElementVisible(checkbox)) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "checkbox-missing",
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    if (otherChecked.length) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "other-checkboxes-selected",
+        rowIndex: row.index,
+        selectedCount: otherChecked.length + 1,
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    const wasChecked = isWedaCheckboxChecked(checkbox);
+    if (!wasChecked && !await setWedaCheckboxChecked(checkbox, true)) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "checkbox-not-checked",
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+      });
+      return false;
+    }
+
+    const deleteLink = await waitForWedaDeleteSelectedMessagesLink();
+    if (!deleteLink) {
+      appendDebugLog("weda:duplicate-delete-skip", {
+        reason: "delete-link-missing-after-checkbox",
+        rowIndex: row.index,
+        rowStableKey: row.stableKey,
+        key: fingerprint.key,
+        candidates: getWedaDeleteSelectedMessagesCandidateSummaries(),
+      });
+
+      if (!wasChecked && document.contains(checkbox) && isWedaCheckboxChecked(checkbox)) {
+        await setWedaCheckboxChecked(checkbox, false);
+      }
+
+      return false;
+    }
+
+    const previousState = getState();
+    const beforeSnapshot = buildWedaMessageListSnapshot();
+    const beforeRowsLength = rows.length || getBiologyRows().length;
+
+    setState({
+      running: true,
+      phase: "deletingDuplicate",
+      currentIndex: row.index,
+      currentRowKey: row.key,
+      currentStableKey: row.stableKey,
+      currentJobId: null,
+      message: "Doublon strict détecté : suppression du courrier le plus ancien...",
+    });
+
+    appendDebugLog("weda:duplicate-delete-click", {
+      rowIndex: row.index,
+      rowStableKey: row.stableKey,
+      previousRowIndex: previousEntry.rowIndex,
+      previousRowStableKey: previousEntry.rowStableKey || "",
+      key: fingerprint.key,
+      byteLength: fingerprint.byteLength,
+    });
+
+    clickWedaDeleteLinkWithTemporaryConfirm(deleteLink);
+
+    let deleted = false;
+    try {
+      await waitFor(() => {
+        const currentSnapshot = buildWedaMessageListSnapshot();
+        return !document.contains(row.row) ||
+          getBiologyRows().length < beforeRowsLength ||
+          (beforeSnapshot && currentSnapshot && beforeSnapshot !== currentSnapshot && !document.contains(row.row));
+      }, {
+        timeout: WEDA_STRICT_DUPLICATE_DELETE_WAIT_MS,
+        interval: 350,
+        description: "la suppression du courrier doublon",
+      });
+      deleted = true;
+    } catch (_error) {
+      deleted = !document.contains(row.row) || getBiologyRows().length < beforeRowsLength;
+    }
+
+    if (!deleted) {
+      if (!wasChecked && document.contains(checkbox) && isWedaCheckboxChecked(checkbox)) {
+        await setWedaCheckboxChecked(checkbox, false);
+      }
+
+      setState({
+        running: previousState.running,
+        phase: previousState.phase || "clickedRow",
+        currentIndex: previousState.currentIndex,
+        currentRowKey: previousState.currentRowKey,
+        currentStableKey: previousState.currentStableKey,
+        currentJobId: previousState.currentJobId || null,
+        message: "Suppression du doublon non confirmée : analyse conservée.",
+      });
+      return false;
+    }
+
+    appendDebugLog("weda:duplicate-delete-done", {
+      rowIndex: row.index,
+      rowStableKey: row.stableKey,
+      key: fingerprint.key,
+      remainingRows: getBiologyRows().length,
+    });
+
+    markRowSeen(row.key || row.stableKey);
+    await sleep(WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS);
+    continueAfterStrictDuplicateDeletion();
+    return true;
+  }
+
+  function findWedaMessageRowCheckbox(row) {
+    const element = row && row.row;
+    if (!element || typeof element.querySelector !== "function") {
+      return null;
+    }
+
+    return element.querySelector('input[type="checkbox"]') || null;
+  }
+
+  function getCheckedWedaMessageListCheckboxes() {
+    const list = document.querySelector(MESSAGE_LIST_SELECTOR) || document;
+    return Array.from(list.querySelectorAll('input[type="checkbox"]'))
+      .filter(isWedaCheckboxChecked);
+  }
+
+  function isWedaCheckboxChecked(checkbox) {
+    return Boolean(checkbox && checkbox.checked);
+  }
+
+  async function setWedaCheckboxChecked(checkbox, checked) {
+    if (!checkbox || checkbox.disabled) {
+      return false;
+    }
+
+    if (isWedaCheckboxChecked(checkbox) === Boolean(checked)) {
+      return true;
+    }
+
+    try {
+      checkbox.scrollIntoView({ block: "center", inline: "nearest" });
+    } catch (_error) {
+      // Le clic reste tenté même si le défilement échoue.
+    }
+
+    dispatchPointerLikeEvents(checkbox);
+    if (isWedaCheckboxChecked(checkbox) !== Boolean(checked)) {
+      try {
+        checkbox.click();
+      } catch (_error) {
+        // Les événements pointeur ci-dessus peuvent suffire.
+      }
+    }
+
+    if (await waitForCheckboxState(checkbox, checked, 900)) {
+      return true;
+    }
+
+    setNativeCheckboxChecked(checkbox, checked);
+    checkbox.dispatchEvent(new Event("input", { bubbles: true }));
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    return waitForCheckboxState(checkbox, checked, 900);
+  }
+
+  function setNativeCheckboxChecked(checkbox, checked) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+
+    if (descriptor && typeof descriptor.set === "function") {
+      descriptor.set.call(checkbox, Boolean(checked));
+    } else {
+      checkbox.checked = Boolean(checked);
+    }
+  }
+
+  async function waitForCheckboxState(checkbox, checked, timeoutMs = 900) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt <= timeoutMs) {
+      if (!document.contains(checkbox) || isWedaCheckboxChecked(checkbox) === Boolean(checked)) {
+        return true;
+      }
+      await sleep(80);
+    }
+    return isWedaCheckboxChecked(checkbox) === Boolean(checked);
+  }
+
+  async function waitForWedaDeleteSelectedMessagesLink(timeoutMs = 2500) {
+    try {
+      return await waitFor(() => findWedaDeleteSelectedMessagesLink(), {
+        timeout: timeoutMs,
+        interval: 150,
+        description: "le bouton Supprimer les messages selectionnes",
+      });
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function findWedaDeleteSelectedMessagesLink() {
+    const exact = document.querySelector(DELETE_SELECTED_MESSAGES_SELECTOR);
+    if (exact && isElementVisible(exact)) {
+      return exact;
+    }
+
+    const candidates = collectWedaDeleteSelectedMessagesCandidates()
+      .map((element, index) => ({
+        element,
+        index,
+        score: scoreWedaDeleteSelectedMessagesCandidate(element),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return candidates[0] ? candidates[0].element : null;
+  }
+
+  function collectWedaDeleteSelectedMessagesCandidates() {
+    const containers = [
+      ...Array.from(document.querySelectorAll("#weInboxContainer .messageListToolsContainer, .messageListToolsContainer")),
+      document.querySelector("#weInboxContainer"),
+    ].filter(Boolean)
+      .filter((container, index, list) => list.indexOf(container) === index);
+
+    return containers.flatMap((container) => Array.from(container.querySelectorAll([
+      "a",
+      "button",
+      "[role='button']",
+      "[onclick]",
+      "[title]",
+      "[aria-label]",
+    ].join(","))))
+      .filter((element, index, list) => element && list.indexOf(element) === index)
+      .filter((element) => isElementVisible(element))
+      .filter((element) => !(element.closest && element.closest("#messageContainer")));
+  }
+
+  function scoreWedaDeleteSelectedMessagesCandidate(element) {
+    const descriptor = normalizeForCompare(getWedaDeleteSelectedMessagesCandidateDescriptor(element));
+    if (!descriptor) {
+      return 0;
+    }
+
+    let score = 0;
+    if (/\b(?:supprim|effac|delete|remove|trash|corbeille|poubelle)\w*\b/.test(descriptor)) {
+      score += 1000;
+    }
+
+    if (/\b(?:message|messages|courrier|courriers|selection|selectionnes|selected)\b/.test(descriptor)) {
+      score += 180;
+    }
+
+    if (element.closest && element.closest(".messageListToolsContainer")) {
+      score += 500;
+    }
+
+    if (/targetsupprimer|delete|remove|trash|corbeille|poubelle/.test(descriptor)) {
+      score += 250;
+    }
+
+    return score;
+  }
+
+  function getWedaDeleteSelectedMessagesCandidateDescriptor(element) {
+    if (!element) {
+      return "";
+    }
+
+    const values = [
+      element.textContent || "",
+      element.getAttribute("title") || "",
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("id") || "",
+      element.getAttribute("class") || "",
+      element.getAttribute("href") || "",
+      element.getAttribute("onclick") || "",
+    ];
+
+    Array.from(element.querySelectorAll ? element.querySelectorAll("img, svg, use") : [])
+      .forEach((child) => {
+        values.push(
+          child.getAttribute("title") || "",
+          child.getAttribute("alt") || "",
+          child.getAttribute("aria-label") || "",
+          child.getAttribute("src") || "",
+          child.getAttribute("href") || "",
+          child.getAttribute("xlink:href") || "",
+          child.getAttribute("class") || ""
+        );
+      });
+
+    return normalizeText(values.filter(Boolean).join(" "));
+  }
+
+  function getWedaDeleteSelectedMessagesCandidateSummaries() {
+    return collectWedaDeleteSelectedMessagesCandidates()
+      .slice(0, 12)
+      .map((element) => ({
+        tag: element.tagName || "",
+        id: element.id || "",
+        className: String(element.className || ""),
+        descriptor: getWedaDeleteSelectedMessagesCandidateDescriptor(element).slice(0, 180),
+        score: scoreWedaDeleteSelectedMessagesCandidate(element),
+      }));
+  }
+
+  function clickWedaDeleteLinkWithTemporaryConfirm(deleteLink) {
+    const restoreConfirm = installTemporaryDuplicateDeleteConfirm();
+    try {
+      clickButtonLikeUser(deleteLink);
+    } finally {
+      window.setTimeout(restoreConfirm, WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS);
+    }
+  }
+
+  function installTemporaryDuplicateDeleteConfirm() {
+    const pageWindow = getPageWindow();
+    const originalWindowConfirm = window.confirm;
+    const originalPageConfirm = pageWindow && pageWindow !== window ? pageWindow.confirm : null;
+    let restored = false;
+
+    const confirmHandler = (message) => {
+      const text = normalizeForCompare(message || "");
+      const accepted = !text || /(?:supprim|effac|delete)/.test(text);
+      appendDebugLog("weda:duplicate-delete-confirm", {
+        accepted,
+        text: sanitizeDebugString(String(message || ""), 180),
+      });
+
+      if (accepted) {
+        return true;
+      }
+
+      return typeof originalWindowConfirm === "function" ? originalWindowConfirm.call(window, message) : false;
+    };
+
+    try {
+      window.confirm = confirmHandler;
+    } catch (_error) {
+      // Certains contextes refusent la réassignation, le clic reste tenté.
+    }
+
+    if (pageWindow && pageWindow !== window) {
+      try {
+        pageWindow.confirm = confirmHandler;
+      } catch (_error) {
+        // Best effort pour les handlers WEDA exécutés dans unsafeWindow.
+      }
+    }
+
+    return () => {
+      if (restored) {
+        return;
+      }
+      restored = true;
+
+      try {
+        window.confirm = originalWindowConfirm;
+      } catch (_error) {
+        // Rien à restaurer si le contexte refuse.
+      }
+
+      if (pageWindow && pageWindow !== window && originalPageConfirm) {
+        try {
+          pageWindow.confirm = originalPageConfirm;
+        } catch (_error) {
+          // Best effort.
+        }
+      }
+    };
+  }
+
+  function buildWedaMessageListSnapshot() {
+    return getBiologyRows()
+      .map((item) => [item.index, item.key, item.stableKey, item.date, item.identityLabel].join(":"))
+      .join("|");
+  }
+
+  function continueAfterStrictDuplicateDeletion() {
+    const state = getState();
+    if (!state.running || state.phase !== "deletingDuplicate") {
+      return;
+    }
+
+    markRowSeen(state.currentRowKey || state.currentStableKey);
+
+    if (state.mode === "auto") {
+      const nextAutoIndex = findNextAutoRowIndex(state);
+
+      if (nextAutoIndex < 0) {
+        finishAutoCycle("Veille auto : doublon strict supprimé, aucun nouveau courrier restant.");
+        return;
+      }
+
+      setState({
+        running: true,
+        mode: "auto",
+        phase: "readyToClick",
+        currentIndex: nextAutoIndex,
+        currentRowKey: null,
+        currentStableKey: null,
+        currentContentKey: null,
+        currentPdfUrl: "",
+        currentUrlKey: "",
+        allowUnchangedContentKey: "",
+        previousContentKey: null,
+        currentJobId: null,
+        manualTargetKeys: [],
+        message: "Doublon strict supprimé : passage au courrier suivant...",
+      });
+
+      clickBiologyRow(nextAutoIndex);
+      return;
+    }
+
+    const rows = getBiologyRows();
+    const deletedIndex = Number.isFinite(Number(state.currentIndex)) ? Number(state.currentIndex) : 0;
+    const nextIndex = Math.min(Math.max(0, deletedIndex), rows.length - 1);
+
+    if (nextIndex < 0 || !rows.length) {
+      resetWedaDuplicatePdfRegistry("manual-finished-after-duplicate-delete");
+      setState({
+        running: false,
+        mode: "manual",
+        phase: "done",
+        currentJobId: null,
+        manualTargetKeys: [],
+        message: "Terminé : doublon strict supprimé, aucun courrier restant.",
+      });
+      scheduleAutoRefresh();
+      return;
+    }
+
+    setState({
+      running: true,
+      mode: "manual",
+      phase: "readyToClick",
+      currentIndex: nextIndex,
+      currentRowKey: null,
+      currentStableKey: null,
+      currentContentKey: null,
+      currentPdfUrl: "",
+      currentUrlKey: "",
+      allowUnchangedContentKey: "",
+      previousContentKey: null,
+      currentJobId: null,
+      message: "Doublon strict supprimé : reprise au courrier suivant...",
+    });
+
+    clickBiologyRow(nextIndex);
   }
 
   function getCurrentPerformanceTime() {
@@ -5210,10 +7829,363 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
   }
 
+  function setupManualArchiveNextNavigation() {
+    if (document.__wbhManualArchiveNextNavigation) {
+      return;
+    }
+    document.__wbhManualArchiveNextNavigation = true;
+
+    document.addEventListener("click", (event) => {
+      const state = getState();
+      if (state.running) {
+        return;
+      }
+
+      const archiveControl = findManualArchiveCourierControlFromTarget(event.target);
+      if (!archiveControl) {
+        return;
+      }
+
+      scheduleManualArchiveNextNavigation(archiveControl);
+    }, true);
+  }
+
+  function findManualArchiveCourierControlFromTarget(target) {
+    let element = target && target.nodeType === 1 ? target : target && target.parentElement;
+    const candidates = [];
+
+    while (element && element !== document.body) {
+      if (isManualArchiveClickableCandidate(element)) {
+        candidates.push(element);
+      }
+      element = element.parentElement;
+    }
+
+    return candidates.find(isManualArchiveCourierControl) || null;
+  }
+
+  function isManualArchiveClickableCandidate(element) {
+    if (!element || typeof element.matches !== "function") {
+      return false;
+    }
+
+    try {
+      return element.matches("button, a, [role='button'], [onclick], .btnImport, .targetSupprimer, input[type='button'], input[type='submit']");
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function isManualArchiveCourierControl(element) {
+    if (!element || !isElementVisible(element) || !(element.closest && element.closest("#messageContainer"))) {
+      return false;
+    }
+
+    const descriptor = normalizeForCompare(getManualArchiveControlDescriptor(element));
+    if (!descriptor || !/\barchiv\w*\b/.test(descriptor)) {
+      return false;
+    }
+
+    return !/(?:desarchiv|desarchiv|supprim|delete|effac|patient|antecedent|ant[eé]c[eé]dent)/.test(descriptor);
+  }
+
+  function getManualArchiveControlDescriptor(element) {
+    if (!element) {
+      return "";
+    }
+
+    const values = [
+      element.textContent || "",
+      element.getAttribute("value") || "",
+      element.getAttribute("title") || "",
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("id") || "",
+      element.getAttribute("class") || "",
+      element.getAttribute("href") || "",
+      element.getAttribute("onclick") || "",
+    ];
+
+    Array.from(element.querySelectorAll ? element.querySelectorAll("img, svg, use") : [])
+      .forEach((child) => {
+        values.push(
+          child.getAttribute("title") || "",
+          child.getAttribute("alt") || "",
+          child.getAttribute("aria-label") || "",
+          child.getAttribute("src") || "",
+          child.getAttribute("href") || "",
+          child.getAttribute("xlink:href") || "",
+          child.getAttribute("class") || ""
+        );
+      });
+
+    return normalizeText(values.filter(Boolean).join(" "));
+  }
+
+  function scheduleManualArchiveNextNavigation(archiveControl) {
+    const item = getStrictSelectedBiologyItem() || getSelectedBiologyItem();
+    const rows = getBiologyRows();
+
+    if (!item || !rows.length) {
+      return;
+    }
+
+    const snapshot = {
+      index: item.index,
+      key: item.key || "",
+      stableKey: item.stableKey || "",
+      rowCount: rows.length,
+      contentKey: getDisplayedBiologyContentKey(),
+    };
+
+    appendDebugLog("weda:manual-archive-next-scheduled", {
+      rowIndex: snapshot.index,
+      rowStableKey: snapshot.stableKey,
+      rowCount: snapshot.rowCount,
+      control: archiveControl,
+    });
+
+    window.clearTimeout(manualArchiveNextTimer);
+    manualArchiveNextTimer = window.setTimeout(() => {
+      advanceToNextRowAfterManualArchive(snapshot).catch((error) => {
+        appendDebugLog("weda:manual-archive-next-error", {
+          rowIndex: snapshot.index,
+          rowStableKey: snapshot.stableKey,
+          error: error && error.message ? error.message : String(error),
+        });
+      });
+    }, MANUAL_ARCHIVE_NEXT_SETTLE_MS);
+  }
+
+  async function advanceToNextRowAfterManualArchive(snapshot) {
+    if (getState().running) {
+      return;
+    }
+
+    const change = await waitForManualArchiveListChange(snapshot);
+    if (!change.changed || getState().running) {
+      appendDebugLog("weda:manual-archive-next-skip", {
+        reason: change.changed ? "workflow-started" : "list-unchanged",
+        rowIndex: snapshot.index,
+        rowStableKey: snapshot.stableKey,
+        rowCount: change.rows.length,
+      });
+      return;
+    }
+
+    const snapshotRowStillPresent = Boolean(findManualArchiveSnapshotRow(snapshot, change.rows));
+    const selectedIndex = change.rows.length < snapshot.rowCount || !snapshotRowStillPresent
+      ? -1
+      : change.selectedIndex;
+    const nextIndex = findNextManualArchiveRowIndex(snapshot, change.rows, selectedIndex);
+    if (nextIndex < 0) {
+      appendDebugLog("weda:manual-archive-next-none", {
+        rowIndex: snapshot.index,
+        rowStableKey: snapshot.stableKey,
+        rowCount: change.rows.length,
+      });
+      return;
+    }
+
+    const nextRow = change.rows[nextIndex];
+    appendDebugLog("weda:manual-archive-next-click", {
+      archivedRowIndex: snapshot.index,
+      archivedRowStableKey: snapshot.stableKey,
+      nextIndex,
+      nextStableKey: nextRow ? nextRow.stableKey : "",
+      rowCount: change.rows.length,
+    });
+
+    triggerWedaBiologyRowOpen(nextRow, "manual-archive-next");
+    window.setTimeout(() => {
+      applyRememberedDocumentFieldsForSelectedRow({ autoSave: true, silent: true });
+    }, 1500);
+  }
+
+  async function waitForManualArchiveListChange(snapshot) {
+    const startedAt = Date.now();
+    let rows = getBiologyRows();
+    let selectedIndex = getSelectedBiologyIndex();
+
+    while (Date.now() - startedAt < MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS) {
+      rows = getBiologyRows();
+      selectedIndex = getSelectedBiologyIndex();
+
+      const snapshotRow = findManualArchiveSnapshotRow(snapshot, rows);
+      const changed = rows.length < snapshot.rowCount ||
+        !snapshotRow ||
+        (selectedIndex >= 0 && selectedIndex !== snapshot.index);
+
+      if (changed) {
+        return {
+          changed: true,
+          rows,
+          selectedIndex,
+        };
+      }
+
+      await sleep(250);
+    }
+
+    return {
+      changed: false,
+      rows,
+      selectedIndex,
+    };
+  }
+
+  function findManualArchiveSnapshotRow(snapshot, rows = getBiologyRows()) {
+    return rows.find((row) => (
+      (snapshot.key && row.key && row.key === snapshot.key) ||
+      (snapshot.stableKey && row.stableKey && row.stableKey === snapshot.stableKey && Number(row.index) === Number(snapshot.index))
+    )) || null;
+  }
+
+  function findNextManualArchiveRowIndex(snapshot, rows = getBiologyRows(), selectedIndex = -1) {
+    if (!rows.length) {
+      return -1;
+    }
+
+    if (selectedIndex >= 0 && rows[selectedIndex]) {
+      return selectedIndex;
+    }
+
+    const previousIndex = Number.isFinite(Number(snapshot.index)) ? Number(snapshot.index) : 0;
+    return Math.min(Math.max(0, previousIndex), rows.length - 1);
+  }
+
   async function applyRememberedDocumentFieldsForSelectedRow(options = {}) {
+    await applyRememberedPatientForSelectedRow(options);
+    await sleep(80);
     await applyRememberedTitleForSelectedRow(options);
     await sleep(80);
     return applyRememberedSpecialtyForSelectedRow(options);
+  }
+
+  async function applyRememberedPatientForSelectedRow(options = {}) {
+    const state = getState();
+    if (state.running || rememberedPatientAutofillInProgress) {
+      return false;
+    }
+
+    const item = getStrictSelectedBiologyItem() || getSelectedBiologyItem();
+    if (!item || !isDisplayedBiologyForRow(item)) {
+      return false;
+    }
+
+    const pdfUrl = getDisplayedPdfUrl();
+    const urlKey = getDisplayedPdfUrlKey();
+    const rememberedPatient = getRememberedWedaPatientForOptions({
+      row: item,
+      rowStableKey: item.stableKey,
+      urlKey,
+      pdfUrl,
+    });
+
+    if (!rememberedPatient) {
+      return false;
+    }
+
+    const identityHintText = buildWedaRememberedPatientIdentityHintText(rememberedPatient.identity);
+    const hasFindPatientPanel = Boolean(findWedaFindPatientPanel());
+    const hasTitleInput = Boolean(findWedaTitleInput({ pdfUrl }));
+    const patientButton = findImportPatientButton();
+
+    if (!hasFindPatientPanel && hasTitleInput) {
+      touchRememberedPatientKeys(rememberedPatient.keys);
+      return false;
+    }
+
+    if (!hasFindPatientPanel && !patientButton) {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-patient-autofill-skip-no-entrypoint", {
+          rowIndex: item.index,
+          rowStableKey: item.stableKey,
+          rememberedKey: rememberedPatient.key,
+          hasTitleInput,
+          hasPatientButton: false,
+        });
+      }
+      return false;
+    }
+
+    rememberedPatientAutofillInProgress = true;
+    appendDebugLog("weda:remembered-patient-autofill-start", {
+      rowIndex: item.index,
+      rowStableKey: item.stableKey,
+      rememberedKey: rememberedPatient.key,
+      hasBirthDate: Boolean(rememberedPatient.identity && rememberedPatient.identity.birthDate),
+      hasFindPatientPanel,
+      hasPatientButton: Boolean(patientButton),
+      hasTitleInput,
+      source: rememberedPatient.entry && rememberedPatient.entry.source || "",
+    });
+
+    try {
+      let input = null;
+
+      if (!hasFindPatientPanel) {
+        appendDebugLog("weda:remembered-patient-import-open", {
+          rowIndex: item.index,
+          rowStableKey: item.stableKey,
+          rememberedKey: rememberedPatient.key,
+          hasPatientButton: Boolean(patientButton),
+        });
+        input = await openPatientImportForCurrentMessage("", "remembered-patient-autofill", {
+          ...options,
+          row: item,
+          rowStableKey: item.stableKey,
+          urlKey,
+          pdfUrl,
+          patientIdentityText: identityHintText,
+        });
+      }
+
+      if (findWedaFindPatientPanel()) {
+        input = await rescueWedaFindPatientPanelWithDocumentIdentity({
+          ...options,
+          reason: "remembered-patient-autofill",
+          row: item,
+          rowStableKey: item.stableKey,
+          urlKey,
+          pdfUrl,
+          patientIdentityText: identityHintText,
+        });
+      }
+
+      input = input || findWedaTitleInput({ pdfUrl });
+
+      if (input) {
+        touchRememberedPatientKeys(rememberedPatient.keys);
+      }
+
+      appendDebugLog("weda:remembered-patient-autofill-done", {
+        rowIndex: item.index,
+        rowStableKey: item.stableKey,
+        rememberedKey: rememberedPatient.key,
+        applied: Boolean(input),
+        hasFindPatientPanel: Boolean(findWedaFindPatientPanel()),
+        hasTitleInput: Boolean(input),
+      });
+      return Boolean(input);
+    } catch (error) {
+      appendDebugLog("weda:remembered-patient-autofill-error", {
+        rowIndex: item.index,
+        rowStableKey: item.stableKey,
+        rememberedKey: rememberedPatient.key,
+        error: error && error.message ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      rememberedPatientAutofillInProgress = false;
+    }
+  }
+
+  function buildWedaRememberedPatientIdentityHintText(identity = {}) {
+    const normalizedIdentity = normalizeWedaFindPatientIdentity(identity);
+    return normalizeMultilineText([
+      normalizedIdentity.searchLabel ? `Patient: ${normalizedIdentity.searchLabel}` : "",
+      normalizedIdentity.birthDate ? `Date de naissance: ${normalizedIdentity.birthDate}` : "",
+    ].filter(Boolean).join("\n"));
   }
 
   function setupWedaSpecialtyManualEditTracking(container) {
@@ -5313,6 +8285,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const metadata = {
+      rowKey: context.rowKey || "",
       rowStableKey: context.rowStableKey || "",
       rowIdentity: context.rowIdentity || "",
       pdfUrlHash: context.pdfUrlHash || "",
@@ -5404,6 +8377,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       input,
       keys: context.keys,
       rowIndex: context.rowIndex,
+      rowKey: context.rowKey,
       rowStableKey: context.rowStableKey,
       rowIdentity: context.rowIdentity,
       pdfUrlHash: context.pdfUrlHash,
@@ -5472,6 +8446,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return {
       keys: Array.from(new Set(keys)),
       rowIndex: item ? item.index : state.currentIndex,
+      rowKey: item ? item.key : state.currentRowKey,
       rowStableKey: item ? item.stableKey : state.currentStableKey,
       rowIdentity: item ? item.identityLabel : "",
       pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
@@ -5517,6 +8492,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const metadata = {
+      rowKey: edit.rowKey || "",
       rowStableKey: edit.rowStableKey || "",
       rowIdentity: edit.rowIdentity || "",
       pdfUrlHash: edit.pdfUrlHash || "",
@@ -5601,17 +8577,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   async function applyRememberedTitleForSelectedRow(options = {}) {
     const state = getState();
 
-    if (state.running && state.phase === "savingTitle") {
+    if (state.running) {
       if (!options.silent) {
-        appendDebugLog("weda:remembered-title-skip-saving-title", {
+        appendDebugLog(state.phase === "savingTitle" ? "weda:remembered-title-skip-saving-title" : "weda:remembered-title-skip-active-workflow", {
           currentIndex: state.currentIndex,
           currentJobId: state.currentJobId || "",
+          phase: state.phase || "",
         });
       }
       return;
     }
 
-    const item = getSelectedBiologyItem();
+    const item = getStrictSelectedBiologyItem();
+
+    if (!item) {
+      return;
+    }
 
     if (item && !isDisplayedBiologyForRow(item)) {
       return;
@@ -5628,6 +8609,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const remembered = rememberedEntry.title;
 
     if (!remembered) {
+      return;
+    }
+
+    const compatibility = isRememberedDocumentEntryCompatibleWithRow(rememberedEntry, item, options);
+    if (!compatibility.ok) {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-title-skip-row-mismatch", {
+          rowIndex: item ? item.index : null,
+          rowKey: item ? item.key : "",
+          rowStableKey: item ? item.stableKey : "",
+          rememberedKey: rememberedEntry.key,
+          rememberedRowKey: compatibility.rememberedRowKey || "",
+          rememberedRowStableKey: compatibility.rememberedStableKey || "",
+          reason: compatibility.reason || "",
+          lookupKeys: rememberedEntry.keys,
+        });
+      }
       return;
     }
 
@@ -5759,6 +8757,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (!options.noRetry) {
       window.setTimeout(() => {
+        const freshItem = getStrictSelectedBiologyItem();
+        const compatibility = isRememberedDocumentEntryCompatibleWithRow(rememberedEntry, freshItem, options);
+        if (!compatibility.ok) {
+          return;
+        }
+
         const freshInput = findWedaTitleInput();
         if (!freshInput || sanitizeTitle(freshInput.value) === remembered) {
           return;
@@ -5815,8 +8819,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function getRememberedTitle(rowKey) {
+    const entry = getRememberedTitleEntry(rowKey);
+    return entry ? entry.title : "";
+  }
+
+  function getRememberedTitleEntry(rowKey) {
     if (!rowKey) {
-      return "";
+      return null;
     }
 
     const titles = GM_getValue(TITLES_KEY, {});
@@ -5830,10 +8839,18 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         rowKey,
         titleLength: title.length,
       });
-      return "";
+      return null;
     }
 
-    return title;
+    if (!title) {
+      return null;
+    }
+
+    return {
+      ...entry,
+      key: rowKey,
+      title,
+    };
   }
 
   function touchRememberedTitleKeys(keys, expectedTitle = "") {
@@ -5894,13 +8911,88 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
 
     for (const key of lookupKeys) {
-      const title = getRememberedTitle(key);
-      if (title) {
-        return { key, keys: lookupKeys, title };
+      const entry = getRememberedTitleEntry(key);
+      if (entry) {
+        return { key, keys: lookupKeys, title: entry.title, entry };
       }
     }
 
-    return { key: "", keys: lookupKeys, title: "" };
+    return { key: "", keys: lookupKeys, title: "", entry: null };
+  }
+
+  function isRememberedDocumentEntryCompatibleWithRow(rememberedEntry, item, options = {}) {
+    if (!rememberedEntry || !rememberedEntry.key || !item || !item.row) {
+      return {
+        ok: false,
+        reason: "missing-row-context",
+      };
+    }
+
+    const entry = rememberedEntry.entry || rememberedEntry;
+    const rememberedRowKey = String(entry.rowKey || "").trim();
+    const itemRowKey = String(item.key || "").trim();
+    const rememberedStableKey = String(entry.rowStableKey || "").trim();
+    const itemStableKey = String(item.stableKey || "").trim();
+    const rememberedIdentity = normalizeForCompare(entry.rowIdentity || "");
+    const itemIdentity = normalizeForCompare(item.identityLabel || "");
+    const matchedByStrongDocumentKey = isRememberedEntryMatchedByStrongDocumentKey(rememberedEntry);
+
+    if (matchedByStrongDocumentKey) {
+      return {
+        ok: true,
+        reason: "strong-document-key",
+      };
+    }
+
+    const sameStableDuplicateOccurrence = Boolean(rememberedStableKey && itemStableKey && rememberedStableKey === itemStableKey);
+    if (rememberedRowKey && itemRowKey && rememberedRowKey !== itemRowKey && !sameStableDuplicateOccurrence) {
+      return {
+        ok: false,
+        reason: "row-key-mismatch",
+        rememberedRowKey,
+        itemRowKey,
+      };
+    }
+
+    if (rememberedStableKey && itemStableKey && rememberedStableKey !== itemStableKey) {
+      return {
+        ok: false,
+        reason: "row-stable-key-mismatch",
+        rememberedStableKey,
+        itemStableKey,
+      };
+    }
+
+    if (!rememberedStableKey && rememberedIdentity && itemIdentity && rememberedIdentity !== itemIdentity) {
+      return {
+        ok: false,
+        reason: "row-identity-mismatch",
+        rememberedIdentity,
+        itemIdentity,
+      };
+    }
+
+    if (!rememberedRowKey && !rememberedStableKey && !rememberedIdentity && options.autoSave) {
+      return {
+        ok: false,
+        reason: "missing-row-metadata-autosave",
+      };
+    }
+
+    return {
+      ok: true,
+      reason: "",
+    };
+  }
+
+  function isRememberedEntryMatchedByStrongDocumentKey(rememberedEntry = {}) {
+    const key = String(rememberedEntry.key || "").trim();
+    const lookupKeys = Array.isArray(rememberedEntry.keys) ? rememberedEntry.keys : [rememberedEntry.keys];
+
+    return Boolean(
+      isStrongWedaDocumentMemoryKey(key) &&
+      lookupKeys.some((lookupKey) => String(lookupKey || "").trim() === key)
+    );
   }
 
   function isRememberedTitleFromAnotherBiology(title, currentKeys) {
@@ -5917,17 +9009,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   async function applyRememberedSpecialtyForSelectedRow(options = {}) {
     const state = getState();
 
-    if (state.running && state.phase === "savingTitle") {
+    if (state.running) {
       if (!options.silent) {
-        appendDebugLog("weda:remembered-specialty-skip-saving-title", {
+        appendDebugLog(state.phase === "savingTitle" ? "weda:remembered-specialty-skip-saving-title" : "weda:remembered-specialty-skip-active-workflow", {
           currentIndex: state.currentIndex,
           currentJobId: state.currentJobId || "",
+          phase: state.phase || "",
         });
       }
       return false;
     }
 
-    const item = getSelectedBiologyItem();
+    const item = getStrictSelectedBiologyItem();
+
+    if (!item) {
+      return false;
+    }
 
     if (item && !isDisplayedBiologyForRow(item)) {
       return false;
@@ -5944,6 +9041,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const remembered = rememberedEntry.selection;
 
     if (!remembered) {
+      return false;
+    }
+
+    const compatibility = isRememberedDocumentEntryCompatibleWithRow(rememberedEntry, item, options);
+    if (!compatibility.ok) {
+      if (!options.silent) {
+        appendDebugLog("weda:remembered-specialty-skip-row-mismatch", {
+          rowIndex: item ? item.index : null,
+          rowKey: item ? item.key : "",
+          rowStableKey: item ? item.stableKey : "",
+          rememberedKey: rememberedEntry.key,
+          rememberedRowKey: compatibility.rememberedRowKey || "",
+          rememberedRowStableKey: compatibility.rememberedStableKey || "",
+          reason: compatibility.reason || "",
+          lookupKeys: rememberedEntry.keys,
+        });
+      }
       return false;
     }
 
@@ -6007,6 +9121,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (!options.noRetry) {
       window.setTimeout(() => {
+        const freshItem = getStrictSelectedBiologyItem();
+        const compatibility = isRememberedDocumentEntryCompatibleWithRow(rememberedEntry, freshItem, options);
+        if (!compatibility.ok) {
+          return;
+        }
+
         const freshSelect = findWedaSpecialtySelect({
           titleInput: findWedaTitleInput(),
           pdfUrl: getDisplayedPdfUrl(),
@@ -6050,6 +9170,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return {
       keys: Array.from(new Set(keys)),
       rowIndex: item ? item.index : state.currentIndex,
+      rowKey: item ? item.key : state.currentRowKey,
       rowStableKey: item ? item.stableKey : state.currentStableKey,
       rowIdentity: item ? item.identityLabel : "",
       pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
@@ -6113,6 +9234,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function getRememberedSpecialty(rowKey) {
+    const entry = getRememberedSpecialtyEntry(rowKey);
+    return entry ? entry.selection : null;
+  }
+
+  function getRememberedSpecialtyEntry(rowKey) {
     if (!rowKey) {
       return null;
     }
@@ -6130,20 +9256,28 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
-    return selection;
+    if (!selection) {
+      return null;
+    }
+
+    return {
+      ...entry,
+      key: rowKey,
+      selection,
+    };
   }
 
   function getRememberedSpecialtyForKeys(keys) {
     const lookupKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean)));
 
     for (const key of lookupKeys) {
-      const selection = getRememberedSpecialty(key);
-      if (selection) {
-        return { key, keys: lookupKeys, selection };
+      const entry = getRememberedSpecialtyEntry(key);
+      if (entry) {
+        return { key, keys: lookupKeys, selection: entry.selection, entry };
       }
     }
 
-    return { key: "", keys: lookupKeys, selection: null };
+    return { key: "", keys: lookupKeys, selection: null, entry: null };
   }
 
   function touchRememberedSpecialtyKeys(keys, expectedSelection = null) {
@@ -6299,6 +9433,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function finishAutoCycle(message) {
     const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+    resetWedaDuplicatePdfRegistry("auto-cycle-finished");
     setState({
       running: false,
       mode: "manual",
@@ -6327,6 +9462,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     if (index >= rows.length) {
       GM_deleteValue(JOB_KEY);
       GM_deleteValue(RESULT_KEY);
+      resetWedaDuplicatePdfRegistry("workflow-end");
 
       if (state.mode === "auto") {
         finishAutoCycle("Veille auto : traitement terminé.");
@@ -6357,6 +9493,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: row.key,
       currentStableKey: row.stableKey,
       previousContentKey,
+      currentContentKey: null,
+      currentPdfUrl: "",
+      currentUrlKey: "",
+      lastTitle: "",
+      lastTitleKey: "",
       allowUnchangedContentKey: alreadyDisplayed ? previousContentKey : "",
       currentJobId: null,
       message: "Ouverture du courrier " + (index + 1) + "/" + rows.length + "...",
@@ -6456,9 +9597,66 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       const documentText = displayedDocument.tableText;
       const contentKey = displayedDocument.contentKey;
       const hasPdfImageFallback = Array.isArray(displayedDocument.pdfPageImages) && displayedDocument.pdfPageImages.length > 0;
+      const liveFindPatientPanel = findWedaFindPatientPanel();
+      const liveFindPatientPanelActionable = Boolean(liveFindPatientPanel && isWedaFindPatientPanelActionable(liveFindPatientPanel));
+      const liveTitleInput = findWedaTitleInput({
+        pdfUrl: displayedDocument.pdfUrl || "",
+        urlKey: displayedDocument.urlKey || "",
+        contentKey,
+        rowStableKey: row.stableKey,
+      });
+      rememberCurrentPatientImportContextForDocument({
+        row,
+        rowStableKey: row.stableKey,
+        contentKey,
+        urlKey: displayedDocument.urlKey || "",
+        pdfUrl: displayedDocument.pdfUrl || "",
+      });
 
-      if (importPreparation.titleInputRequired && !findWedaTitleInput()) {
-        throw new Error("champ titre indisponible après ouverture Un patient");
+      if (importPreparation.titleInputRequired && (liveFindPatientPanelActionable || !liveTitleInput)) {
+        const rescuedInput = liveFindPatientPanelActionable
+          ? await rescueWedaFindPatientPanelWithDocumentIdentity({
+            reason: "pre-pdf-find-patient-panel-after-extract",
+            sourceText: documentText,
+            pdfPageImages: displayedDocument.pdfPageImages || [],
+            pdfImageFallbackReason: displayedDocument.pdfImageFallbackReason || "",
+            rowStableKey: row.stableKey,
+            contentKey,
+            urlKey: displayedDocument.urlKey || "",
+            pdfUrl: displayedDocument.pdfUrl || "",
+          })
+          : null;
+
+        if (!rescuedInput) {
+          const fallbackTitleInput = liveTitleInput || findWedaTitleInput({
+            pdfUrl: displayedDocument.pdfUrl || "",
+            urlKey: displayedDocument.urlKey || "",
+            contentKey,
+            rowStableKey: row.stableKey,
+          });
+          const remainingFindPatientPanel = findWedaFindPatientPanel();
+          const remainingFindPatientPanelActionable = Boolean(remainingFindPatientPanel && isWedaFindPatientPanelActionable(remainingFindPatientPanel));
+
+          if (fallbackTitleInput && !remainingFindPatientPanelActionable) {
+            appendDebugLog("weda:find-patient-rescue-fallback-title-input", {
+              rowIndex: row.index,
+              rowStableKey: row.stableKey,
+              titleInputIndex: getWedaTitleInputIndex(fallbackTitleInput),
+              panelStillOpen: Boolean(remainingFindPatientPanel),
+            });
+          } else {
+            const patientImportIssue = getLastPatientImportSelectionIssue();
+            throw new Error(patientImportIssue && patientImportIssue.blocked
+              ? patientImportIssue.message
+              : "champ titre indisponible après ouverture Un patient");
+          }
+        }
+      } else if (importPreparation.titleInputRequired && liveFindPatientPanel && liveTitleInput && !liveFindPatientPanelActionable) {
+        appendDebugLog("weda:find-patient-panel-non-actionable-continue-analysis", {
+          rowIndex: row.index,
+          rowStableKey: row.stableKey,
+          titleInputIndex: getWedaTitleInputIndex(liveTitleInput),
+        });
       }
 
       appendDebugLog("weda:displayed-document-ready", {
@@ -6482,6 +9680,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         documentLines: countBiologyLinesForLog(documentText, "pdf"),
         documentLength: documentText.length,
       });
+
+      if (await handleStrictDuplicateDisplayedDocument(row, displayedDocument, documentText, rows)) {
+        return;
+      }
 
       if (shouldFailClosedForDisplayedDocument(displayedDocument, documentText)) {
         await handleUnusableDisplayedDocument(row, rows, displayedDocument, contentKey);
@@ -7075,6 +10277,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const titleMetadata = {
+      rowKey: targetRow.key || "",
       rowStableKey: targetRow.stableKey,
       rowIdentity: targetRow.identityLabel,
       pdfUrlHash: hashString(target.pdfUrl || displayedPdfUrl || ""),
@@ -7216,6 +10419,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (specialtySelection) {
       const specialtyMetadata = {
+        rowKey: targetRow.key || "",
         rowStableKey: targetRow.stableKey,
         rowIdentity: targetRow.identityLabel,
         pdfUrlHash: hashString(target.pdfUrl || displayedPdfUrl || ""),
@@ -7542,6 +10746,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (nextIndex < 0) {
       const rows = getBiologyRows();
+      resetWedaDuplicatePdfRegistry("manual-finished");
       setState({
         running: false,
         mode: "manual",
@@ -13470,7 +16675,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function isSensitiveDebugKey(key) {
-    return /^(?:patient|nom|prenom|birth|naissance|identity|rowIdentity|title|titre|lastTitle|tableText|tableHtml|prompt|raw|answer|pdfAttachmentBase64|pdfPageImages|pdfPageImageDataUrls|dataUrl|data_url|imageUrl|image_url)$/i.test(String(key || ""));
+    return /^(?:patient|patientId|patientUrl|patientLabel|candidateLabel|maidenName|nom|prenom|familyName|givenName|searchLabel|searchQuery|birth|birthDate|dateNaissance|naissance|identity|rowIdentity|title|titre|lastTitle|tableText|tableHtml|prompt|raw|answer|pdfAttachmentBase64|pdfPageImages|pdfPageImageDataUrls|dataUrl|data_url|imageUrl|image_url)$/i.test(String(key || ""));
   }
 
   function sanitizeDebugString(value, maxLength = 400) {

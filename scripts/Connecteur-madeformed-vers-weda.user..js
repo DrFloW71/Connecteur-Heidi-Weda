@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Connecteur Madeformed - WEDA
 // @namespace    http://tampermonkey.net/
-// @version      3.55
-// @description  PageDown : copier/envoyer le SMS vers WEDA ; clic nom patient agenda : ouvrir dossier WEDA
+// @version      3.56
+// @description  PageDown : copier/envoyer le SMS vers WEDA ; clic nom patient agenda/messages : ouvrir dossier WEDA
 // @match        https://pro.madeformed.com/*
 // @match        https://secure.weda.fr/*
 // @grant        GM_setClipboard
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.55';
+    const VERSION = '3.56';
 
     const JOB_KEY = 'TM_MADEFORMED_TO_WEDA_JOB_V31';
     const LOG_KEY = 'TM_MADEFORMED_TO_WEDA_LOG_V31';
@@ -59,6 +59,9 @@
     const SEL_MADEFORMED_OPEN_PATIENT_NAME =
         `${SEL_MADEFORMED_PATIENT_HEADER_NAME}, ${SEL_MADEFORMED_PATIENT_PREVIEW_NAME}`;
 
+    const SEL_MADEFORMED_MESSAGES_PATIENT_NAME =
+        '.name.truncate';
+
     const SEL_WEDA_SEARCH_BUTTON =
         '#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient';
 
@@ -84,6 +87,10 @@
 
     function isMadeformed() {
         return location.hostname === 'pro.madeformed.com';
+    }
+
+    function isMadeformedMessagesPage() {
+        return isMadeformed() && location.pathname.replace(/\/+$/, '') === '/messages';
     }
 
     function isWeda() {
@@ -235,6 +242,12 @@
         GM_deleteValue(JOB_KEY);
         addLog('INFO', 'Job supprimé');
         refreshMadeformedPanel();
+    }
+
+    function refreshMadeformedPageClasses() {
+        if (!isMadeformed() || !document.body) return;
+
+        document.body.classList.toggle('tm-mf-weda-messages-page', isMadeformedMessagesPage());
     }
 
     function resetAll() {
@@ -821,8 +834,8 @@
         };
     }
 
-    function createOpenPatientJob(patientNameRaw, dateOfBirth, source = 'madeformed_agenda') {
-        const patientNameForWeda = formatPatientNameForWeda(patientNameRaw);
+    function createOpenPatientJob(patientNameRaw, dateOfBirth, source = 'madeformed_agenda', options = {}) {
+        const patientNameForWeda = cleanText(options.patientNameForWeda || '') || formatPatientNameForWeda(patientNameRaw);
 
         return {
             id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
@@ -1002,6 +1015,51 @@
         };
     }
 
+    function getMadeformedMessagesPatientFromClickEvent(event) {
+        if (!event || event.button !== 0) return null;
+        if (!isMadeformedMessagesPage()) return null;
+        if (!event.target || !event.target.closest) return null;
+
+        const nameEl = event.target.closest(SEL_MADEFORMED_MESSAGES_PATIENT_NAME);
+        if (!nameEl || !isVisible(nameEl)) return null;
+
+        const patientNameRaw = stripMadeformedPatientTitle(nameEl.textContent || '');
+
+        if (!patientNameRaw || !isLikelyPatientName(patientNameRaw)) {
+            addLog('WARN', 'Clic nom patient messages Madeformed ignoré : nom patient non fiable', {
+                rawText: cleanText(nameEl.textContent || '').slice(0, 120)
+            });
+            return null;
+        }
+
+        const sourceEl =
+            nameEl.closest('[user-id], [data-user-id], [data-patient-id], [data-id]') ||
+            nameEl.closest('.message, .message-row, .conversation, .conversation-row, .thread, .item, li, tr') ||
+            nameEl.parentElement ||
+            nameEl;
+
+        const userIdEl = sourceEl.querySelector
+            ? sourceEl.querySelector('[user-id], [data-user-id], [data-patient-id], [data-id]')
+            : null;
+
+        return {
+            nameEl,
+            sourceEl,
+            patientNameRaw,
+            patientNameForWeda: patientNameRaw,
+            dateOfBirth: extractMadeformedDateOfBirth(sourceEl.textContent || ''),
+            userId: userIdEl
+                ? cleanText(
+                    userIdEl.getAttribute('user-id') ||
+                    userIdEl.getAttribute('data-user-id') ||
+                    userIdEl.getAttribute('data-patient-id') ||
+                    userIdEl.getAttribute('data-id') ||
+                    ''
+                )
+                : ''
+        };
+    }
+
     function getMadeformedAgendaPatientFromClickEvent(event) {
         if (!event || event.button !== 0) return null;
 
@@ -1033,7 +1091,9 @@
     }
 
     function openWedaPatientJobFromMadeformed(patient, source, logMessage, extraLogData = {}) {
-        const job = createOpenPatientJob(patient.patientNameRaw, patient.dateOfBirth, source);
+        const job = createOpenPatientJob(patient.patientNameRaw, patient.dateOfBirth, source, {
+            patientNameForWeda: patient.patientNameForWeda || ''
+        });
 
         saveJob(job);
         GM_deleteValue(CLOSE_KEY);
@@ -1076,6 +1136,29 @@
                 : 'Ouverture dossier patient WEDA depuis clic en-tête patient Madeformed',
             {
                 userId: madeformedPatient.userId || ''
+            }
+        );
+    }
+
+    async function openWedaPatientFromMadeformedMessages(event) {
+        const messagesPatient = getMadeformedMessagesPatientFromClickEvent(event);
+
+        if (!messagesPatient) {
+            return false;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+
+        return openWedaPatientJobFromMadeformed(
+            messagesPatient,
+            'madeformed_messages',
+            'Ouverture dossier patient WEDA depuis clic messages Madeformed',
+            {
+                userId: messagesPatient.userId || ''
             }
         );
     }
@@ -1428,6 +1511,9 @@
 
     function madeformedMain() {
         setupMadeformedCloseListener();
+        refreshMadeformedPageClasses();
+
+        window.setInterval(refreshMadeformedPageClasses, 1000);
 
         document.addEventListener('keydown', async function (e) {
             if (isLaunchShortcut(e)) {
@@ -1443,6 +1529,10 @@
                 return;
             }
 
+            if (await openWedaPatientFromMadeformedMessages(e)) {
+                return;
+            }
+
             await openWedaPatientFromMadeformedAgenda(e);
         }, true);
 
@@ -1451,7 +1541,8 @@
                 'PageDown'
             ],
             clicAgenda: 'clic sur le nom du patient dans un rendez-vous Madeformed',
-            clicFichePatient: 'clic sur le nom du patient dans l’en-tête de fiche Madeformed'
+            clicFichePatient: 'clic sur le nom du patient dans l’en-tête de fiche Madeformed',
+            clicMessages: 'clic sur le nom du patient dans la liste messages Madeformed'
         });
     }
 
@@ -2318,13 +2409,17 @@
         if (!document.body) return;
         if (document.getElementById('tm-mf-weda-panel')) return;
 
+        refreshMadeformedPageClasses();
+
         const style = document.createElement('style');
         style.textContent = `
-            ${SEL_MADEFORMED_OPEN_PATIENT_NAME} {
+            ${SEL_MADEFORMED_OPEN_PATIENT_NAME},
+            body.tm-mf-weda-messages-page ${SEL_MADEFORMED_MESSAGES_PATIENT_NAME} {
                 cursor: pointer !important;
             }
 
-            :is(${SEL_MADEFORMED_OPEN_PATIENT_NAME}):hover {
+            :is(${SEL_MADEFORMED_OPEN_PATIENT_NAME}):hover,
+            body.tm-mf-weda-messages-page ${SEL_MADEFORMED_MESSAGES_PATIENT_NAME}:hover {
                 text-decoration: underline;
                 text-underline-offset: 2px;
             }

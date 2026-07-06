@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec LM Studio local
 // @namespace    https://secure.weda.fr/
-// @version      0.1.3
+// @version      0.1.4
 // @description  Analyse les résultats HPRIM avec l'API OpenAI-compatible de LM Studio en local. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @grant        GM_addValueChangeListener
@@ -31,7 +31,7 @@
   const LMSTUDIO_MAX_TOKENS = 220;
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "0.1.3";
+  const SCRIPT_VERSION = "0.1.4";
 
   const STORAGE_PREFIX = "wedaBioLmStudio.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
@@ -61,7 +61,7 @@
   const STATUS_ID = "weda-bio-lmstudio-status";
   const DEBUG_LOG_PANEL_ID = "weda-bio-lmstudio-log-panel";
   const DEBUG_LOG_TEXTAREA_ID = "weda-bio-lmstudio-log-textarea";
-  const AUTO_INTERVAL_MS = 5 * 60 * 1000;
+  const AUTO_INTERVAL_MS = 60 * 1000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -745,7 +745,7 @@ Ne jamais afficher cet auto-contrôle.`;
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE BIOLOGIES LM STUDIO</button>
-        <button type="button" id="wbh-auto">MODE AUTO 5 MIN</button>
+        <button type="button" id="wbh-auto">MODE AUTO 60 S</button>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-stop">Arrêter</button>
         <div class="wbh-debug-actions" aria-label="Actions de debug">
@@ -1056,7 +1056,7 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 5 MIN";
+      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 60 S";
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
     }

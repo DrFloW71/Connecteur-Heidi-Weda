@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Antécédents CIM-10 WEDA avec LM Studio AVEC colorisation
 // @namespace    http://tampermonkey.net/
-// @version      6.2.4
-// @description  Touche Début/Home : exporte les antécédents WEDA non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
+// @version      6.2.5
+// @description  Touche Inser/Insert : exporte les antécédents WEDA non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @all-frames   true
 // @run-at       document-idle
@@ -25,7 +25,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.4-LMstudio-avec-colorisation';
+    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.5-LMstudio-avec-colorisation';
 
     const HOST_WEDA = 'secure.weda.fr';
     const HOST_HEIDI = 'scribe.heidihealth.com';
@@ -4896,7 +4896,7 @@ END_ATCD`;
         const mainBtn = document.createElement('button');
         mainBtn.id = mainButtonId;
         mainBtn.textContent = 'LM Studio CIM10 + couleur';
-        mainBtn.title = 'Exporter les antécédents WEDA non codés vers LM Studio local, importer les CIM-10 puis coloriser localement. Raccourci : touche Début / Home';
+        mainBtn.title = 'Exporter les antécédents WEDA non codés vers LM Studio local, importer les CIM-10 puis coloriser localement. Raccourci : touche Inser / Insert';
         styleWedaLauncherButton(mainBtn, 'primary');
         mainBtn.addEventListener('click', () => startAtcdCim10ExportFromWeda('button'), true);
 
@@ -15005,13 +15005,13 @@ ${HEIDI_ASK_AI_PROMPT}`
             if (event.repeat) return;
             if (isEditableTarget(event.target)) return;
 
-            const isHomeKey = event.key === 'Home' || event.code === 'Home';
+            const isInsertKey = event.key === 'Insert' || event.code === 'Insert';
 
-            if (isHomeKey) {
+            if (isInsertKey) {
                 event.preventDefault();
                 event.stopPropagation();
-                showBadge('Touche Début détectée.\nLancement export ATCD WEDA vers LM Studio local…', { duration: 5000 });
-                startAtcdCim10ExportFromWeda('keyboard_home');
+                showBadge('Touche Inser détectée.\nLancement export ATCD WEDA vers LM Studio local…', { duration: 5000 });
+                startAtcdCim10ExportFromWeda('keyboard_insert');
             }
         }, true);
     }
