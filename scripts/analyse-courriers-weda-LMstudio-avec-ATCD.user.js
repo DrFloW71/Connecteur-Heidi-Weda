@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.25
+// @version      0.1.30
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -66,7 +66,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.25";
+  const SCRIPT_VERSION = "0.1.30";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -149,6 +149,12 @@
     "#messageContainer > div.messageBody",
     "#messageContainer div.messageBody.importing",
     "#messageContainer div.messageBody",
+  ].join(", ");
+  const DOC_IMPORT_ATTACHMENT_SELECTOR = [
+    "#messageContainer we-doc-import.docImportAttach",
+    "#messageContainer .docImportAttach",
+    "#messageContainer div.mssAttachment",
+    "#messageContainer div.messageAttachment",
   ].join(", ");
   const IMPORT_MESSAGE_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart.ng-star-inserted > div.flexColStart.mt10.width100.ng-star-inserted > div.mt5.flexRow.ng-star-inserted > div > table > tr.ng-star-inserted > td:nth-child(5) > a";
   const IMPORT_PATIENT_SELECTOR = "#messageContainer > div.docImportBody.mt10.flexColStart > div > div.btnImport.importPatient.targetSupprimer, #messageContainer .btnImport.importPatient.targetSupprimer";
@@ -1104,6 +1110,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentIndex: 0,
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       allowUnchangedContentKey: "",
       currentJobId: null,
       panelCollapsed: false,
@@ -1312,6 +1319,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: null,
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       allowUnchangedContentKey: "",
       previousContentKey: null,
       currentJobId: null,
@@ -1490,6 +1498,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: newRows[0].key,
       currentStableKey: newRows[0].stableKey,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       allowUnchangedContentKey: "",
       currentJobId: null,
       autoRefreshPending: false,
@@ -1574,6 +1583,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: rows[startIndex] ? rows[startIndex].key : null,
       currentStableKey: rows[startIndex] ? rows[startIndex].stableKey : null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       allowUnchangedContentKey: "",
       autoTargetKeys: [],
       manualTargetKeys: rows.slice(startIndex).map((row) => row.key).filter(Boolean),
@@ -1602,6 +1612,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       manualTargetKeys: [],
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       currentPdfUrl: "",
       currentUrlKey: "",
       allowUnchangedContentKey: "",
@@ -1940,7 +1951,64 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function getDisplayedPdfUrlKey() {
     const pdfUrl = getDisplayedPdfUrl();
+    return getPdfUrlKey(pdfUrl);
+  }
+
+  function getPdfUrlKey(pdfUrl = "") {
     return pdfUrl ? "pdfurl-" + hashString(pdfUrl) : "";
+  }
+
+  function normalizePdfUrlKeySet(values = []) {
+    const set = new Set();
+    const list = Array.isArray(values) ? values : [values];
+
+    list.forEach((value) => {
+      const text = String(value || "").trim();
+      if (!text) {
+        return;
+      }
+
+      if (/^pdfurl-/.test(text)) {
+        set.add(text);
+        return;
+      }
+
+      const url = normalizePdfUrl(text);
+      if (url) {
+        set.add(getPdfUrlKey(url));
+      }
+    });
+
+    return set;
+  }
+
+  function getCurrentAttachmentProcessedUrlKeys(state = getState()) {
+    return Array.isArray(state.currentAttachmentProcessedUrlKeys)
+      ? state.currentAttachmentProcessedUrlKeys.filter(Boolean)
+      : [];
+  }
+
+  function appendProcessedAttachmentUrlKey(keys = [], urlKey = "") {
+    return Array.from(new Set([
+      ...(Array.isArray(keys) ? keys : []),
+      urlKey,
+    ].filter(Boolean)));
+  }
+
+  function findNextDisplayedPdfAttachment(processedUrlKeys = []) {
+    const excludedUrlKeys = normalizePdfUrlKeySet(processedUrlKeys);
+    const candidates = getDisplayedPdfUrlCandidates({
+      excludeUrlKeys: Array.from(excludedUrlKeys),
+    });
+    const nextPdfUrl = candidates[0] || "";
+
+    return nextPdfUrl
+      ? {
+        pdfUrl: nextPdfUrl,
+        urlKey: getPdfUrlKey(nextPdfUrl),
+        remainingCount: candidates.length,
+      }
+      : null;
   }
 
   function getDisplayedBiologyHeaderText() {
@@ -1970,9 +2038,18 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function getDisplayedPdfUrlCandidates(options = {}) {
     const candidates = [];
+    const excludedUrlKeys = normalizePdfUrlKeySet(options.excludeUrlKeys || []);
+    const nonAnalyzableUrlKeys = normalizePdfUrlKeySet(collectNonAnalyzableAttachmentUrlCandidates());
     const addCandidate = (value) => {
       const url = normalizePdfUrl(value);
-      if (url && isLikelyPdfUrl(url) && !candidates.includes(url)) {
+      const urlKey = getPdfUrlKey(url);
+      if (
+        url &&
+        isLikelyPdfUrl(url) &&
+        !excludedUrlKeys.has(urlKey) &&
+        !nonAnalyzableUrlKeys.has(urlKey) &&
+        !candidates.includes(url)
+      ) {
         candidates.push(url);
       }
     };
@@ -2019,8 +2096,95 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function collectMssAttachmentPdfUrlCandidates() {
     return querySelectorAllDeep(document, "#messageContainer div.mssAttachment embed[src]")
+      .filter((element) => !isNonAnalyzableAttachmentElement(element))
       .map((element) => element.getAttribute("src"))
       .filter((url) => isLikelyPdfUrl(url));
+  }
+
+  function collectNonAnalyzableAttachmentUrlCandidates(rootDocument = document) {
+    const root = rootDocument || document;
+    const candidates = [];
+    const roots = [
+      document.querySelector("#messageContainer"),
+      root,
+    ].filter(Boolean)
+      .filter((element, index, list) => list.indexOf(element) === index);
+
+    roots.forEach((searchRoot) => {
+      querySelectorAllDeep(searchRoot, [
+        DOC_IMPORT_ATTACHMENT_SELECTOR,
+        "a[href]",
+        "embed[src]",
+        "iframe[src]",
+        "object[data]",
+        "[href]",
+        "[src]",
+        "[data]",
+        "[original-url]",
+        "[data-original-url]",
+      ].join(","))
+        .filter((element) => isNonAnalyzableAttachmentElement(element))
+        .forEach((element) => {
+          candidates.push(
+            element.getAttribute("original-url"),
+            element.getAttribute("data-original-url"),
+            element.getAttribute("data"),
+            element.getAttribute("href"),
+            element.getAttribute("src"),
+            element.getAttribute("ng-src"),
+            element.getAttribute("data-src")
+          );
+        });
+    });
+
+    return candidates
+      .map((value) => normalizePdfUrl(value))
+      .filter((url, index, list) => url && isLikelyPdfUrl(url) && list.indexOf(url) === index);
+  }
+
+  function isNonAnalyzableAttachmentElement(element) {
+    if (!element || element.nodeType !== 1) {
+      return false;
+    }
+
+    const root = element.closest([
+      "a",
+      "td",
+      "tr",
+      "we-doc-import",
+      "div.docImportAttach",
+      "div.messageAttachment",
+      "div.mssAttachment",
+      "div.flexRow",
+    ].join(",")) || element;
+    const descriptor = [
+      element.id || "",
+      element.className || "",
+      element.getAttribute("title") || "",
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("alt") || "",
+      element.getAttribute("href") || "",
+      element.getAttribute("src") || "",
+      element.getAttribute("data") || "",
+      element.getAttribute("original-url") || "",
+      element.getAttribute("data-original-url") || "",
+      root.className || "",
+      normalizeText(root.textContent || "").slice(0, 500),
+    ].join(" ");
+
+    return isNonAnalyzableAttachmentDescriptor(descriptor);
+  }
+
+  function isNonAnalyzableAttachmentDescriptor(value = "") {
+    const text = String(value || "");
+    const decoded = safeDecodeURIComponent(text);
+    return (
+      /\.(?:zip|7z|rar)(?:\b|[?#&])/i.test(text) ||
+      /\.(?:zip|7z|rar)(?:\b|[?#&])/i.test(decoded) ||
+      /\bicon[-_ ]?(?:zip|archive)\b/i.test(text) ||
+      /\bapplication\/(?:zip|x-zip-compressed|x-7z-compressed|x-rar-compressed)\b/i.test(decoded) ||
+      /\b(?:ihe[_ -]?xdm|archive)\.(?:zip|7z|rar)\b/i.test(decoded)
+    );
   }
 
   function collectPdfUrlCandidatesFromPerformance(minStartTime = 0) {
@@ -2078,6 +2242,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     ].join(","));
 
     elements.forEach((element) => {
+      if (isNonAnalyzableAttachmentElement(element)) {
+        return;
+      }
+
       if (visibleOnly && !isDisplayedPdfCandidateVisible(element)) {
         return;
       }
@@ -2100,6 +2268,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       }
 
       fallbackElements.forEach((element) => {
+        if (isNonAnalyzableAttachmentElement(element)) {
+          return;
+        }
+
         Array.from(element.attributes || []).forEach((attribute) => {
           if (isLikelyPdfUrl(attribute.value || "")) {
             candidates.push(attribute.value);
@@ -2130,7 +2302,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       "iframe[src*='BinaryData']",
       "iframe[src*='downloadAttachment']",
       "iframe[src*='application%2Fpdf']",
-    ].join(",")).find((candidate) => isDisplayedPdfCandidateVisible(candidate));
+    ].join(",")).find((candidate) => !isNonAnalyzableAttachmentElement(candidate) && isDisplayedPdfCandidateVisible(candidate));
 
     return element || null;
   }
@@ -5560,8 +5732,27 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return openPatientImportForCurrentMessage(jobId, importMessageLink ? "after-import-message" : "missing-import-message", options);
   }
 
-  async function prepareImportBeforePdfWait(row) {
+  async function prepareImportBeforePdfWait(row, options = {}) {
     clearPatientImportSelectionIssue();
+    const expectedTitleInput = options.expectedPdfUrl || options.urlKey
+      ? findWedaTitleInput({
+        pdfUrl: options.expectedPdfUrl || "",
+        urlKey: options.urlKey || "",
+        rowStableKey: row ? row.stableKey : "",
+      })
+      : null;
+
+    if (expectedTitleInput) {
+      appendDebugLog("weda:pre-pdf-title-input-already-visible", {
+        rowIndex: row ? row.index : null,
+        rowStableKey: row ? row.stableKey : "",
+        urlKey: options.urlKey || "",
+        pdfUrlHash: options.expectedPdfUrl ? hashString(options.expectedPdfUrl) : "",
+        titleInputIndex: getWedaTitleInputIndex(expectedTitleInput),
+      });
+      return { patientImportOpened: false, titleInputRequired: true };
+    }
+
     const importMessageSelection = resolveImportMessageLink({
       reason: "before-pdf-wait",
       rowStableKey: row ? row.stableKey : "",
@@ -5662,6 +5853,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         const pdfUrl = getDisplayedPdfUrl({
           includePerformance: getElapsedPerformanceMs(waitStartedAt) >= PDF_PERFORMANCE_FALLBACK_SETTLE_MS,
           minPerformanceStartTime: waitStartedAt,
+          excludeUrlKeys: options.excludeUrlKeys || [],
         });
         const urlKey = pdfUrl ? "pdfurl-" + hashString(pdfUrl) : "";
         const selectedOk = item && item.row && (
@@ -5680,7 +5872,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
         pdfSeenSince = pdfSeenSince || now;
 
-        if (expectedPdfUrl && pdfUrl !== expectedPdfUrl) {
+        if (expectedPdfUrl && !areSamePdfUrls(pdfUrl, expectedPdfUrl)) {
           return null;
         }
 
@@ -5718,7 +5910,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     abortIfWorkflowStopped();
     setPanelStatus("Extraction du texte du PDF...");
-    const extracted = await extractDisplayedPdfTextWithRetry(displayed, waitStartedAt);
+    const extracted = await extractDisplayedPdfTextWithRetry(displayed, waitStartedAt, {
+      excludeUrlKeys: options.excludeUrlKeys || [],
+    });
     abortIfWorkflowStopped();
     const documentText = extracted.documentText;
     const contentKey = getDisplayedBiologyContentKey(documentText);
@@ -6626,6 +6820,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         currentRowKey: null,
         currentStableKey: null,
         currentContentKey: null,
+        currentAttachmentProcessedUrlKeys: [],
         currentPdfUrl: "",
         currentUrlKey: "",
         allowUnchangedContentKey: "",
@@ -6650,6 +6845,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         mode: "manual",
         phase: "done",
         currentJobId: null,
+        currentAttachmentProcessedUrlKeys: [],
         manualTargetKeys: [],
         message: "Terminé : doublon strict supprimé, aucun courrier restant.",
       });
@@ -6665,6 +6861,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: null,
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       currentPdfUrl: "",
       currentUrlKey: "",
       allowUnchangedContentKey: "",
@@ -6690,12 +6887,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return performance.now() - startTime;
   }
 
-  async function extractDisplayedPdfTextWithRetry(initialDisplayed, waitStartedAt) {
+  async function extractDisplayedPdfTextWithRetry(initialDisplayed, waitStartedAt, options = {}) {
     const startedAt = Date.now();
     let displayed = initialDisplayed;
     let lastError = null;
     let attempt = 0;
-    const emptyUrlKeys = new Set();
+    const skippedUrlKeys = normalizePdfUrlKeySet(options.excludeUrlKeys || []);
 
     while (Date.now() - startedAt <= PDF_EMPTY_TEXT_RETRY_MS) {
       abortIfWorkflowStopped();
@@ -6786,17 +6983,45 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         lastError = error;
       }
 
-      emptyUrlKeys.add(displayed.urlKey || ("pdfurl-" + hashString(displayed.pdfUrl || "")));
+      const currentUrlKey = displayed.urlKey || getPdfUrlKey(displayed.pdfUrl || "");
+
+      if (isNonAnalyzableAttachmentError(lastError)) {
+        skippedUrlKeys.add(currentUrlKey);
+        appendDebugLog("weda:non-analyzable-attachment-skipped", {
+          attempt,
+          urlKey: currentUrlKey,
+          error: lastError ? lastError.message : "",
+          fetchInfo: lastError && lastError.pdfFetchInfo ? lastError.pdfFetchInfo : null,
+        });
+
+        const nextPdfUrl = getDisplayedPdfUrlCandidates({
+          includePerformance: true,
+          minPerformanceStartTime: waitStartedAt,
+          excludeUrlKeys: Array.from(skippedUrlKeys),
+        })[0] || "";
+
+        if (!nextPdfUrl) {
+          throw lastError;
+        }
+
+        displayed = {
+          pdfUrl: nextPdfUrl,
+          urlKey: getPdfUrlKey(nextPdfUrl),
+          selectedOk: displayed.selectedOk,
+        };
+        continue;
+      }
 
       appendDebugLog("weda:pdf-text-empty-retry", {
         attempt,
-        urlKey: displayed.urlKey,
+        urlKey: currentUrlKey,
         error: lastError ? lastError.message : "",
         pdfInfo: lastError && lastError.pdfInfo ? lastError.pdfInfo : null,
         fetchInfo: lastError && lastError.pdfFetchInfo ? lastError.pdfFetchInfo : null,
         candidateCount: getDisplayedPdfUrlCandidates({
           includePerformance: true,
           minPerformanceStartTime: waitStartedAt,
+          excludeUrlKeys: options.excludeUrlKeys || [],
         }).length,
         hasPlugin: Boolean(querySelectorAllDeep(document, PDF_EMBED_SELECTOR).length),
         hasAnyPdfElement: Boolean(getDisplayedPdfEmbed()),
@@ -6821,16 +7046,18 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       const nextPdfCandidates = getDisplayedPdfUrlCandidates({
         includePerformance: true,
         minPerformanceStartTime: waitStartedAt,
+        excludeUrlKeys: options.excludeUrlKeys || [],
       });
-      const nextPdfUrl = nextPdfCandidates.find((candidate) => {
-        const candidateKey = "pdfurl-" + hashString(candidate);
-        return !emptyUrlKeys.has(candidateKey);
-      }) || displayed.pdfUrl;
+      const currentStillVisible = nextPdfCandidates
+        .some((candidate) => getPdfUrlKey(candidate) === currentUrlKey);
+      const nextPdfUrl = !currentStillVisible
+        ? nextPdfCandidates.find((candidate) => !skippedUrlKeys.has(getPdfUrlKey(candidate)))
+        : displayed.pdfUrl;
 
       if (nextPdfUrl) {
         displayed = {
           pdfUrl: nextPdfUrl,
-          urlKey: "pdfurl-" + hashString(nextPdfUrl),
+          urlKey: getPdfUrlKey(nextPdfUrl),
           selectedOk: displayed.selectedOk,
         };
       }
@@ -7407,6 +7634,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function isRetryablePdfExtractionError(error) {
+    if (isNonAnalyzableAttachmentError(error)) {
+      return false;
+    }
+
     const message = String(error && error.message || "");
     return (
       /texte du PDF vide ou illisible/i.test(message) ||
@@ -7523,6 +7754,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           });
         }
       } catch (error) {
+        if (isNonAnalyzableAttachmentError(error)) {
+          throw error;
+        }
         lastError = error;
       } finally {
         if (abortTimer) {
@@ -7534,6 +7768,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         try {
           return await fetchPdfBytesWithTampermonkey(pdfUrl);
         } catch (error) {
+          if (isNonAnalyzableAttachmentError(error)) {
+            throw error;
+          }
           lastError = error;
         }
       }
@@ -7559,6 +7796,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           return bytes;
         }
       } catch (error) {
+        if (isNonAnalyzableAttachmentError(error)) {
+          throw error;
+        }
         lastError = error;
       }
     }
@@ -7664,6 +7904,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       header: bytes.length ? bytesToAscii(bytes.slice(0, 8)) : "",
     };
 
+    if (isNonAnalyzablePdfFetchInfo(bytes.pdfFetchInfo)) {
+      throw createNonAnalyzableAttachmentError("archive compressée", bytes.pdfFetchInfo);
+    }
+
     return bytes;
   }
 
@@ -7707,6 +7951,25 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const error = new Error(message);
     error.pdfFetchInfo = fetchInfo;
     return error;
+  }
+
+  function createNonAnalyzableAttachmentError(reason = "pièce jointe non analysable", fetchInfo = {}) {
+    const error = createPdfFetchError("pièce jointe ignorée : " + reason, fetchInfo);
+    error.nonAnalyzableAttachment = true;
+    return error;
+  }
+
+  function isNonAnalyzablePdfFetchInfo(fetchInfo = {}) {
+    const header = String(fetchInfo.header || "");
+    const contentType = String(fetchInfo.contentType || "");
+    return /^PK(?:\.|\x03|\x05|\x07)/.test(header) ||
+      /\bapplication\/(?:zip|x-zip-compressed|x-7z-compressed|x-rar-compressed)\b/i.test(contentType);
+  }
+
+  function isNonAnalyzableAttachmentError(error) {
+    const message = String(error && error.message || "");
+    return Boolean(error && error.nonAnalyzableAttachment) ||
+      /pi[eè]ce jointe ignor[eé]e|archive compress[eé]e/i.test(message);
   }
 
   async function extractPdfPageText(page) {
@@ -9442,6 +9705,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: null,
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       allowUnchangedContentKey: "",
       previousContentKey: null,
       currentJobId: null,
@@ -9474,6 +9738,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         mode: "manual",
         phase: "done",
         currentJobId: null,
+        currentAttachmentProcessedUrlKeys: [],
         allowUnchangedContentKey: "",
         manualTargetKeys: [],
         message: "Terminé : " + rows.length + " courrier(s) parcouru(s).",
@@ -9494,6 +9759,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentStableKey: row.stableKey,
       previousContentKey,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       currentPdfUrl: "",
       currentUrlKey: "",
       lastTitle: "",
@@ -9570,7 +9836,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         return;
       }
 
-      const importPreparation = await prepareImportBeforePdfWait(row);
+      const processedAttachmentUrlKeys = getCurrentAttachmentProcessedUrlKeys(state);
+      const expectedPdfUrl = state.currentPdfUrl || "";
+      const expectedUrlKey = state.currentUrlKey || "";
+      const importPreparation = await prepareImportBeforePdfWait(row, {
+        expectedPdfUrl,
+        urlKey: expectedUrlKey,
+      });
 
       if (!isCurrentRowWorkflowActive(row)) {
         appendDebugLog("weda:extract-cancelled-after-import-prep", {
@@ -9583,6 +9855,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       const displayedDocument = await waitForDisplayedBiology(row, state.previousContentKey || "", {
         allowContentKey: state.allowUnchangedContentKey || "",
         pdfPerformanceStartTime: importPreparation.pdfPerformanceStartTime || 0,
+        excludeUrlKeys: processedAttachmentUrlKeys,
+        expectedPdfUrl,
       });
 
       if (!isCurrentRowWorkflowActive(row)) {
@@ -9760,6 +10034,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         phase: "waitingLmStudio",
         currentJobId: jobId,
         currentContentKey: contentKey,
+        currentAttachmentProcessedUrlKeys: appendProcessedAttachmentUrlKey(
+          processedAttachmentUrlKeys,
+          displayedDocument.urlKey || getPdfUrlKey(displayedDocument.pdfUrl || "")
+        ),
         currentPdfUrl: displayedDocument.pdfUrl,
         currentUrlKey: displayedDocument.urlKey,
         allowUnchangedContentKey: "",
@@ -9816,6 +10094,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   async function handleUnusableDisplayedDocument(row, rows, displayedDocument, contentKey) {
     const jobId = createId("courrier-local");
     const result = buildUnusablePdfLocalResult(jobId, row, displayedDocument, contentKey);
+    const state = getState();
+    const processedAttachmentUrlKeys = getCurrentAttachmentProcessedUrlKeys(state);
 
     GM_deleteValue(JOB_KEY);
     GM_deleteValue(RESULT_KEY);
@@ -9836,6 +10116,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       phase: "waitingLmStudio",
       currentJobId: jobId,
       currentContentKey: contentKey,
+      currentAttachmentProcessedUrlKeys: appendProcessedAttachmentUrlKey(
+        processedAttachmentUrlKeys,
+        displayedDocument && (displayedDocument.urlKey || getPdfUrlKey(displayedDocument.pdfUrl || "")) || ""
+      ),
       currentPdfUrl: displayedDocument && displayedDocument.pdfUrl || "",
       currentUrlKey: displayedDocument && displayedDocument.urlKey || "",
       allowUnchangedContentKey: "",
@@ -9935,6 +10219,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           currentRowKey: null,
           currentStableKey: null,
           currentContentKey: null,
+          currentAttachmentProcessedUrlKeys: [],
+          currentPdfUrl: "",
+          currentUrlKey: "",
           allowUnchangedContentKey: "",
           previousContentKey: null,
           currentJobId: null,
@@ -9971,6 +10258,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         currentRowKey: null,
         currentStableKey: null,
         currentContentKey: null,
+        currentAttachmentProcessedUrlKeys: [],
         currentPdfUrl: "",
         currentUrlKey: "",
         allowUnchangedContentKey: "",
@@ -9987,6 +10275,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       mode: "manual",
       phase: "done",
       currentJobId: null,
+      currentAttachmentProcessedUrlKeys: [],
       manualTargetKeys: [],
       message: message + " Aucun courrier suivant.",
     });
@@ -10704,6 +10993,41 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
+    const processedAttachmentUrlKeys = appendProcessedAttachmentUrlKey(
+      getCurrentAttachmentProcessedUrlKeys(state),
+      state.currentUrlKey || getPdfUrlKey(state.currentPdfUrl || "")
+    );
+    const nextAttachment = findNextDisplayedPdfAttachment(processedAttachmentUrlKeys);
+
+    if (nextAttachment) {
+      appendDebugLog("weda:next-attachment-same-message", {
+        jobId,
+        currentIndex: state.currentIndex,
+        currentStableKey: state.currentStableKey,
+        processedUrlKeys: processedAttachmentUrlKeys,
+        nextUrlKey: nextAttachment.urlKey,
+        remainingCount: nextAttachment.remainingCount,
+      });
+      setState({
+        running: true,
+        mode: state.mode || "manual",
+        phase: "clickedRow",
+        currentIndex: state.currentIndex,
+        currentRowKey: state.currentRowKey,
+        currentStableKey: state.currentStableKey,
+        currentContentKey: null,
+        currentAttachmentProcessedUrlKeys: processedAttachmentUrlKeys,
+        currentPdfUrl: nextAttachment.pdfUrl,
+        currentUrlKey: nextAttachment.urlKey,
+        allowUnchangedContentKey: "",
+        previousContentKey: state.currentContentKey || "",
+        currentJobId: null,
+        message: "Autre pièce jointe détectée : analyse du PDF suivant...",
+      });
+      window.setTimeout(() => extractAndSendCurrentBiology(), 250);
+      return;
+    }
+
     markRowSeen(state.currentRowKey || state.currentStableKey);
 
     if (state.mode === "auto") {
@@ -10722,6 +11046,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         currentRowKey: null,
         currentStableKey: null,
         currentContentKey: null,
+        currentAttachmentProcessedUrlKeys: [],
         currentPdfUrl: "",
         currentUrlKey: "",
         allowUnchangedContentKey: "",
@@ -10752,6 +11077,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         mode: "manual",
         phase: "done",
         currentJobId: null,
+        currentAttachmentProcessedUrlKeys: [],
         manualTargetKeys: [],
         message: "Terminé : " + rows.length + " courrier(s) parcouru(s).",
       });
@@ -10767,6 +11093,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentRowKey: null,
       currentStableKey: null,
       currentContentKey: null,
+      currentAttachmentProcessedUrlKeys: [],
       currentPdfUrl: "",
       currentUrlKey: "",
       allowUnchangedContentKey: "",
