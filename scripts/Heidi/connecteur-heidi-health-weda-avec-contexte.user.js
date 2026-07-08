@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Heidi Health vers WEDA
 // @namespace    http://tampermonkey.net/
-// @version      7.95
+// @version      7.97
 // @description  PageUp : lance Heidi + récupération du contexte. PageDown : transfert WEDA. Remplit constantes, suivis structurés, ajoute les étiquettes WEDA, contrôle qualité, notifications renforcées, retour accueil direct et fermeture accélérée. + DEBUG
 // @match        https://*/*
 // @exclude      https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -24,7 +24,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_HH = '7.95';
+    const VERSION_AUTO_HH = '7.97';
 
     const CLE_SIGNAL = 'auto_hh_signal_stable_v768';
     const CLE_SIGNAL_LEGACY = 'auto_hh_signal_stable';
@@ -33,6 +33,7 @@
     const CLE_WEDA_CONNECTEUR_ACTIF = 'auto_hh_weda_connector_enabled_stable';
     const CLE_WEDA_PANEL_POSITION = 'auto_hh_weda_panel_position_stable';
     const CLE_WEDA_PANEL_COMPACT = 'auto_hh_weda_panel_compact_stable';
+    const CLE_DELAI_RECUPERATION_CONTEXTE_MS = 'auto_hh_context_retrieval_delay_ms_stable';
     const CLE_LAST_WEDA_URL = 'auto_hh_last_weda_url_stable';
     const CLE_RETOUR_ACCUEIL_ORIGINE_WEDA = 'auto_hh_weda_return_home_request_stable';
     const CLE_RETOUR_ACCUEIL_ORIGINE_WEDA_TRAITE = 'auto_hh_weda_return_home_request_done_stable';
@@ -128,6 +129,11 @@
     const SELECTEUR_GRID_GLOSSAIRES_WEDA = '#ContentPlaceHolder1_EvenementUcForm1_GlossairesGrid';
 
     const DELAI_APRES_NOUVELLE_SESSION_MS = 250;
+    const DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS = 60000;
+    const DELAI_RECUPERATION_CONTEXTE_MIN_MS = 0;
+    const DELAI_RECUPERATION_CONTEXTE_MAX_MS = 5 * 60 * 1000;
+    const MARGE_PANNEAU_WEDA_PLEIN_PX = 8;
+    const MARGE_PANNEAU_WEDA_COMPACT_PX = 0;
     const TIMEOUT_BOUTON_MS = 20000;
     const TIMEOUT_GENERATION_HEIDI_MS = 60000;
     const TIMEOUT_WEDA_CHAMP_MS = 45000;
@@ -404,6 +410,32 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
         return !!actif;
     }
 
+    function normaliserDelaiRecuperationContexteMs(valeur, fallback = DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS) {
+        const nombre = Number(valeur);
+        if (!Number.isFinite(nombre)) return fallback;
+        return Math.min(
+            DELAI_RECUPERATION_CONTEXTE_MAX_MS,
+            Math.max(DELAI_RECUPERATION_CONTEXTE_MIN_MS, Math.round(nombre))
+        );
+    }
+
+    function getDelaiRecuperationContexteMs() {
+        try {
+            return normaliserDelaiRecuperationContexteMs(
+                GM_getValue(CLE_DELAI_RECUPERATION_CONTEXTE_MS, DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS)
+            );
+        } catch (e) {
+            return DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS;
+        }
+    }
+
+    function formaterDelaiRecuperationContexte(delaiMs) {
+        const secondes = Math.round(normaliserDelaiRecuperationContexteMs(delaiMs) / 1000);
+        if (secondes <= 0) return '0 s';
+        if (secondes >= 60 && secondes % 60 === 0) return (secondes / 60) + ' min';
+        return secondes + ' s';
+    }
+
     async function copierLogsAutoHH() {
         const logs = getLogsAutoHH();
         const texte = JSON.stringify({
@@ -604,16 +636,19 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             try { GM_setValue(CLE_WEDA_CONNECTEUR_ACTIF, true); } catch (e) {}
 
             function limiterPositionPanneau(left, top) {
-                const marge = 8;
+                const compact = panneau.dataset && panneau.dataset.autoHhCompact === '1';
+                const marge = compact ? MARGE_PANNEAU_WEDA_COMPACT_PX : MARGE_PANNEAU_WEDA_PLEIN_PX;
                 const rect = panneau.getBoundingClientRect();
                 const largeur = rect.width || 280;
                 const hauteur = rect.height || 44;
                 const maxLeft = Math.max(marge, window.innerWidth - largeur - marge);
                 const maxTop = Math.max(marge, window.innerHeight - hauteur - marge);
+                const valeurLeft = Number(left);
+                const valeurTop = Number(top);
 
                 return {
-                    left: Math.min(Math.max(marge, Number(left) || marge), maxLeft),
-                    top: Math.min(Math.max(marge, Number(top) || marge), maxTop)
+                    left: Math.min(Math.max(marge, Number.isFinite(valeurLeft) ? valeurLeft : marge), maxLeft),
+                    top: Math.min(Math.max(marge, Number.isFinite(valeurTop) ? valeurTop : marge), maxTop)
                 };
             }
 
@@ -786,6 +821,69 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             const boutonLogs = creerBouton('Copier logs');
             const boutonReduire = creerBoutonIcone('-', 'Réduire le panneau Auto-HH');
 
+            const blocDelaiContexte = document.createElement('label');
+            blocDelaiContexte.title = 'Temporisation avant récupération du contexte WEDA';
+            blocDelaiContexte.style.display = 'inline-flex';
+            blocDelaiContexte.style.alignItems = 'center';
+            blocDelaiContexte.style.gap = '4px';
+            blocDelaiContexte.style.border = '1px solid rgba(255,255,255,0.28)';
+            blocDelaiContexte.style.background = 'rgba(255,255,255,0.10)';
+            blocDelaiContexte.style.borderRadius = '7px';
+            blocDelaiContexte.style.padding = '4px 6px';
+            blocDelaiContexte.style.minHeight = '28px';
+            blocDelaiContexte.style.whiteSpace = 'nowrap';
+            blocDelaiContexte.style.userSelect = 'none';
+
+            const libelleDelaiContexte = document.createElement('span');
+            libelleDelaiContexte.textContent = 'Ctx';
+            libelleDelaiContexte.style.font = '700 11px Arial, sans-serif';
+            libelleDelaiContexte.style.color = '#cfe8ff';
+
+            const champDelaiContexte = document.createElement('input');
+            champDelaiContexte.type = 'number';
+            champDelaiContexte.dataset.autoHhPanelInput = '1';
+            champDelaiContexte.min = String(DELAI_RECUPERATION_CONTEXTE_MIN_MS / 1000);
+            champDelaiContexte.max = String(DELAI_RECUPERATION_CONTEXTE_MAX_MS / 1000);
+            champDelaiContexte.step = '5';
+            champDelaiContexte.inputMode = 'numeric';
+            champDelaiContexte.style.width = '46px';
+            champDelaiContexte.style.minWidth = '46px';
+            champDelaiContexte.style.boxSizing = 'border-box';
+            champDelaiContexte.style.border = '1px solid rgba(255,255,255,0.32)';
+            champDelaiContexte.style.borderRadius = '5px';
+            champDelaiContexte.style.background = 'rgba(255,255,255,0.92)';
+            champDelaiContexte.style.color = '#123044';
+            champDelaiContexte.style.font = '700 12px Arial, sans-serif';
+            champDelaiContexte.style.padding = '3px 4px';
+            champDelaiContexte.style.textAlign = 'right';
+
+            const uniteDelaiContexte = document.createElement('span');
+            uniteDelaiContexte.textContent = 's';
+            uniteDelaiContexte.style.font = '700 11px Arial, sans-serif';
+            uniteDelaiContexte.style.color = '#cfe8ff';
+
+            blocDelaiContexte.appendChild(libelleDelaiContexte);
+            blocDelaiContexte.appendChild(champDelaiContexte);
+            blocDelaiContexte.appendChild(uniteDelaiContexte);
+
+            function rafraichirChampDelaiContexte() {
+                const delaiMs = getDelaiRecuperationContexteMs();
+                const secondes = Math.round(delaiMs / 1000);
+                const resume = formaterDelaiRecuperationContexte(delaiMs);
+                champDelaiContexte.value = String(secondes);
+                blocDelaiContexte.title = 'Temporisation avant récupération du contexte WEDA : ' + resume;
+                champDelaiContexte.title = blocDelaiContexte.title;
+            }
+
+            function enregistrerDelaiContexteDepuisChamp() {
+                const delaiMs = normaliserDelaiRecuperationContexteMs(Number(champDelaiContexte.value) * 1000);
+                const resume = formaterDelaiRecuperationContexte(delaiMs);
+                try { GM_setValue(CLE_DELAI_RECUPERATION_CONTEXTE_MS, delaiMs); } catch (e) {}
+                rafraichirChampDelaiContexte();
+                ajouterLogAutoHH('weda-ui-context-delay-change', { delaiMs });
+                afficherBadge('AUTO-HH contexte : temporisation ' + resume, 3000, { force: true });
+            }
+
             function repositionnerPanneauApresChangementTaille() {
                 setTimeout(() => {
                     try {
@@ -798,7 +896,7 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
 
             function appliquerModeCompactPanneau(compact, options = {}) {
                 const compactActif = !!compact;
-                const controlesMasques = [version, boutonLancer, boutonArreter, boutonLogs, boutonReduire];
+                const controlesMasques = [version, blocDelaiContexte, boutonLancer, boutonArreter, boutonLogs, boutonReduire];
 
                 panneau.dataset.autoHhCompact = compactActif ? '1' : '0';
                 panneau.style.gap = compactActif ? '4px' : '6px';
@@ -854,6 +952,24 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
                 afficherBadge(ok ? 'AUTO-HH : logs copiés' : 'AUTO-HH : copie des logs impossible', ok ? 3000 : 7000, { force: true });
             }, true);
 
+            champDelaiContexte.addEventListener('pointerdown', event => {
+                event.stopPropagation();
+            }, true);
+
+            champDelaiContexte.addEventListener('keydown', event => {
+                event.stopPropagation();
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    enregistrerDelaiContexteDepuisChamp();
+                    try { champDelaiContexte.blur(); } catch (e) {}
+                }
+            }, true);
+
+            champDelaiContexte.addEventListener('change', event => {
+                event.stopPropagation();
+                enregistrerDelaiContexteDepuisChamp();
+            }, true);
+
             boutonReduire.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -870,10 +986,19 @@ let instanceHeidiAutoHH = 'heidi_instance_' + Date.now() + '_' + Math.random().t
             panneau.appendChild(poignee);
             panneau.appendChild(blocVersion);
             panneau.appendChild(boutonReduire);
+            panneau.appendChild(blocDelaiContexte);
             panneau.appendChild(boutonLancer);
             panneau.appendChild(boutonArreter);
             panneau.appendChild(boutonLogs);
             document.body.appendChild(panneau);
+            rafraichirChampDelaiContexte();
+            try {
+                if (typeof GM_addValueChangeListener === 'function') {
+                    GM_addValueChangeListener(CLE_DELAI_RECUPERATION_CONTEXTE_MS, function () {
+                        rafraichirChampDelaiContexte();
+                    });
+                }
+            } catch (e) {}
             mettreAJourStatutPanneauAutoHH(getStatutInterfaceAutoHH());
 
             try {
@@ -8417,6 +8542,15 @@ return null;
 
 
     async function traiterRaccourciClavier(event) {
+        const cibleEvenement = event && event.target;
+        if (
+            cibleEvenement &&
+            cibleEvenement.dataset &&
+            cibleEvenement.dataset.autoHhPanelInput === '1'
+        ) {
+            return;
+        }
+
         const demandeLancement = touchePageUpDetectee(event);
         const demandeStopTransfer = touchePageDownDetectee(event);
         if (!demandeLancement && !demandeStopTransfer) return;
@@ -8774,6 +8908,7 @@ if (!signal) return;
     const PARAM_WORKER_HEIDI_CONTEXTE = 'AUTO_HH_HEIDI_WORKER';
     const PARAM_HEIDI_BIO_JOB_CONTEXTE = 'wedaBioJob';
     const CLE_OUVERTURE_CONTEXTE_LOCK = 'auto_hh_context_open_lock_stable';
+    const CLE_DELAI_RECUPERATION_CONTEXTE_MS = 'auto_hh_context_retrieval_delay_ms_stable';
 
     const PAGE_WEDA_PATIENT_CONTEXTE = '/foldermedical/patientviewform.aspx';
     const PAGE_WEDA_HPRIM_CONTEXTE = '/foldermedical/hprimform.aspx';
@@ -8785,6 +8920,9 @@ if (!signal) return;
     const ENTETE_CONTEXTE_WEDA = 'Contexte WEDA patient';
 
     const DELAI_APRES_SIGNAL_START_CONTEXTE_MS = 60000;
+    const DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS = DELAI_APRES_SIGNAL_START_CONTEXTE_MS;
+    const DELAI_RECUPERATION_CONTEXTE_MIN_MS = 0;
+    const DELAI_RECUPERATION_CONTEXTE_MAX_MS = 5 * 60 * 1000;
     const DELAI_SIGNAL_INITIAL_RECENT_CONTEXTE_MS = 90000;
     const DELAI_APRES_CLIC_SUITE_CONTEXTE_MS = 1800;
     const TIMEOUT_CONTEXTE_HEIDI_MS = 30000;
@@ -8829,6 +8967,32 @@ if (!signal) return;
 
     function sleepContexte(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function normaliserDelaiRecuperationContexteMs(valeur, fallback = DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS) {
+        const nombre = Number(valeur);
+        if (!Number.isFinite(nombre)) return fallback;
+        return Math.min(
+            DELAI_RECUPERATION_CONTEXTE_MAX_MS,
+            Math.max(DELAI_RECUPERATION_CONTEXTE_MIN_MS, Math.round(nombre))
+        );
+    }
+
+    function getDelaiRecuperationContexteMs() {
+        try {
+            return normaliserDelaiRecuperationContexteMs(
+                GM_getValue(CLE_DELAI_RECUPERATION_CONTEXTE_MS, DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS)
+            );
+        } catch (e) {
+            return DELAI_RECUPERATION_CONTEXTE_DEFAUT_MS;
+        }
+    }
+
+    function formaterDelaiRecuperationContexte(delaiMs) {
+        const secondes = Math.round(normaliserDelaiRecuperationContexteMs(delaiMs) / 1000);
+        if (secondes <= 0) return '0 s';
+        if (secondes >= 60 && secondes % 60 === 0) return (secondes / 60) + ' min';
+        return secondes + ' s';
     }
 
     function isTopFrameContexte() {
@@ -9983,36 +10147,36 @@ if (!signal) return;
         }, 700);
     }
 
-   function choisirWedaUrlContexteApresTemporisation(signal) {
-    const snapshot = GM_getValue(CLE_WEDA_ACTIVE_SNAPSHOT_CONTEXTE, null);
-    const urlWedaActuelle = GM_getValue(CLE_LAST_WEDA_URL_CONTEXTE, null);
-    const urlSignal = signal && signal.wedaUrl ? signal.wedaUrl : null;
-    const timestampSignal = Number(signal && signal.timestamp ? signal.timestamp : 0);
+    function choisirWedaUrlContexteApresTemporisation(signal) {
+        const snapshot = GM_getValue(CLE_WEDA_ACTIVE_SNAPSHOT_CONTEXTE, null);
+        const urlWedaActuelle = GM_getValue(CLE_LAST_WEDA_URL_CONTEXTE, null);
+        const urlSignal = signal && signal.wedaUrl ? signal.wedaUrl : null;
+        const timestampSignal = Number(signal && signal.timestamp ? signal.timestamp : 0);
 
-    if (snapshot && snapshot.url) {
-        const timestampSnapshot = Number(snapshot.timestamp || 0);
-        const snapshotRecent = timestampSnapshot > 0 && Date.now() - timestampSnapshot <= 120000;
-        const snapshotCompatiblePageUp = snapshotRecent && (!timestampSignal || timestampSnapshot >= timestampSignal - 2000);
+        if (snapshot && snapshot.url) {
+            const timestampSnapshot = Number(snapshot.timestamp || 0);
+            const snapshotRecent = timestampSnapshot > 0 && Date.now() - timestampSnapshot <= 120000;
+            const snapshotCompatiblePageUp = snapshotRecent && (!timestampSignal || timestampSnapshot >= timestampSignal - 2000);
 
-        if (snapshotCompatiblePageUp) {
-            const patientSnapshot = getParamPatDkDepuisUrlContexte(snapshot.url);
-            const patientSignal = getParamPatDkDepuisUrlContexte(urlSignal);
+            if (snapshotCompatiblePageUp) {
+                const patientSnapshot = getParamPatDkDepuisUrlContexte(snapshot.url);
+                const patientSignal = getParamPatDkDepuisUrlContexte(urlSignal);
 
-            if (patientSnapshot && patientSignal && patientSnapshot !== patientSignal) {
-                console.info('[AUTO-HH CONTEXTE] Patient WEDA changé après PageUp, utilisation du patient actif.', {
-                    patientSignal,
-                    patientSnapshot,
-                    urlSignal,
-                    urlActive: snapshot.url
-                });
+                if (patientSnapshot && patientSignal && patientSnapshot !== patientSignal) {
+                    console.info('[AUTO-HH CONTEXTE] Patient WEDA changé après PageUp, utilisation du patient actif.', {
+                        patientSignal,
+                        patientSnapshot,
+                        urlSignal,
+                        urlActive: snapshot.url
+                    });
+                }
+
+                return snapshot.url;
             }
-
-            return snapshot.url;
         }
-    }
 
-    return urlSignal || urlWedaActuelle || null;
-}
+        return urlSignal || urlWedaActuelle || null;
+    }
 
 
     async function traiterSignalStartContexte(signal, origine) {
@@ -10025,9 +10189,20 @@ if (!signal) return;
 
         console.info('[AUTO-HH CONTEXTE] Signal start reçu via ' + origine + ' :', signal);
 
-        afficherBadgeContexte('AUTO-HH contexte : ouverture WEDA dans 1 minute', 5000);
+        const delaiRecuperationContexteMs = getDelaiRecuperationContexteMs();
+        const resumeDelaiRecuperationContexte = formaterDelaiRecuperationContexte(delaiRecuperationContexteMs);
+        afficherBadgeContexte(
+            delaiRecuperationContexteMs > 0
+                ? 'AUTO-HH contexte : ouverture WEDA dans ' + resumeDelaiRecuperationContexte
+                : 'AUTO-HH contexte : ouverture WEDA immédiate',
+            5000
+        );
+        console.info('[AUTO-HH CONTEXTE] Temporisation avant collecte contexte :', {
+            delaiMs: delaiRecuperationContexteMs,
+            delai: resumeDelaiRecuperationContexte
+        });
 
-        await sleepContexte(DELAI_APRES_SIGNAL_START_CONTEXTE_MS);
+        if (delaiRecuperationContexteMs > 0) await sleepContexte(delaiRecuperationContexteMs);
 
         const signalCourant = GM_getValue(CLE_SIGNAL_CONTEXTE, null);
         if (!signalContexteCorrespondAuSignal(signalCourant, signal)) {
@@ -10039,7 +10214,7 @@ if (!signal) return;
             return;
         }
 
-       const wedaUrl = choisirWedaUrlContexteApresTemporisation(signal);
+        const wedaUrl = choisirWedaUrlContexteApresTemporisation(signal);
 
         if (!wedaUrl) {
             afficherBadgeContexte('AUTO-HH contexte : aucun WEDA connu', 7000);
@@ -10205,6 +10380,7 @@ if (!signal) return;
     const CLE_NOTIFICATION = 'auto_hh_notification_stable';
     const CLE_LAST_REPORT = 'auto_hh_last_report_stable';
     const CLE_WEDA_ACTIVE_SNAPSHOT = 'auto_hh_weda_active_snapshot_stable';
+    const CLE_DELAI_RECUPERATION_CONTEXTE_MS = 'auto_hh_context_retrieval_delay_ms_stable';
     const CLE_DEBUG_LAST_REPORT = 'auto_hh_debug_last_report_stable';
 
     const SELECTEURS = {
@@ -10769,6 +10945,7 @@ if (!signal) return;
             CLE_NOTIFICATION,
             CLE_LAST_REPORT,
             CLE_WEDA_ACTIVE_SNAPSHOT,
+            CLE_DELAI_RECUPERATION_CONTEXTE_MS,
             CLE_DEBUG_LAST_REPORT
         ];
 
@@ -11193,7 +11370,8 @@ if (!signal) return;
                 CLE_SESSION_CONTEXT_JOB,
                 CLE_NOTIFICATION,
                 CLE_LAST_REPORT,
-                CLE_WEDA_ACTIVE_SNAPSHOT
+                CLE_WEDA_ACTIVE_SNAPSHOT,
+                CLE_DELAI_RECUPERATION_CONTEXTE_MS
             ].forEach(key => {
                 safe(() => {
                     GM_addValueChangeListener(key, (_name, oldValue, newValue) => {

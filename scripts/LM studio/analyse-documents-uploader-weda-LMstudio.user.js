@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Synthese documents uploader LM Studio
 // @namespace    https://secure.weda.fr/
-// @version      0.2.0
+// @version      0.2.2
 // @description  Analyse les PDF de UpLoaderForm.aspx ligne par ligne avec LM Studio local, renseigne une synthese courte et prepare l'ajout ATCD CIM-10 si detecte.
 // @match        https://secure.weda.fr/FolderMedical/UpLoaderForm.aspx*
 // @match        https://secure.weda.fr/FolderMedical/PatientViewForm.aspx*
@@ -22,7 +22,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "0.2.0";
+  const SCRIPT_VERSION = "0.2.2";
   const WEDA_HOST = "secure.weda.fr";
 
   const LMSTUDIO_API_BASE_URL = "http://localhost:1234/v1";
@@ -32,6 +32,7 @@
   const LMSTUDIO_REQUEST_TIMEOUT_MS = 300000;
   const LMSTUDIO_TEMPERATURE = 0;
   const LMSTUDIO_MAX_TOKENS = 900;
+  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 220;
   const LMSTUDIO_MAX_DOCUMENT_TEXT_LENGTH = 45000;
 
   const COURRIER_ATCD_PROMPT = `Tu dois produire deux blocs balisés, et uniquement ces deux blocs.
@@ -153,6 +154,20 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   const PATIENT_OPEN_LINK_SELECTOR = "a[id^='ContentPlaceHolder1_FileStreamClassementsGrid_HyperLinkGotoPatient_']";
   const DESTINATION_SELECT_SELECTOR = "select[id^='ContentPlaceHolder1_FileStreamClassementsGrid_DropDownListGridFileStreamClassementEvenementType_']";
   const CLASSIFICATION_SELECT_SELECTOR = "select[id^='ContentPlaceHolder1_FileStreamClassementsGrid_DropDownListGridFileStreamClassementLabelClassification_']";
+  const WEDA_FIND_PATIENT_PANEL_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PanelFindPatient";
+  const WEDA_FIND_PATIENT_MODE_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient";
+  const WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche";
+  const WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient";
+  const WEDA_FIND_PATIENT_GRID_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld, #ContentPlaceHolder1_FindPatientUcForm1_PatientsGrid";
+  const WEDA_FIND_PATIENT_SELECTED_ROW_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld > tbody > tr.grid-selecteditem, #ContentPlaceHolder1_FindPatientUcForm1_PatientsGrid > tbody > tr.grid-selecteditem";
+  const WEDA_FIND_PATIENT_NAME_MODE_VALUE = "Nom";
+  const WEDA_FIND_PATIENT_MODE_WAIT_MS = 6000;
+  const WEDA_FIND_PATIENT_MODE_SETTLE_MS = 900;
+  const WEDA_FIND_PATIENT_RESULT_WAIT_MS = 9000;
+  const WEDA_FIND_PATIENT_SEARCH_SETTLE_MS = 900;
+  const WEDA_FIND_PATIENT_SELECTION_SETTLE_MS = 1200;
+  const WEDA_FIND_PATIENT_MIN_SCORE = 420;
+  const WEDA_FIND_PATIENT_AMBIGUITY_MARGIN = 160;
   const POSTBACK_ANTECEDENTS_WEDA = "ctl00$ContentPlaceHolder1$ButtonGotoAntecedent";
   const POSTBACK_SEARCH_CIM10_WEDA = "ctl00$ContentPlaceHolder1$TextBoxFind";
   const SELECTOR_PATIENT_PANEL = "#ContentPlaceHolder1_PanelPatient";
@@ -447,27 +462,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       pendingRowIndex: item.rowIndex,
     });
 
-    let displayed = null;
-    const resumeState = options.state || {};
-    const canReuseDisplayedPdf = Boolean(
-      options.resume &&
-      resumeState.currentIndex === index &&
-      /waiting-pdf|extracting|analyzing|resume/i.test(String(resumeState.phase || ""))
-    );
-
-    if (canReuseDisplayedPdf) {
-      displayed = getDisplayedPdf({ includePerformance: true });
-    }
-
-    if (!displayed || !displayed.pdfUrl) {
-      const previousPdfUrl = getDisplayedPdfUrl({ includePerformance: false });
-      const minPerformanceStartTime = getCurrentPerformanceTime();
-      clickElement(item.patientLink);
-      displayed = await waitForDisplayedPdf({
-        previousPdfUrl,
-        minPerformanceStartTime,
-      });
-    }
+    const displayed = await openDisplayedPdfForRow(item, index, options);
 
     const pdfKeys = displayed && displayed.urlKey ? [displayed.urlKey] : [];
     const rememberedPdf = getRememberedSummary(pdfKeys);
@@ -509,7 +504,18 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       throw new Error("reponse LM Studio sans synthese utilisable");
     }
 
-    const freshItem = getDocumentRows()[index] || item;
+    const patientWasUndefined = isUploaderPatientUndefined(item);
+    await assignUploaderPatientFromDocumentIfNeeded(item, documentData, displayed).catch((error) => {
+      appendDebugLog("weda:find-patient-uploader-error", {
+        rowIndex: item && item.rowIndex,
+        error: getErrorMessage(error),
+      });
+      markRow(item, "warning", "Synthese analysee, patient a verifier");
+      return null;
+    });
+
+    const freshItem = findFreshRowItem(item) || getDocumentRows()[index] || item;
+    const patientStillUndefined = patientWasUndefined && isUploaderPatientUndefined(freshItem);
     setTitleInputValue(freshItem.titleInput || item.titleInput, summary);
     rememberSummary([...baseKeys, displayed.urlKey, documentData.urlKey].filter(Boolean), summary, {
       source: "lmstudio",
@@ -540,8 +546,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const atcdWasDetected = Boolean(parsedResult.antecedent && (parsedResult.antecedent.status === "OUI" || parsedResult.antecedent.rejectionReason));
     markRow(
       freshItem || item,
-      atcdWasDetected && !atcdWorkerOpened ? "warning" : "done",
-      atcdWorkerOpened ? "Synthese inseree + ATCD ouvert" : atcdWasDetected ? "Synthese inseree, ATCD non prepare" : "Synthese inseree"
+      patientStillUndefined || (atcdWasDetected && !atcdWorkerOpened) ? "warning" : "done",
+      patientStillUndefined
+        ? "Synthese inseree, patient a verifier"
+        : atcdWorkerOpened ? "Synthese inseree + ATCD ouvert" : atcdWasDetected ? "Synthese inseree, ATCD non prepare" : "Synthese inseree"
     );
     setState({
       running: true,
@@ -549,7 +557,71 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       currentIndex: index + 1,
       lastPdfKey: displayed.urlKey,
     });
-    setPanelStatus(`Ligne ${index + 1} : synthese inseree.`);
+    setPanelStatus(patientStillUndefined
+      ? `Ligne ${index + 1} : synthese inseree, patient a verifier manuellement.`
+      : `Ligne ${index + 1} : synthese inseree.`);
+  }
+
+  async function openDisplayedPdfForRow(item, index, options = {}) {
+    let displayed = null;
+    const resumeState = options.state || {};
+    const canReuseDisplayedPdf = Boolean(
+      options.resume &&
+      resumeState.currentIndex === index &&
+      /waiting-pdf|extracting|analyzing|resume/i.test(String(resumeState.phase || ""))
+    );
+
+    if (canReuseDisplayedPdf) {
+      displayed = getDisplayedPdf({ includePerformance: true });
+      if (displayed && displayed.pdfUrl) {
+        appendDebugLog("pdf:reuse-resume", {
+          rowIndex: item && item.rowIndex,
+          urlKey: displayed.urlKey,
+        });
+        return displayed;
+      }
+    }
+
+    const currentDisplayed = getDisplayedPdf({ includePerformance: true });
+    if (currentDisplayed && currentDisplayed.pdfUrl && canReuseCurrentDisplayedPdfForRow(item, index)) {
+      appendDebugLog("pdf:reuse-current-row", {
+        rowIndex: item && item.rowIndex,
+        selected: isUploaderRowSelected(item),
+        singleRow: getDocumentRows().length === 1,
+        patientUndefined: isUploaderPatientUndefined(item),
+        urlKey: currentDisplayed.urlKey,
+      });
+      return currentDisplayed;
+    }
+
+    const previousPdfUrl = getDisplayedPdfUrl({ includePerformance: false });
+    const minPerformanceStartTime = getCurrentPerformanceTime();
+    clickElement(item.patientLink);
+    return waitForDisplayedPdf({
+      previousPdfUrl,
+      minPerformanceStartTime,
+      allowSamePdf: canReuseCurrentDisplayedPdfForRow(item, index),
+    });
+  }
+
+  function canReuseCurrentDisplayedPdfForRow(item, index) {
+    if (!item) {
+      return false;
+    }
+    if (isUploaderRowSelected(item)) {
+      return true;
+    }
+    const rows = getDocumentRows();
+    return rows.length === 1 && Number(index) === 0;
+  }
+
+  function isUploaderRowSelected(item) {
+    const row = item && item.row;
+    return Boolean(row && row.classList && (
+      row.classList.contains("grid-selecteditem") ||
+      row.classList.contains("selected") ||
+      row.getAttribute("aria-selected") === "true"
+    ));
   }
 
   function getDocumentRows() {
@@ -579,6 +651,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const date = normalizeText(dateInput ? dateInput.value : "");
     const destination = getSelectedOptionText(destinationSelect);
     const classification = getSelectedOptionText(classificationSelect);
+    const patientLabel = normalizeText(patientLink ? patientLink.textContent || "" : "");
     const patientState = normalizeText(patientLink ? patientLink.getAttribute("title") || patientLink.textContent || "" : "");
     const rowKeySource = [
       "uploader-row-v1",
@@ -599,10 +672,25 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       date,
       originalTitle,
       currentTitle,
+      patientLabel,
       destination,
       classification,
+      patientState,
+      patientUndefined: isUploaderPatientUndefined({ patientLink, patientLabel, patientState }),
       rowKey: `row-${hashString(rowKeySource)}`,
     };
+  }
+
+  function isUploaderPatientUndefined(itemOrLink) {
+    const link = itemOrLink && itemOrLink.nodeType === 1 ? itemOrLink : itemOrLink && itemOrLink.patientLink;
+    const raw = [
+      itemOrLink && itemOrLink.patientState,
+      itemOrLink && itemOrLink.patientLabel,
+      link && link.getAttribute("title"),
+      link && link.textContent,
+    ].filter(Boolean).join(" ");
+    const text = normalizeForCompare(raw);
+    return /patient\s+a\s+definir|le\s+patient\s+est\s+a\s+definir/.test(text);
   }
 
   function extractTrailingIndex(value) {
@@ -622,6 +710,975 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       item && item.rowKey,
       item && item.date && item.originalTitle ? `row-title-${hashString([item.date, item.originalTitle, item.rowIndex].join("|"))}` : "",
     ].filter(Boolean);
+  }
+
+  async function assignUploaderPatientFromDocumentIfNeeded(rowItem, documentData, displayed) {
+    const item = findFreshRowItem(rowItem) || rowItem;
+    if (!item || !isUploaderPatientUndefined(item)) {
+      return null;
+    }
+
+    appendDebugLog("weda:find-patient-uploader-needed", {
+      rowIndex: item.rowIndex,
+      originalTitle: item.originalTitle || "",
+      pdfUrlKey: displayed && displayed.urlKey || "",
+      textLength: documentData && documentData.text ? documentData.text.length : 0,
+      imageCount: documentData && Array.isArray(documentData.pageImages) ? documentData.pageImages.length : 0,
+    });
+
+    const identity = await resolveUploaderPatientIdentity({
+      sourceText: documentData && documentData.text || "",
+      pdfPageImages: documentData && documentData.pageImages || [],
+      rowItem: item,
+    });
+
+    if (!hasUsableUploaderPatientIdentity(identity)) {
+      appendDebugLog("weda:find-patient-uploader-identity-missing", {
+        rowIndex: item.rowIndex,
+        source: identity && identity.source || "",
+        hasBirthDate: Boolean(identity && identity.birthDate),
+      });
+      setPanelStatus("Patient a definir : identite patient introuvable dans le PDF, selection manuelle necessaire.");
+      return null;
+    }
+
+    const panel = await openWedaFindPatientPanelForUploader(item);
+    if (!panel) {
+      appendDebugLog("weda:find-patient-uploader-panel-missing", {
+        rowIndex: item.rowIndex,
+        searchLabel: identity.searchLabel,
+      });
+      setPanelStatus("Patient a definir : panneau de recherche WEDA introuvable.");
+      return null;
+    }
+
+    setPanelStatus(`Patient a definir : recherche WEDA "${identity.searchLabel}"...`);
+    const selection = await searchAndSelectWedaFindPatient(identity, {
+      rowItem: item,
+      urlKey: displayed && displayed.urlKey || "",
+    });
+
+    if (selection && selection.appliedItem) {
+      appendDebugLog("weda:find-patient-uploader-applied", {
+        rowIndex: item.rowIndex,
+        patientLabel: selection.patientLabel || "",
+        birthDate: selection.birthDate || "",
+        reason: selection.reason || "",
+      });
+      markRow(selection.appliedItem, "running", "Patient attribue");
+      return selection.appliedItem;
+    }
+
+    return null;
+  }
+
+  async function resolveUploaderPatientIdentity(options = {}) {
+    const sourceText = normalizeMultilineText(options.sourceText || "");
+    const heuristic = extractUploaderPatientIdentityHeuristically(sourceText);
+    if (hasUsableUploaderPatientIdentity(heuristic)) {
+      return heuristic;
+    }
+
+    if (!sourceText && !getUploaderPdfPageImages(options).length) {
+      return heuristic;
+    }
+
+    try {
+      const lmStudioIdentity = await requestLmStudioPatientIdentity(options);
+      return hasUsableUploaderPatientIdentity(lmStudioIdentity) ? lmStudioIdentity : (lmStudioIdentity || heuristic);
+    } catch (error) {
+      appendDebugLog("lmstudio:patient-identity-error", {
+        error: getErrorMessage(error),
+        sourceLength: sourceText.length,
+        imageCount: getUploaderPdfPageImages(options).length,
+      });
+      return heuristic;
+    }
+  }
+
+  function extractUploaderPatientIdentityHeuristically(sourceText = "") {
+    const source = normalizeMultilineText(extractLikelyPatientIdentitySourceText(sourceText) || sourceText);
+    const compact = normalizeText(source);
+    const birthDate = extractPatientBirthDateHints(source, { allowLooseParentheses: true })[0] || "";
+
+    const fieldMatch = compact.match(/\bnom(?:\s+de\s+naissance)?\s*[:\-]\s*([^:;\n,]{2,80})\s+(?:pr[eé]noms?|prenom)\s*[:\-]\s*([^:;\n,]{2,100})/i);
+    if (fieldMatch) {
+      return normalizeUploaderPatientIdentity({
+        familyName: fieldMatch[1],
+        givenName: fieldMatch[2],
+        birthDate,
+        source: "heuristic-fields",
+      });
+    }
+
+    const inlineMatch = compact.match(/\b(?:patient|patiente|b[ée]n[ée]ficiaire|assur[ée]e?|concerne|identit[ée])\s*[:\-]\s*(?:m(?:me|adame|onsieur)?\.?\s*)?([A-ZÀ-ÖØ-Ý][A-ZÀ-ÖØ-Ý' -]{1,80})\s+([A-ZÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ' -]{1,80})/);
+    if (inlineMatch) {
+      return normalizeUploaderPatientIdentity({
+        familyName: inlineMatch[1],
+        givenName: inlineMatch[2],
+        birthDate,
+        source: "heuristic-inline",
+      });
+    }
+
+    return normalizeUploaderPatientIdentity({
+      birthDate,
+      source: "heuristic-empty",
+    });
+  }
+
+  async function requestLmStudioPatientIdentity(options = {}) {
+    const model = await getLmStudioModelId();
+    const userContent = buildLmStudioPatientIdentityUserContent(options);
+    const payload = {
+      model,
+      temperature: 0,
+      max_tokens: LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS,
+      stream: false,
+      messages: [
+        {
+          role: "system",
+          content: "Tu extrais uniquement l'identite administrative du patient concerne. Reponds uniquement avec le bloc XML demande, sans commentaire.",
+        },
+        {
+          role: "user",
+          content: userContent,
+        },
+      ],
+    };
+
+    appendDebugLog("lmstudio:patient-identity-request", {
+      model,
+      promptLength: getLmStudioUserContentTextLength(userContent),
+      imageCount: countLmStudioUserContentImages(userContent),
+      maxTokens: LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS,
+    });
+
+    const response = await gmJsonRequest({
+      method: "POST",
+      url: LMSTUDIO_CHAT_COMPLETIONS_URL,
+      timeout: LMSTUDIO_REQUEST_TIMEOUT_MS,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      data: JSON.stringify(payload),
+    });
+    const answer = extractLmStudioAnswer(response);
+    const identity = parseLmStudioPatientIdentityOutput(answer);
+
+    appendDebugLog("lmstudio:patient-identity-answer", {
+      answerLength: answer.length,
+      hasFamilyName: Boolean(identity.familyName),
+      hasGivenName: Boolean(identity.givenName),
+      hasBirthDate: Boolean(identity.birthDate),
+    });
+
+    return identity;
+  }
+
+  function buildLmStudioPatientIdentityUserContent(options = {}) {
+    const sourceText = truncateLmStudioDocumentText(options.sourceText || "");
+    const prompt = [
+      "Le document WEDA est sur une ligne dont le patient est a definir.",
+      "Analyse le PDF et extrais uniquement l'identite du patient concerne par le document.",
+      "N'invente rien. Si une information est absente ou incertaine, laisse le champ vide.",
+      "Format obligatoire, sans texte autour :",
+      "<PATIENT_IDENTITE>",
+      "NOM: nom de famille du patient, en majuscules si possible",
+      "PRENOMS: prenom usuel puis autres prenoms utiles si presents",
+      "DATE_NAISSANCE: JJ/MM/AAAA si explicitement present, sinon vide",
+      "</PATIENT_IDENTITE>",
+      "",
+      "PDF:",
+      sourceText || "[texte non disponible, utiliser les images jointes si presentes]",
+    ].join("\n");
+    const images = getUploaderPdfPageImages(options);
+
+    if (!images.length) {
+      return prompt;
+    }
+
+    return [
+      {
+        type: "text",
+        text: `${prompt}\n\nIMPORTANT : si le texte est incomplet ou illisible, lis les images du PDF ci-dessous comme OCR visuel.`,
+      },
+      ...images.map((image) => ({
+        type: "image_url",
+        image_url: {
+          url: image.dataUrl,
+        },
+      })),
+    ];
+  }
+
+  function parseLmStudioPatientIdentityOutput(answer = "") {
+    const block = extractTaggedBlock(answer, "PATIENT_IDENTITE") || answer;
+    const fields = parseSimpleKeyValueBlock(block);
+
+    return normalizeUploaderPatientIdentity({
+      familyName: fields.NOM || fields.NOM_PATIENT || fields.PATIENT_NOM || "",
+      givenName: fields.PRENOMS || fields.PRENOM || fields.PRENOM_PATIENT || fields.PATIENT_PRENOM || "",
+      birthDate: fields.DATE_NAISSANCE || fields.NAISSANCE || fields.DATE_DE_NAISSANCE || "",
+      source: "lmstudio",
+    });
+  }
+
+  function normalizeUploaderPatientIdentity(identity = {}) {
+    let familyName = cleanWedaFindPatientNamePart(identity.familyName || identity.nom || "");
+    let givenName = cleanWedaFindPatientNamePart(identity.givenName || identity.prenom || identity.prenoms || "");
+    const fullName = cleanWedaFindPatientNamePart(identity.fullName || identity.patientLabel || "");
+
+    if ((!familyName || !givenName) && fullName) {
+      const parsed = parsePatientImportName(fullName);
+      familyName = familyName || parsed.familyName;
+      givenName = givenName || parsed.givenName;
+    }
+
+    if (!givenName && familyName.split(/\s+/).length >= 2) {
+      const parsed = parsePatientImportName(familyName);
+      familyName = parsed.familyName || familyName;
+      givenName = parsed.givenName || "";
+    }
+
+    familyName = cleanWedaFindPatientNamePart(familyName).toUpperCase();
+    givenName = cleanWedaFindPatientNamePart(givenName);
+    const birthDate = normalizePatientBirthDate(identity.birthDate || identity.dateNaissance || "");
+    const searchLabel = normalizeText([familyName, givenName].filter(Boolean).join(" "));
+
+    return {
+      familyName,
+      givenName,
+      birthDate,
+      searchLabel,
+      source: identity.source || "",
+    };
+  }
+
+  function cleanWedaFindPatientNamePart(value = "") {
+    return normalizeText(value)
+      .replace(/\b(?:m|mr|mme|madame|monsieur|mlle|melle)\.?\b/gi, "")
+      .replace(/\b(?:n[ée]e?|date\s+de\s+naissance|naissance|dob)\b[\s\S]*$/i, "")
+      .replace(/\b(?:nom|pr[eé]noms?|patient|patiente|identit[ée]|b[ée]n[ée]ficiaire|assur[ée]e?|concerne)\b\s*[:\-]?/gi, "")
+      .replace(/[()[\]{}<>]/g, " ")
+      .replace(/\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}/g, "")
+      .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ' -]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function hasUsableUploaderPatientIdentity(identity = {}) {
+    return Boolean(identity && identity.searchLabel && identity.familyName && (identity.givenName || identity.birthDate));
+  }
+
+  function getUploaderPdfPageImages(options = {}) {
+    return Array.isArray(options.pdfPageImages)
+      ? options.pdfPageImages.filter((image) => image && image.dataUrl)
+      : [];
+  }
+
+  async function openWedaFindPatientPanelForUploader(rowItem) {
+    const existingPanel = findWedaFindPatientPanel();
+    if (existingPanel) {
+      return existingPanel;
+    }
+
+    const freshItem = findFreshRowItem(rowItem) || rowItem;
+    if (!freshItem || !freshItem.patientLink) {
+      return null;
+    }
+
+    clickElement(freshItem.patientLink);
+    return waitFor(() => findWedaFindPatientPanel(), {
+      timeout: WEDA_FIND_PATIENT_MODE_WAIT_MS,
+      interval: 300,
+      description: "la recherche patient WEDA",
+    }).catch(() => null);
+  }
+
+  async function searchAndSelectWedaFindPatient(identity, options = {}) {
+    const input = await ensureWedaFindPatientNameSearchInput();
+    if (!input) {
+      const issue = buildWedaFindPatientIssue("missing-search-input", identity, 0, 0, 0);
+      appendDebugLog("weda:find-patient-uploader-blocked", issue);
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    setWedaFindPatientSearchInputValue(input, identity.searchLabel);
+    const searchButton = findWedaFindPatientSearchButton();
+    appendDebugLog("weda:find-patient-search-click", {
+      rowIndex: options.rowItem && options.rowItem.rowIndex,
+      hasSearchButton: Boolean(searchButton),
+      hasBirthDate: Boolean(identity.birthDate),
+      searchLength: identity.searchLabel.length,
+    });
+
+    if (searchButton) {
+      clickElement(searchButton);
+    } else if (input.name) {
+      callWedaPostBack(input.name, "");
+    }
+
+    let selection = null;
+    const searchStartedAt = Date.now();
+    try {
+      selection = await waitFor(() => {
+        if (Date.now() - searchStartedAt < WEDA_FIND_PATIENT_SEARCH_SETTLE_MS || isWedaAsyncPostBackActive()) {
+          return null;
+        }
+        const candidates = collectWedaFindPatientGridCandidates();
+        const selectedRowSelection = resolveWedaFindPatientSelectedGridSelection(identity, candidates);
+        if (selectedRowSelection && selectedRowSelection.link) {
+          return selectedRowSelection;
+        }
+        if (!candidates.length) {
+          return null;
+        }
+        const currentSelection = resolveWedaFindPatientGridSelection(identity, candidates);
+        return currentSelection && currentSelection.link ? currentSelection : null;
+      }, {
+        timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
+        interval: 400,
+        description: "les resultats de recherche patient WEDA",
+      });
+    } catch (_error) {
+      const candidates = collectWedaFindPatientGridCandidates();
+      selection = resolveWedaFindPatientSelectedGridSelection(identity, candidates) ||
+        resolveWedaFindPatientGridSelection(identity, candidates);
+    }
+
+    if (!selection || !selection.link) {
+      const issue = buildWedaFindPatientIssue(
+        selection && selection.reason || "no-grid-selection",
+        identity,
+        selection && selection.candidateCount || 0,
+        selection && selection.topScore || 0,
+        selection && selection.scoreGap || 0
+      );
+      appendDebugLog("weda:find-patient-selection-blocked", {
+        ...issue,
+        hasBirthDateHint: Boolean(identity.birthDate),
+      });
+      setPanelStatus(issue.message);
+      return null;
+    }
+
+    appendDebugLog("weda:find-patient-row-click", {
+      rowIndex: options.rowItem && options.rowItem.rowIndex,
+      selectionReason: selection.reason || "",
+      candidateCount: selection.candidateCount || 0,
+      selectedIndex: selection.selectedIndex,
+      score: selection.score || 0,
+      scoreGap: selection.scoreGap || 0,
+      birthDateMatch: Boolean(selection.birthDateMatch),
+      nameMatch: Boolean(selection.nameMatch),
+      patientLabel: selection.patientLabel || "",
+    });
+    setPanelStatus(`Patient WEDA retrouve : ${selection.patientLabel || identity.searchLabel}`);
+    clickElement(selection.link);
+
+    const appliedItem = await waitForWedaFindPatientSelectionApplied(options);
+    return {
+      ...selection,
+      appliedItem,
+    };
+  }
+
+  function findWedaFindPatientPanel() {
+    const panel = document.querySelector(WEDA_FIND_PATIENT_PANEL_SELECTOR);
+    return isWedaFindPatientPanelOpen(panel) ? panel : null;
+  }
+
+  function isWedaFindPatientPanelOpen(panel) {
+    if (!panel || panel.hidden || panel.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+
+    const style = window.getComputedStyle ? window.getComputedStyle(panel) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0)) {
+      return false;
+    }
+
+    const rect = typeof panel.getBoundingClientRect === "function" ? panel.getBoundingClientRect() : null;
+    return !rect || (rect.width > 0 && rect.height > 0);
+  }
+
+  function findWedaFindPatientSearchInput(panel = findWedaFindPatientPanel()) {
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    return null;
+  }
+
+  function findWedaFindPatientModeSelect(panel = findWedaFindPatientPanel()) {
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_MODE_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    return null;
+  }
+
+  function findWedaFindPatientSearchButton(panel = findWedaFindPatientPanel()) {
+    const roots = [panel, document].filter(Boolean)
+      .filter((root, index, list) => list.indexOf(root) === index);
+
+    for (const root of roots) {
+      const exact = root.querySelector(WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR);
+      if (exact && isElementVisible(exact)) {
+        return exact;
+      }
+    }
+
+    return null;
+  }
+
+  async function ensureWedaFindPatientNameSearchInput() {
+    let select = findWedaFindPatientModeSelect();
+    if (!select) {
+      select = await waitFor(() => findWedaFindPatientModeSelect(), {
+        timeout: WEDA_FIND_PATIENT_MODE_WAIT_MS,
+        interval: 300,
+        description: "la liste de mode de recherche patient WEDA",
+      }).catch(() => null);
+    }
+
+    if (!select || !isElementVisible(select)) {
+      appendDebugLog("weda:find-patient-mode-select-missing", {});
+      return null;
+    }
+
+    const modeSwitched = await ensureWedaFindPatientNameModeSelected(select);
+    if (modeSwitched === null) {
+      return null;
+    }
+
+    const input = await waitForWedaFindPatientNameSearchInput(
+      modeSwitched ? "le champ de recherche patient par nom apres changement de mode" : "le champ de recherche patient par nom"
+    );
+    if (input) {
+      return input;
+    }
+
+    const freshSelect = findWedaFindPatientModeSelect();
+    if (freshSelect && freshSelect.name) {
+      callWedaPostBack(freshSelect.name, "");
+    }
+
+    return waitForWedaFindPatientNameSearchInput("le champ de recherche patient par nom apres postback");
+  }
+
+  async function ensureWedaFindPatientNameModeSelected(select) {
+    const currentMode = String(select && select.value || "");
+    if (currentMode === WEDA_FIND_PATIENT_NAME_MODE_VALUE) {
+      return false;
+    }
+
+    const nameOption = Array.from(select.options || [])
+      .find((option) => String(option.value || "") === WEDA_FIND_PATIENT_NAME_MODE_VALUE);
+    if (!nameOption) {
+      appendDebugLog("weda:find-patient-name-mode-option-missing", {
+        currentMode,
+        expectedMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+        availableModes: Array.from(select.options || [])
+          .map((option) => String(option.value || ""))
+          .filter(Boolean)
+          .slice(0, 40),
+      });
+      return null;
+    }
+
+    appendDebugLog("weda:find-patient-mode-switch", {
+      fromMode: currentMode,
+      toMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+      optionText: normalizeText(nameOption.textContent || nameOption.label || ""),
+    });
+
+    Array.from(select.options || []).forEach((option) => {
+      option.selected = option === nameOption;
+    });
+    setNativeSelectValue(select, WEDA_FIND_PATIENT_NAME_MODE_VALUE);
+    dispatchWedaSelectValueEvents(select);
+    await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
+    return true;
+  }
+
+  async function waitForWedaFindPatientNameSearchInput(description) {
+    return waitFor(() => {
+      if (isWedaAsyncPostBackActive()) {
+        return null;
+      }
+
+      const select = findWedaFindPatientModeSelect();
+      if (!select || select.value !== WEDA_FIND_PATIENT_NAME_MODE_VALUE) {
+        return null;
+      }
+      return findWedaFindPatientSearchInput();
+    }, {
+      timeout: WEDA_FIND_PATIENT_MODE_WAIT_MS,
+      interval: 300,
+      description,
+    }).catch(() => null);
+  }
+
+  function setWedaFindPatientSearchInputValue(input, value) {
+    input.focus();
+    setNativeInputValue(input, value);
+
+    try {
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: value,
+      }));
+    } catch (_error) {
+      input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+    }
+  }
+
+  function collectWedaFindPatientGridCandidates() {
+    const grids = Array.from(document.querySelectorAll(WEDA_FIND_PATIENT_GRID_SELECTOR))
+      .filter((grid) => grid && isElementVisible(grid));
+    if (!grids.length) {
+      return [];
+    }
+
+    return grids.flatMap((grid) => Array.from(grid.querySelectorAll("tr")))
+      .filter((row) => row && !row.classList.contains("grid-header") && !row.classList.contains("grid-pager"))
+      .map((row, index) => buildWedaFindPatientGridCandidate(row, index))
+      .filter((candidate) => candidate && candidate.link && (candidate.patientLabel || candidate.birthDate));
+  }
+
+  function buildWedaFindPatientGridCandidate(row, index) {
+    const cells = Array.from(row.children || []).filter((cell) => /^(?:td|th)$/i.test(cell.tagName || ""));
+    const patientLink = row.querySelector("a[id*='LinkButtonOldPatientGetNomPrenom'], a[id*='LinkButtonPatientGetNomPrenom']") ||
+      (cells[2] ? cells[2].querySelector("a") : null);
+    const birthDateLink = row.querySelector("a[id*='LinkButtonOldPatienDateNaissance'], a[id*='LinkButtonPatienDateNaissance']") ||
+      (cells[3] ? cells[3].querySelector("a") : null);
+    const maidenNameLink = row.querySelector("a[id*='LinkButtonOldPatientNomJeuneFille'], a[id*='LinkButtonPatientNomJeuneFille']") ||
+      (cells[6] ? cells[6].querySelector("a") : null);
+    const patientLabel = cleanPatientImportLabel(patientLink ? patientLink.textContent : (cells[2] ? cells[2].textContent : ""));
+    const birthDate = normalizePatientBirthDate(birthDateLink ? birthDateLink.textContent : (cells[3] ? cells[3].textContent : ""));
+    const maidenName = cleanPatientImportLabel(maidenNameLink ? maidenNameLink.textContent : (cells[6] ? cells[6].textContent : ""));
+
+    return {
+      row,
+      link: patientLink || row.querySelector("a[href*='WebForm_DoPostBackWithOptions']"),
+      index,
+      patientLabel,
+      birthDate,
+      maidenName,
+      nameParts: parsePatientImportName(patientLabel),
+    };
+  }
+
+  function resolveWedaFindPatientSelectedGridSelection(identity = {}, candidates = collectWedaFindPatientGridCandidates()) {
+    const selectedRow = document.querySelector(WEDA_FIND_PATIENT_SELECTED_ROW_SELECTOR);
+    if (!selectedRow || !isElementVisible(selectedRow)) {
+      return null;
+    }
+
+    const candidate = buildWedaFindPatientGridCandidate(selectedRow, 0);
+    if (!candidate || !candidate.link) {
+      return null;
+    }
+
+    const score = scoreWedaFindPatientGridCandidate(candidate, identity);
+    return {
+      link: candidate.link,
+      reason: "selected-row",
+      candidateCount: Array.isArray(candidates) && candidates.length ? candidates.length : 1,
+      selectedIndex: candidate.index,
+      score: Math.max(score.value, WEDA_FIND_PATIENT_MIN_SCORE),
+      scoreGap: 9999,
+      birthDateMatch: score.birthDateMatch,
+      nameMatch: score.nameMatch,
+      patientLabel: candidate.patientLabel || "",
+      birthDate: candidate.birthDate || "",
+      maidenName: candidate.maidenName || "",
+    };
+  }
+
+  function resolveWedaFindPatientGridSelection(identity = {}, candidates = collectWedaFindPatientGridCandidates()) {
+    if (!candidates.length) {
+      return {
+        link: null,
+        blocked: false,
+        reason: "missing-results",
+        candidateCount: 0,
+      };
+    }
+
+    const scored = candidates
+      .map((candidate) => {
+        const score = scoreWedaFindPatientGridCandidate(candidate, identity);
+        return {
+          ...candidate,
+          score: score.value,
+          nameMatch: score.nameMatch,
+          birthDateMatch: score.birthDateMatch,
+        };
+      })
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+    const best = scored[0] || null;
+    const second = scored[1] || null;
+    const scoreGap = best && second ? best.score - second.score : best ? best.score : 0;
+    const birthMatches = scored.filter((candidate) => candidate.birthDateMatch);
+    const nameMatches = scored.filter((candidate) => candidate.nameMatch);
+    let selected = null;
+    let reason = "";
+
+    if (birthMatches.length === 1 && birthMatches[0].score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = birthMatches[0];
+      reason = "unique-birth-date";
+    } else if (nameMatches.length === 1 && nameMatches[0].score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = nameMatches[0];
+      reason = "unique-name";
+    } else if (scored.length === 1 && best.score >= WEDA_FIND_PATIENT_MIN_SCORE) {
+      selected = best;
+      reason = "single-result";
+    } else if (
+      best &&
+      best.score >= WEDA_FIND_PATIENT_MIN_SCORE &&
+      (!second || scoreGap >= WEDA_FIND_PATIENT_AMBIGUITY_MARGIN)
+    ) {
+      selected = best;
+      reason = "best-score";
+    }
+
+    if (!selected) {
+      return {
+        link: null,
+        blocked: true,
+        reason: best && best.score > 0 ? "ambiguous-find-patient-selection" : "no-find-patient-match",
+        candidateCount: scored.length,
+        topScore: best ? best.score : 0,
+        scoreGap,
+        hasBirthDateHint: Boolean(identity.birthDate),
+      };
+    }
+
+    return {
+      link: selected.link,
+      reason,
+      candidateCount: scored.length,
+      selectedIndex: selected.index,
+      score: selected.score,
+      scoreGap,
+      birthDateMatch: selected.birthDateMatch,
+      nameMatch: selected.nameMatch,
+      patientLabel: selected.patientLabel || "",
+      birthDate: selected.birthDate || "",
+      maidenName: selected.maidenName || "",
+    };
+  }
+
+  function scoreWedaFindPatientGridCandidate(candidate = {}, identity = {}) {
+    let value = 0;
+    let nameMatch = false;
+    let birthDateMatch = false;
+    const labelText = normalizePatientCompareText([candidate.patientLabel, candidate.maidenName].filter(Boolean).join(" "));
+    const candidateName = candidate.nameParts || parsePatientImportName(candidate.patientLabel || "");
+    const candidateFamily = normalizePatientCompareText(candidateName.familyName || "").trim();
+    const candidateGiven = normalizePatientCompareText(candidateName.givenName || "").trim();
+    const family = normalizePatientCompareText(identity.familyName || "").trim();
+    const given = normalizePatientCompareText(identity.givenName || "").trim();
+    const full = normalizePatientCompareText(identity.searchLabel || "").trim();
+
+    if (identity.birthDate && candidate.birthDate === identity.birthDate) {
+      value += 1200;
+      birthDateMatch = true;
+    }
+
+    if (full && labelText.includes(` ${full} `)) {
+      value += 850;
+      nameMatch = true;
+    }
+
+    if (family && given && labelText.includes(` ${family} `) && labelText.includes(` ${given} `)) {
+      value += 650;
+      nameMatch = true;
+    }
+
+    if (family && candidateFamily === family) {
+      value += 260;
+      nameMatch = true;
+    } else if (family && labelText.includes(` ${family} `)) {
+      value += 160;
+    }
+
+    if (given && candidateGiven === given) {
+      value += 220;
+      nameMatch = true;
+    } else if (given && labelText.includes(` ${given} `)) {
+      value += 120;
+    }
+
+    return {
+      value,
+      nameMatch,
+      birthDateMatch,
+    };
+  }
+
+  function buildWedaFindPatientIssue(reason, identity = {}, candidateCount = 0, topScore = 0, scoreGap = 0) {
+    const message = reason === "ambiguous-find-patient-selection"
+      ? "Recherche patient WEDA bloquee : plusieurs patients restent plausibles."
+      : reason === "no-find-patient-match"
+        ? "Recherche patient WEDA bloquee : aucun resultat ne correspond clairement au PDF."
+        : "Recherche patient WEDA bloquee : impossible de selectionner automatiquement le patient.";
+
+    return {
+      blocked: true,
+      reason,
+      at: Date.now(),
+      message,
+      candidateCount,
+      topScore,
+      scoreGap,
+      hasBirthDateHint: Boolean(identity.birthDate),
+      searchLabel: identity.searchLabel || "",
+      source: "uploader-find-patient",
+    };
+  }
+
+  async function waitForWedaFindPatientSelectionApplied(options = {}) {
+    try {
+      await waitFor(() => !findWedaFindPatientPanel(), {
+        timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
+        interval: 400,
+        description: "la fermeture de la recherche patient WEDA",
+      });
+    } catch (_error) {
+      appendDebugLog("weda:find-patient-panel-still-open-after-click", {
+        rowIndex: options.rowItem && options.rowItem.rowIndex,
+        candidateCount: collectWedaFindPatientGridCandidates().length,
+      });
+      return null;
+    }
+
+    await waitForWedaIdleForAtcd().catch(() => null);
+    await sleep(WEDA_FIND_PATIENT_SELECTION_SETTLE_MS);
+
+    return waitFor(() => {
+      const fresh = findFreshRowItem(options.rowItem);
+      if (!fresh || isUploaderPatientUndefined(fresh)) {
+        return null;
+      }
+      return fresh;
+    }, {
+      timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
+      interval: 400,
+      description: "l'attribution du patient sur la ligne WEDA",
+    }).catch(() => findFreshRowItem(options.rowItem));
+  }
+
+  function cleanPatientImportLabel(value) {
+    return normalizeText(value)
+      .replace(/\bImporter\s+le\s+message\b/gi, "")
+      .replace(/\bQualifi[eé]\b/gi, "")
+      .replace(/\bNon\s+qualifi[eé]\b/gi, "")
+      .trim();
+  }
+
+  function parsePatientImportName(label) {
+    const tokens = normalizeText(label)
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter(Boolean);
+    const familyTokens = [];
+
+    for (const token of tokens) {
+      if (!isUppercaseNameToken(token)) {
+        break;
+      }
+      familyTokens.push(token);
+    }
+
+    let familyName = familyTokens.join(" ");
+    let givenName = tokens.slice(familyTokens.length).join(" ");
+
+    if (!familyName && tokens.length >= 2) {
+      familyName = tokens[0];
+      givenName = tokens.slice(1).join(" ");
+    }
+
+    if (!givenName && tokens.length >= 2) {
+      givenName = tokens.slice(-1).join(" ");
+      familyName = tokens.slice(0, -1).join(" ");
+    }
+
+    return {
+      familyName: normalizeText(familyName),
+      givenName: normalizeText(givenName),
+      fullName: normalizeText(label),
+      invertedName: normalizeText([givenName, familyName].filter(Boolean).join(" ")),
+    };
+  }
+
+  function isUppercaseNameToken(token) {
+    const letters = String(token || "").replace(/[^A-Za-zÀ-ÖØ-öø-ÿ]/g, "");
+    return Boolean(letters && letters !== letters.toLowerCase() && letters === letters.toUpperCase());
+  }
+
+  function extractLikelyPatientIdentitySourceText(sourceText) {
+    const lines = normalizeMultilineText(sourceText)
+      .split("\n")
+      .map((line) => normalizeText(line))
+      .filter(Boolean);
+    const headLines = lines.slice(0, 50);
+    const identityLines = lines
+      .filter((line) => {
+        const normalized = normalizeForCompare(line);
+        return /\b(?:patient|patiente|identite|nom|prenom|naissance|ne le|nee le|date de naissance|dob|beneficiaire|assure|assuree|concerne)\b/.test(normalized);
+      })
+      .slice(0, 30);
+
+    return normalizeMultilineText(uniqueStrings(headLines.concat(identityLines)).join("\n"));
+  }
+
+  function extractPatientBirthDateHints(text, options = {}) {
+    const source = String(text || "");
+    const dates = [];
+    const datePattern = "(\\d{1,2}[\\/.\\-]\\d{1,2}[\\/.\\-]\\d{2,4})";
+    [
+      new RegExp(`(?:n[ée]e?|date\\s+de\\s+naissance|naissance|dob|birth)\\D{0,45}${datePattern}`, "gi"),
+      new RegExp(`(?:patient|patiente|b[ée]n[ée]ficiaire|assur[ée]e?|identit[ée]|nom|pr[ée]nom)\\D{0,95}${datePattern}`, "gi"),
+    ].forEach((pattern) => collectPatientBirthDateMatches(source, pattern, dates));
+
+    if (options.allowLooseParentheses) {
+      collectPatientBirthDateMatches(source, new RegExp(`\\(\\s*${datePattern}\\s*\\)`, "g"), dates);
+      collectPatientBirthDateMatches(source, new RegExp(`:\\s*[^\\n:]{0,90}${datePattern}`, "g"), dates);
+    }
+
+    return uniqueStrings(dates);
+  }
+
+  function collectPatientBirthDateMatches(source, pattern, dates) {
+    let match = null;
+    while ((match = pattern.exec(source)) !== null) {
+      const date = normalizePatientBirthDate(match[1] || "");
+      if (date) {
+        dates.push(date);
+      }
+    }
+  }
+
+  function normalizePatientBirthDate(value) {
+    const match = String(value || "").match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+    if (!match) {
+      return "";
+    }
+
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    let year = String(match[3] || "");
+
+    if (!day || !month || day > 31 || month > 12) {
+      return "";
+    }
+
+    if (year.length === 2) {
+      const numericYear = Number(year);
+      year = String(numericYear >= 30 ? 1900 + numericYear : 2000 + numericYear);
+    }
+
+    if (!/^\d{4}$/.test(year)) {
+      return "";
+    }
+
+    return [
+      String(day).padStart(2, "0"),
+      String(month).padStart(2, "0"),
+      year,
+    ].join("/");
+  }
+
+  function normalizePatientCompareText(value) {
+    const text = normalizeForCompare(value)
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text ? ` ${text} ` : " ";
+  }
+
+  function getLmStudioUserContentTextLength(content) {
+    if (typeof content === "string") {
+      return content.length;
+    }
+
+    if (!Array.isArray(content)) {
+      return 0;
+    }
+
+    return content.reduce((total, part) => total + String(part && part.text || "").length, 0);
+  }
+
+  function countLmStudioUserContentImages(content) {
+    if (!Array.isArray(content)) {
+      return 0;
+    }
+
+    return content.filter((part) => part && part.type === "image_url").length;
+  }
+
+  function setNativeSelectValue(select, value) {
+    const win = select && select.ownerDocument && select.ownerDocument.defaultView || window;
+    const descriptor = Object.getOwnPropertyDescriptor(win.HTMLSelectElement.prototype, "value");
+
+    if (descriptor && typeof descriptor.set === "function") {
+      descriptor.set.call(select, value);
+    } else {
+      select.value = value;
+    }
+  }
+
+  function dispatchWedaSelectValueEvents(select) {
+    try {
+      select.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      select.dispatchEvent(new FocusEvent("focus", { bubbles: false }));
+    } catch (_error) {
+      // Les evenements standards ci-dessous restent suffisants dans la plupart des cas.
+    }
+
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    select.dispatchEvent(new KeyboardEvent("keydown", enterKeyOptions()));
+    select.dispatchEvent(new KeyboardEvent("keyup", enterKeyOptions()));
+
+    try {
+      select.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      select.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+      select.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+    } catch (_error) {
+      // Best effort pour les versions WEDA qui sauvegardent sur blur/focusout.
+    }
+  }
+
+  function isWedaAsyncPostBackActive() {
+    try {
+      const sys = (typeof unsafeWindow !== "undefined" && unsafeWindow.Sys) || window.Sys;
+      const prm = sys && sys.WebForms && sys.WebForms.PageRequestManager && sys.WebForms.PageRequestManager.getInstance
+        ? sys.WebForms.PageRequestManager.getInstance()
+        : null;
+      return Boolean(prm && typeof prm.get_isInAsyncPostBack === "function" && prm.get_isInAsyncPostBack());
+    } catch (_error) {
+      return false;
+    }
   }
 
   async function openWedaAntecedentWorkerFromUploaderIfNeeded(result, title, rowItem) {
@@ -1962,6 +3019,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const startedAt = Date.now();
     const previousPdfUrl = options.previousPdfUrl || "";
     const minPerformanceStartTime = Number(options.minPerformanceStartTime || 0);
+    const allowSamePdf = Boolean(options.allowSamePdf);
 
     return waitFor(() => {
       const displayed = getDisplayedPdf({ includePerformance: false });
@@ -1983,7 +3041,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         if (Date.now() - startedAt < PDF_SAME_URL_ACCEPT_DELAY_MS) {
           return null;
         }
-        return null;
+        return allowSamePdf ? displayed : null;
       }
 
       return displayed;
@@ -3360,6 +4418,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase();
+  }
+
+  function uniqueStrings(values) {
+    return Array.from(new Set((Array.isArray(values) ? values : [])
+      .map((value) => normalizeText(value))
+      .filter(Boolean)));
   }
 
   function safeDecodeURIComponent(value) {

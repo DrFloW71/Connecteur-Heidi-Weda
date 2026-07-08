@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.30
+// @version      0.1.33
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -66,7 +66,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.30";
+  const SCRIPT_VERSION = "0.1.33";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -84,10 +84,11 @@
   const CANCEL_KEY = `${STORAGE_PREFIX}cancel`;
   const STATUS_KEY = `${STORAGE_PREFIX}status`;
   const DEBUG_LOG_KEY = `${STORAGE_PREFIX}debugLog.v1`;
-  const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v6`;
-  const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v6`;
+  const TITLES_KEY = `${STORAGE_PREFIX}rememberedTitles.v7`;
+  const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v7`;
   const PATIENTS_KEY = `${STORAGE_PREFIX}rememberedPatients.v1`;
   const AUTO_SEEN_ROWS_KEY = `${STORAGE_PREFIX}autoSeenRows.v1`;
+  const AUTO_INTERVAL_KEY = `${STORAGE_PREFIX}autoIntervalMs.v1`;
   const HEIDI_COURRIER_TAB_ROLE_KEY = `${STORAGE_PREFIX}heidiTabRole`;
   const HEIDI_COURRIER_SESSION_ID_KEY = `${STORAGE_PREFIX}heidiSessionId`;
   const HEIDI_COURRIER_SESSION_URL_KEY = `${STORAGE_PREFIX}heidiSessionUrl`;
@@ -116,6 +117,9 @@
     "#messageContainer div.mssAttachment embed[src*='downloadAttachment']",
     "#messageContainer div.mssAttachment embed[src*='application%2Fpdf']",
     "#messageContainer div.mssAttachment iframe[type='application/pdf']",
+    "#messageContainer div.attachmentContainer iframe[src*='BinaryData']",
+    "#messageContainer .view-pdf-document-uc-form iframe[src*='BinaryData']",
+    "#messageContainer iframe#iFrameViewFile",
     "#container #plugin",
     "embed#plugin",
     "embed[type='application/x-google-chrome-pdf']",
@@ -153,6 +157,8 @@
   const DOC_IMPORT_ATTACHMENT_SELECTOR = [
     "#messageContainer we-doc-import.docImportAttach",
     "#messageContainer .docImportAttach",
+    "#messageContainer div.attachmentContainer",
+    "#messageContainer .view-pdf-document-uc-form",
     "#messageContainer div.mssAttachment",
     "#messageContainer div.messageAttachment",
   ].join(", ");
@@ -203,6 +209,9 @@
   const SELECTOR_WEDA_DATE_PONCTUELLE = "#ContentPlaceHolder1_TextBoxAntecedentDatePonctuel";
   const SELECTOR_WEDA_VALID = "#ContentPlaceHolder1_ButtonValid";
   const AUTO_INTERVAL_MS = 60 * 1000;
+  const AUTO_INTERVAL_MIN_MS = 15 * 1000;
+  const AUTO_INTERVAL_MAX_MS = 60 * 60 * 1000;
+  const PENDING_COURRIER_FAVICON_REFRESH_MS = 30000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -262,6 +271,11 @@
   let titleManualEditCommitTimer = null;
   let autoRefreshTimer = null;
   let autoHeartbeatTimer = null;
+  let pendingCourrierFaviconOriginal = null;
+  let pendingCourrierFaviconObserver = null;
+  let pendingCourrierFaviconTimer = null;
+  let pendingCourrierFaviconInterval = null;
+  let lastPendingCourrierFaviconCount = null;
   let wedaMssanteReconnectTimer = null;
   let wedaMssanteReconnectObserver = null;
   let wedaMssanteReconnectClickAttempted = false;
@@ -427,6 +441,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function initWeda() {
     createWedaPanel();
     syncPanelWithState();
+    setupPendingCourrierFaviconCounter();
     appendDebugLog("weda:init", {
       version: getScriptVersion(),
       hasMessageList: Boolean(document.querySelector(MESSAGE_LIST_SELECTOR)),
@@ -625,6 +640,173 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       /pro\s+sante\s+connect/.test(text);
   }
 
+  function setupPendingCourrierFaviconCounter() {
+    rememberPendingCourrierFaviconOriginal();
+    schedulePendingCourrierFaviconRefresh("init");
+
+    if (!pendingCourrierFaviconObserver && typeof MutationObserver !== "undefined" && document.body) {
+      pendingCourrierFaviconObserver = new MutationObserver(() => {
+        schedulePendingCourrierFaviconRefresh("mutation");
+      });
+      pendingCourrierFaviconObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+    }
+
+    if (!pendingCourrierFaviconInterval) {
+      pendingCourrierFaviconInterval = window.setInterval(() => {
+        schedulePendingCourrierFaviconRefresh("interval");
+      }, PENDING_COURRIER_FAVICON_REFRESH_MS);
+    }
+
+    window.addEventListener("focus", () => {
+      schedulePendingCourrierFaviconRefresh("focus");
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        schedulePendingCourrierFaviconRefresh("visible");
+      }
+    });
+  }
+
+  function schedulePendingCourrierFaviconRefresh(reason = "check") {
+    window.clearTimeout(pendingCourrierFaviconTimer);
+    pendingCourrierFaviconTimer = window.setTimeout(() => {
+      refreshPendingCourrierFavicon(reason);
+    }, reason === "init" ? 0 : 250);
+  }
+
+  function refreshPendingCourrierFavicon(reason = "check") {
+    const count = countPendingCourrierRows();
+    if (count === null) {
+      if (lastPendingCourrierFaviconCount !== null) {
+        restorePendingCourrierFavicon();
+        lastPendingCourrierFaviconCount = null;
+      }
+      return;
+    }
+
+    if (lastPendingCourrierFaviconCount === count) {
+      return;
+    }
+
+    lastPendingCourrierFaviconCount = count;
+    setPendingCourrierFaviconBadge(count);
+    appendDebugLog("weda:pending-courrier-count-favicon", {
+      count,
+      reason,
+    });
+  }
+
+  function countPendingCourrierRows() {
+    const list = document.querySelector(MESSAGE_LIST_SELECTOR);
+    if (!list) {
+      return null;
+    }
+
+    return getBiologyRows().length;
+  }
+
+  function rememberPendingCourrierFaviconOriginal() {
+    if (pendingCourrierFaviconOriginal) {
+      return;
+    }
+
+    const link = document.querySelector("link[rel~='icon'], link[rel='shortcut icon']");
+    pendingCourrierFaviconOriginal = {
+      existed: Boolean(link),
+      href: link ? (link.getAttribute("href") || "") : "",
+      rel: link ? (link.getAttribute("rel") || "icon") : "icon",
+      type: link ? (link.getAttribute("type") || "") : "",
+    };
+  }
+
+  function getPendingCourrierFaviconLink() {
+    let link = document.querySelector("link[rel~='icon'], link[rel='shortcut icon']");
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      link.dataset.wedaCourrierLmStudioFavicon = "1";
+      document.head.appendChild(link);
+    }
+    return link;
+  }
+
+  function restorePendingCourrierFavicon() {
+    rememberPendingCourrierFaviconOriginal();
+
+    const link = document.querySelector("link[rel~='icon'], link[rel='shortcut icon']");
+    if (!link) {
+      return;
+    }
+
+    if (pendingCourrierFaviconOriginal && pendingCourrierFaviconOriginal.existed) {
+      link.setAttribute("rel", pendingCourrierFaviconOriginal.rel || "icon");
+      if (pendingCourrierFaviconOriginal.href) {
+        link.setAttribute("href", pendingCourrierFaviconOriginal.href);
+      } else {
+        link.removeAttribute("href");
+      }
+      if (pendingCourrierFaviconOriginal.type) {
+        link.setAttribute("type", pendingCourrierFaviconOriginal.type);
+      } else {
+        link.removeAttribute("type");
+      }
+      return;
+    }
+
+    if (link.dataset && link.dataset.wedaCourrierLmStudioFavicon === "1") {
+      link.remove();
+    }
+  }
+
+  function setPendingCourrierFaviconBadge(count) {
+    const dataUrl = drawPendingCourrierFaviconBadge(count);
+    if (!dataUrl) {
+      return;
+    }
+
+    const link = getPendingCourrierFaviconLink();
+    link.setAttribute("rel", "icon");
+    link.setAttribute("type", "image/png");
+    link.setAttribute("href", dataUrl);
+  }
+
+  function drawPendingCourrierFaviconBadge(count) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 64;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return "";
+    }
+
+    const safeCount = Math.max(0, Math.round(Number(count) || 0));
+    const label = safeCount > 99 ? "99+" : String(safeCount);
+    const fontSize = label.length <= 1 ? 38 : label.length === 2 ? 32 : 24;
+
+    ctx.clearRect(0, 0, 64, 64);
+    ctx.beginPath();
+    ctx.arc(32, 32, 30, 0, Math.PI * 2);
+    ctx.fillStyle = "#174ea6";
+    ctx.fill();
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `800 ${fontSize}px Arial, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, 32, label.length > 2 ? 33 : 34);
+
+    return canvas.toDataURL("image/png");
+  }
+
   function createWedaPanel() {
     if (document.getElementById(PANEL_ID)) {
       return;
@@ -641,7 +823,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE COURRIERS LM STUDIO + ATCD</button>
-        <button type="button" id="wbh-auto">MODE AUTO 1 MIN</button>
+        <button type="button" id="wbh-auto">${getAutoModeButtonLabel(false)}</button>
+        <label class="wbh-auto-delay" title="Durée entre deux vérifications automatiques">
+          <span>Auto</span>
+          <input type="number" id="wbh-auto-interval" min="${AUTO_INTERVAL_MIN_MS / 1000}" max="${AUTO_INTERVAL_MAX_MS / 1000}" step="15" inputmode="numeric">
+          <span>s</span>
+        </label>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-show-logs">Logs</button>
         <button type="button" id="wbh-copy-logs">Copier logs</button>
@@ -779,6 +966,33 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         background: #a74400;
         border-color: #a74400;
       }
+      #${PANEL_ID} .wbh-auto-delay {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        margin: 0 6px 8px 0;
+        border: 1px solid #b9c7e6;
+        border-radius: 6px;
+        padding: 4px 6px;
+        background: #ffffff;
+        color: #174ea6;
+        font-size: 12px;
+        font-weight: 800;
+        line-height: 1;
+        white-space: nowrap;
+        vertical-align: middle;
+      }
+      #${PANEL_ID} #wbh-auto-interval {
+        width: 52px;
+        min-width: 52px;
+        box-sizing: border-box;
+        border: 1px solid #9fb7e8;
+        border-radius: 5px;
+        padding: 4px 5px;
+        color: #14264a;
+        font: 700 12px Arial, sans-serif;
+        text-align: right;
+      }
       #${PANEL_ID} button:disabled {
         opacity: 0.55;
         cursor: default;
@@ -813,6 +1027,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     document.getElementById("wbh-collapse").addEventListener("click", toggleWedaPanelCollapsed);
     document.getElementById("wbh-start").addEventListener("click", startWedaWorkflow);
     document.getElementById("wbh-auto").addEventListener("click", toggleAutoMode);
+    document.getElementById("wbh-auto-interval").addEventListener("change", handleAutoIntervalInputChange);
+    document.getElementById("wbh-auto-interval").addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter") {
+        event.preventDefault();
+        handleAutoIntervalInputChange();
+        event.currentTarget.blur();
+      }
+    });
     document.getElementById("wbh-clear-memory").addEventListener("click", clearRememberedTitles);
     document.getElementById("wbh-show-logs").addEventListener("click", toggleDebugLogPanel);
     document.getElementById("wbh-copy-logs").addEventListener("click", copyDebugLogs);
@@ -959,11 +1182,85 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     panel.style.bottom = "auto";
   }
 
+  function normalizeAutoIntervalMs(value, fallback = AUTO_INTERVAL_MS) {
+    const number = Number(value);
+    const fallbackNumber = Number(fallback);
+    const safeFallback = Number.isFinite(fallbackNumber) ? fallbackNumber : AUTO_INTERVAL_MS;
+
+    if (!Number.isFinite(number)) {
+      return Math.min(AUTO_INTERVAL_MAX_MS, Math.max(AUTO_INTERVAL_MIN_MS, Math.round(safeFallback)));
+    }
+
+    return Math.min(AUTO_INTERVAL_MAX_MS, Math.max(AUTO_INTERVAL_MIN_MS, Math.round(number)));
+  }
+
+  function getAutoIntervalMs() {
+    return normalizeAutoIntervalMs(GM_getValue(AUTO_INTERVAL_KEY, AUTO_INTERVAL_MS));
+  }
+
+  function setAutoIntervalMs(value) {
+    const intervalMs = normalizeAutoIntervalMs(value);
+    GM_setValue(AUTO_INTERVAL_KEY, intervalMs);
+    return intervalMs;
+  }
+
+  function formatAutoIntervalLabel(intervalMs = getAutoIntervalMs()) {
+    const seconds = Math.round(normalizeAutoIntervalMs(intervalMs) / 1000);
+    if (seconds >= 60 && seconds % 60 === 0) {
+      return `${seconds / 60} MIN`;
+    }
+    return `${seconds} S`;
+  }
+
+  function formatAutoIntervalSentence(intervalMs = getAutoIntervalMs()) {
+    const seconds = Math.round(normalizeAutoIntervalMs(intervalMs) / 1000);
+    if (seconds >= 60 && seconds % 60 === 0) {
+      const minutes = seconds / 60;
+      return `${minutes} min`;
+    }
+    return `${seconds} s`;
+  }
+
+  function getAutoModeButtonLabel(enabled, intervalMs = getAutoIntervalMs()) {
+    return enabled ? "DÉSACTIVER AUTO" : `MODE AUTO ${formatAutoIntervalLabel(intervalMs)}`;
+  }
+
+  function handleAutoIntervalInputChange() {
+    const input = document.getElementById("wbh-auto-interval");
+    if (!input) {
+      return;
+    }
+
+    const intervalMs = setAutoIntervalMs(Number(input.value) * 1000);
+    input.value = String(Math.round(intervalMs / 1000));
+
+    appendDebugLog("weda:auto-interval-change", {
+      intervalMs,
+      label: formatAutoIntervalSentence(intervalMs),
+    });
+
+    const state = getState();
+    if (state.autoEnabled && !state.running) {
+      const nextCheckAt = Date.now() + intervalMs;
+      setState({
+        autoNextCheckAt: nextCheckAt,
+        message: `Mode auto : vérification toutes les ${formatAutoIntervalSentence(intervalMs)}. Prochaine vérification vers ${formatTime(nextCheckAt)}.`,
+      });
+      scheduleAutoRefresh();
+      return;
+    }
+
+    syncPanelWithState();
+    setPanelStatus(`Mode auto : durée réglée à ${formatAutoIntervalSentence(intervalMs)}.`);
+  }
+
   function syncPanelWithState() {
     const state = getState();
     const startButton = document.getElementById("wbh-start");
     const autoButton = document.getElementById("wbh-auto");
+    const autoIntervalInput = document.getElementById("wbh-auto-interval");
     const stopButton = document.getElementById("wbh-stop");
+    const autoIntervalMs = getAutoIntervalMs();
 
     applyWedaPanelCollapsed(Boolean(state.panelCollapsed));
     applyWedaPanelPosition(state.panelPosition);
@@ -973,9 +1270,20 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 1 MIN";
+      autoButton.textContent = getAutoModeButtonLabel(Boolean(state.autoEnabled), autoIntervalMs);
+      autoButton.title = state.autoEnabled
+        ? "Désactiver le mode auto"
+        : `Activer le mode auto : vérification toutes les ${formatAutoIntervalSentence(autoIntervalMs)}.`;
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
+    }
+
+    if (autoIntervalInput) {
+      if (document.activeElement !== autoIntervalInput) {
+        autoIntervalInput.value = String(Math.round(autoIntervalMs / 1000));
+      }
+      autoIntervalInput.title = `Durée entre deux vérifications automatiques : ${formatAutoIntervalSentence(autoIntervalMs)}.`;
+      autoIntervalInput.disabled = false;
     }
 
     if (stopButton) {
@@ -1232,7 +1540,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
-    const nextCheckAt = state.autoNextCheckAt || Date.now() + AUTO_INTERVAL_MS;
+    const nextCheckAt = state.autoNextCheckAt || Date.now() + getAutoIntervalMs();
     const delay = Math.max(1000, nextCheckAt - Date.now());
 
     autoRefreshTimer = window.setTimeout(() => {
@@ -1362,14 +1670,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     markRowsSeen(getBiologyRows());
-    const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+    const autoIntervalMs = getAutoIntervalMs();
+    const nextCheckAt = Date.now() + autoIntervalMs;
     setState({
       autoEnabled: true,
       autoRefreshPending: false,
       autoNextCheckAt: nextCheckAt,
       autoTargetKeys: [],
       manualTargetKeys: [],
-      message: `Mode auto activé. Prochaine vérification vers ${formatTime(nextCheckAt)}.`,
+      message: `Mode auto activé : vérification toutes les ${formatAutoIntervalSentence(autoIntervalMs)}. Prochaine vérification vers ${formatTime(nextCheckAt)}.`,
     });
     scheduleAutoRefresh();
   }
@@ -1476,7 +1785,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
 
     if (!newRows.length) {
-      const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+      const nextCheckAt = Date.now() + getAutoIntervalMs();
       markRowsSeen(rows);
       setState({
         autoRefreshPending: false,
@@ -1940,9 +2249,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
   }
 
-  function getDisplayedBiologyContentKey(documentText = "") {
+  function getDisplayedBiologyContentKey(documentText = "", sourceType = "") {
     const text = normalizePdfText(documentText);
     if (text) {
+      if (sourceType === "message-body") {
+        return "messagebody-" + hashString(text);
+      }
       return "pdftext-" + hashString(text);
     }
 
@@ -2011,6 +2323,62 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       : null;
   }
 
+  function hasDisplayedAnalyzableAttachment(options = {}) {
+    if (getDisplayedPdfUrlCandidates({
+      excludeUrlKeys: options.excludeUrlKeys || [],
+    }).length) {
+      return true;
+    }
+
+    const root = document.querySelector("#messageContainer") || document;
+    return querySelectorAllDeep(root, [
+      DOC_IMPORT_ATTACHMENT_SELECTOR,
+      "div.attachmentContainer",
+      ".view-pdf-document-uc-form",
+      "#PanelViewDocument",
+      "iframe#iFrameViewFile",
+      "iframe[src*='BinaryData']",
+      "iframe[src*='downloadAttachment']",
+      "iframe[src*='application%2Fpdf']",
+      "embed[src*='downloadAttachment']",
+      "embed[src*='application%2Fpdf']",
+      "object[data*='BinaryData']",
+      "object[data*='downloadAttachment']",
+    ].join(",")).some(isDisplayedAnalyzableAttachmentElement);
+  }
+
+  function isDisplayedAnalyzableAttachmentElement(element) {
+    if (!element || element.nodeType !== 1 || isNonAnalyzableAttachmentElement(element)) {
+      return false;
+    }
+
+    const pdfUrls = collectPdfUrlCandidatesFromDocument(element, {
+      visibleOnly: false,
+      scopedFallback: true,
+    }).filter(isLikelyPdfUrl);
+    const descriptor = normalizeForCompare([
+      element.id || "",
+      element.className || "",
+      element.getAttribute("src") || "",
+      element.getAttribute("data") || "",
+      element.getAttribute("href") || "",
+      element.getAttribute("original-url") || "",
+      element.getAttribute("data-original-url") || "",
+    ].join(" "));
+    const looksLikeAttachment = /(?:attachmentcontainer|view pdf document uc form|panelviewdocument|iframeviewfile|binarydata|downloadattachment|application pdf)/.test(descriptor);
+    const hasPdfChild = Boolean(element.querySelector && element.querySelector([
+      "iframe[src*='BinaryData']",
+      "iframe[src*='downloadAttachment']",
+      "iframe[src*='application%2Fpdf']",
+      "embed[src*='downloadAttachment']",
+      "embed[src*='application%2Fpdf']",
+      "object[data*='BinaryData']",
+      "object[data*='downloadAttachment']",
+    ].join(",")));
+
+    return Boolean((pdfUrls.length || looksLikeAttachment || hasPdfChild) && (isElementVisible(element) || pdfUrls.length || hasPdfChild));
+  }
+
   function getDisplayedBiologyHeaderText() {
     const selected = getSelectedBiologyItem();
     return selected ? selected.identityLabel : "";
@@ -2021,7 +2389,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return false;
     }
 
-    return (Boolean(getDisplayedPdfUrl()) || Boolean(extractWedaMessageBodyFallbackText())) && (
+    const hasPdf = Boolean(getDisplayedPdfUrl());
+    const canUseMessageBody = !hasPdf && !hasDisplayedAnalyzableAttachment() && Boolean(extractWedaMessageBodyFallbackText());
+
+    return (hasPdf || canUseMessageBody) && (
       item.row.classList.contains("selected") ||
       getSelectedBiologyIndex() === item.index
     );
@@ -5915,14 +6286,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
     abortIfWorkflowStopped();
     const documentText = extracted.documentText;
-    const contentKey = getDisplayedBiologyContentKey(documentText);
+    const sourceType = extracted.sourceType || (extracted.pdfTextExtractionEmpty ? "pdf-attachment" : "pdf");
+    const contentKey = getDisplayedBiologyContentKey(documentText, sourceType);
 
     return {
       table: null,
       tableText: documentText,
       tableHtml: "",
       contentKey,
-      sourceType: extracted.sourceType || (extracted.pdfTextExtractionEmpty ? "pdf-attachment" : "pdf"),
+      sourceType,
       pdfUrl: extracted.displayed.pdfUrl,
       urlKey: extracted.displayed.urlKey,
       pdfAttachmentBase64: extracted.pdfAttachmentBase64 || "",
@@ -7520,6 +7892,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function buildMessageBodyFallbackFromPdfError(error, displayed) {
+    const hasAnalyzableAttachment = hasDisplayedAnalyzableAttachment();
+    if ((displayed && displayed.pdfUrl) || hasAnalyzableAttachment) {
+      appendDebugLog("weda:pdf-text-empty-message-body-blocked-attachment", {
+        urlKey: displayed && displayed.urlKey ? displayed.urlKey : "",
+        hasDisplayedPdfUrl: Boolean(displayed && displayed.pdfUrl),
+        hasAnalyzableAttachment,
+        error: error && error.message ? error.message : "",
+      });
+      return null;
+    }
+
     const bodyText = extractWedaMessageBodyFallbackText();
 
     if (!bodyText) {
@@ -7548,6 +7931,16 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function buildDisplayedBiologyDocumentFromMessageBody(logEvent, options = {}) {
     const item = options.item || null;
     const error = options.error || null;
+
+    if (hasDisplayedAnalyzableAttachment()) {
+      appendDebugLog("weda:pdf-missing-message-body-blocked-attachment", {
+        error: error && error.message ? error.message : "",
+        rowIndex: item ? item.index : null,
+        hasAnalyzableAttachment: true,
+      });
+      return null;
+    }
+
     const bodyText = extractWedaMessageBodyFallbackText();
     const selectedOk = item && item.row && (
       item.row.classList.contains("selected") ||
@@ -7589,7 +7982,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       table: null,
       tableText: documentText,
       tableHtml: "",
-      contentKey: getDisplayedBiologyContentKey(documentText),
+      contentKey: getDisplayedBiologyContentKey(documentText, "message-body"),
       sourceType: "message-body",
       pdfUrl: "",
       urlKey,
@@ -8336,7 +8729,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const pdfUrl = getDisplayedPdfUrl();
-    const urlKey = getDisplayedPdfUrlKey();
+    const urlKey = getPdfUrlKey(pdfUrl);
     const rememberedPatient = getRememberedWedaPatientForOptions({
       row: item,
       rowStableKey: item.stableKey,
@@ -8697,7 +9090,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function buildWedaTitleManualEditContext(input, rowOverride = null) {
     const state = getState();
     const item = rowOverride || getSelectedBiologyItem();
-    const urlKey = getDisplayedPdfUrlKey();
+    const pdfUrl = getDisplayedPdfUrl();
+    const urlKey = getPdfUrlKey(pdfUrl);
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
     const keys = buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
@@ -8712,7 +9106,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       rowKey: item ? item.key : state.currentRowKey,
       rowStableKey: item ? item.stableKey : state.currentStableKey,
       rowIdentity: item ? item.identityLabel : "",
-      pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
+      pdfUrlHash: hashString(pdfUrl || ""),
       contentKey: stateMatchesItem ? state.currentContentKey || "" : "",
       urlKey: stateMatchesItem ? state.currentUrlKey || urlKey : urlKey,
     };
@@ -8861,7 +9255,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
-    const urlKey = getDisplayedPdfUrlKey();
+    const pdfUrl = getDisplayedPdfUrl();
+    const urlKey = getPdfUrlKey(pdfUrl);
+    const titleInputTarget = {
+      pdfUrl,
+      urlKey,
+      rowStableKey: item.stableKey,
+    };
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
     const rememberedEntry = getRememberedTitleForKeys(buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
@@ -8892,7 +9292,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
-    let input = findWedaTitleInput();
+    let input = findWedaTitleInput(titleInputTarget);
 
     if (!input) {
       if (state.running && state.phase !== "savingTitle") {
@@ -8912,7 +9312,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
       let openedInput = null;
       try {
-        openedInput = await ensureWedaTitleInputVisible("");
+        openedInput = await ensureWedaTitleInputVisible("", titleInputTarget);
       } catch (error) {
         appendDebugLog("weda:remembered-title-input-open-error", {
           rowIndex: item ? item.index : null,
@@ -8933,17 +9333,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       }
 
       await sleep(120);
-      applyRememberedTitleToInput(findWedaTitleInput() || openedInput, rememberedEntry, item, {
+      applyRememberedTitleToInput(findWedaTitleInput(titleInputTarget) || openedInput, rememberedEntry, item, {
         ...options,
         force: true,
         openedInput: true,
+        titleInputTarget,
       });
       return;
     }
 
     applyRememberedTitleToInput(input, rememberedEntry, item, {
-      enforcePriority: true,
       ...options,
+      enforcePriority: true,
+      titleInputTarget,
     });
   }
 
@@ -8961,6 +9363,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     const currentTitle = sanitizeTitle(input.value);
     const enforcePriority = options.enforcePriority !== false;
+    const titleInputTarget = options.titleInputTarget || {};
 
     if (currentTitle === remembered) {
       touchRememberedTitleKeys(rememberedEntry.keys, remembered);
@@ -9026,7 +9429,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           return;
         }
 
-        const freshInput = findWedaTitleInput();
+        const freshInput = findWedaTitleInput({
+          pdfUrl: titleInputTarget.pdfUrl || "",
+          urlKey: titleInputTarget.urlKey || "",
+          rowStableKey: titleInputTarget.rowStableKey || (freshItem ? freshItem.stableKey : ""),
+        });
         if (!freshInput || sanitizeTitle(freshInput.value) === remembered) {
           return;
         }
@@ -9199,21 +9606,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const rememberedIdentity = normalizeForCompare(entry.rowIdentity || "");
     const itemIdentity = normalizeForCompare(item.identityLabel || "");
     const matchedByStrongDocumentKey = isRememberedEntryMatchedByStrongDocumentKey(rememberedEntry);
-
-    if (matchedByStrongDocumentKey) {
-      return {
-        ok: true,
-        reason: "strong-document-key",
-      };
-    }
-
     const sameStableDuplicateOccurrence = Boolean(rememberedStableKey && itemStableKey && rememberedStableKey === itemStableKey);
-    if (rememberedRowKey && itemRowKey && rememberedRowKey !== itemRowKey && !sameStableDuplicateOccurrence) {
+
+    if (entry.sourceType === "message-body" && hasDisplayedAnalyzableAttachment()) {
       return {
         ok: false,
-        reason: "row-key-mismatch",
-        rememberedRowKey,
-        itemRowKey,
+        reason: "message-body-entry-with-attachment",
       };
     }
 
@@ -9226,12 +9624,35 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       };
     }
 
+    if (rememberedRowKey && itemRowKey && rememberedRowKey !== itemRowKey && !sameStableDuplicateOccurrence) {
+      if (matchedByStrongDocumentKey && !rememberedStableKey && !rememberedIdentity && !options.autoSave) {
+        return {
+          ok: true,
+          reason: "strong-document-key-row-key-mismatch",
+        };
+      }
+
+      return {
+        ok: false,
+        reason: "row-key-mismatch",
+        rememberedRowKey,
+        itemRowKey,
+      };
+    }
+
     if (!rememberedStableKey && rememberedIdentity && itemIdentity && rememberedIdentity !== itemIdentity) {
       return {
         ok: false,
         reason: "row-identity-mismatch",
         rememberedIdentity,
         itemIdentity,
+      };
+    }
+
+    if (matchedByStrongDocumentKey) {
+      return {
+        ok: true,
+        reason: "strong-document-key",
       };
     }
 
@@ -9293,7 +9714,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return false;
     }
 
-    const urlKey = getDisplayedPdfUrlKey();
+    const pdfUrl = getDisplayedPdfUrl();
+    const urlKey = getPdfUrlKey(pdfUrl);
+    const specialtyTarget = {
+      pdfUrl,
+      urlKey,
+      rowStableKey: item.stableKey,
+    };
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
     const rememberedEntry = getRememberedSpecialtyForKeys(buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
@@ -9324,11 +9751,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return false;
     }
 
-    const titleInput = findWedaTitleInput();
+    const titleInput = findWedaTitleInput(specialtyTarget);
     const select = findWedaSpecialtySelect({
       titleInput,
-      pdfUrl: getDisplayedPdfUrl(),
-      urlKey,
+      ...specialtyTarget,
     });
 
     if (!select) {
@@ -9391,9 +9817,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         }
 
         const freshSelect = findWedaSpecialtySelect({
-          titleInput: findWedaTitleInput(),
-          pdfUrl: getDisplayedPdfUrl(),
-          urlKey,
+          titleInput: findWedaTitleInput(specialtyTarget),
+          ...specialtyTarget,
         });
 
         if (!freshSelect || isWedaSpecialtySelectionPresent(freshSelect, remembered)) {
@@ -9421,7 +9846,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   function buildWedaSpecialtyMemoryContext(select = null, rowOverride = null) {
     const state = getState();
     const item = rowOverride || getSelectedBiologyItem();
-    const urlKey = getDisplayedPdfUrlKey();
+    const pdfUrl = getDisplayedPdfUrl();
+    const urlKey = getPdfUrlKey(pdfUrl);
     const stateMatchesItem = !item || !state.currentStableKey || state.currentStableKey === item.stableKey;
     const keys = buildWedaDocumentMemoryKeys([
       stateMatchesItem && state.currentContentKey,
@@ -9436,7 +9862,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       rowKey: item ? item.key : state.currentRowKey,
       rowStableKey: item ? item.stableKey : state.currentStableKey,
       rowIdentity: item ? item.identityLabel : "",
-      pdfUrlHash: hashString(getDisplayedPdfUrl() || ""),
+      pdfUrlHash: hashString(pdfUrl || ""),
       contentKey: stateMatchesItem ? state.currentContentKey || "" : "",
       urlKey: stateMatchesItem ? state.currentUrlKey || urlKey : urlKey,
       select,
@@ -9695,7 +10121,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function finishAutoCycle(message) {
-    const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+    const nextCheckAt = Date.now() + getAutoIntervalMs();
     resetWedaDuplicatePdfRegistry("auto-cycle-finished");
     setState({
       running: false,
@@ -10572,6 +10998,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       pdfUrlHash: hashString(target.pdfUrl || displayedPdfUrl || ""),
       contentKey: target.contentKey,
       urlKey: target.urlKey || displayedUrlKey,
+      sourceType: result.sourceType || "",
     };
     const titleMemoryKeys = buildWedaDocumentMemoryKeys([
       target.contentKey,
@@ -10714,6 +11141,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         pdfUrlHash: hashString(target.pdfUrl || displayedPdfUrl || ""),
         contentKey: target.contentKey,
         urlKey: target.urlKey || displayedUrlKey,
+        sourceType: result.sourceType || "",
         title,
       };
       const specialtyMemoryKeys = buildWedaDocumentMemoryKeys([
@@ -11723,7 +12151,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
     GM_deleteValue(JOB_KEY);
     const state = getState();
-    const nextCheckAt = state.autoEnabled ? Date.now() + AUTO_INTERVAL_MS : state.autoNextCheckAt;
+    const nextCheckAt = state.autoEnabled ? Date.now() + getAutoIntervalMs() : state.autoNextCheckAt;
     setState({
       running: false,
       mode: "manual",

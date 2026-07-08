@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec LM Studio local
 // @namespace    https://secure.weda.fr/
-// @version      0.1.4
+// @version      0.1.6
 // @description  Analyse les résultats HPRIM avec l'API OpenAI-compatible de LM Studio en local. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @grant        GM_addValueChangeListener
@@ -31,13 +31,14 @@
   const LMSTUDIO_MAX_TOKENS = 220;
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "0.1.4";
+  const SCRIPT_VERSION = "0.1.6";
 
   const STORAGE_PREFIX = "wedaBioLmStudio.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
   const JOB_KEY_BASE = `${STORAGE_PREFIX}job`;
   const RESULT_KEY_BASE = `${STORAGE_PREFIX}result`;
   const STATUS_KEY_BASE = `${STORAGE_PREFIX}status`;
+  const AUTO_INTERVAL_KEY = `${STORAGE_PREFIX}autoIntervalMs.v1`;
   const WEDA_TAB_ID_SESSION_KEY = `${STORAGE_PREFIX}wedaTabId.v1`;
   const WEDA_PREVIOUS_WINDOW_NAME_SESSION_KEY = `${STORAGE_PREFIX}previousWindowName.v1`;
   const HEIDI_CHANNEL_PARAM = "wedaBioChannel";
@@ -61,7 +62,11 @@
   const STATUS_ID = "weda-bio-lmstudio-status";
   const DEBUG_LOG_PANEL_ID = "weda-bio-lmstudio-log-panel";
   const DEBUG_LOG_TEXTAREA_ID = "weda-bio-lmstudio-log-textarea";
-  const AUTO_INTERVAL_MS = 60 * 1000;
+  const PENDING_FAVICON_LINK_ID = "weda-bio-pending-favicon";
+  const PENDING_FAVICON_SHORTCUT_LINK_ID = "weda-bio-pending-favicon-shortcut";
+  const AUTO_INTERVAL_DEFAULT_MS = 60 * 1000;
+  const AUTO_INTERVAL_MIN_MS = 10 * 1000;
+  const AUTO_INTERVAL_MAX_MS = 24 * 60 * 60 * 1000;
   const AUTO_HEARTBEAT_MS = 60 * 1000;
   const AUTO_STALE_RUNNING_MS = 10 * 60 * 1000;
   const AUTO_GRID_WAIT_MS = 45000;
@@ -104,6 +109,13 @@
   let titleAutofillInterval = null;
   let autoRefreshTimer = null;
   let autoHeartbeatTimer = null;
+  let pendingFaviconObserver = null;
+  let pendingFaviconObservedTarget = null;
+  let pendingFaviconHeadObserver = null;
+  let pendingFaviconUpdateTimer = null;
+  let lastPendingFaviconCount = null;
+  let pendingFaviconObjectUrl = "";
+  let pendingFaviconRenderToken = 0;
   let currentHeidiTab = null;
   let preopenedHeidiWorkerWindow = null;
   let heidiForegroundFallbackUsed = false;
@@ -671,6 +683,7 @@ Ne jamais afficher cet auto-contrôle.`;
   function initWeda() {
     registerWedaWindowName();
     createWedaPanel();
+    setupPendingBiologyFaviconBadge();
     syncPanelWithState();
     appendDebugLog("weda:init", {
       version: getScriptVersion(),
@@ -745,7 +758,12 @@ Ne jamais afficher cet auto-contrôle.`;
       </div>
       <div class="wbh-body">
         <button type="button" id="wbh-start">ANALYSE BIOLOGIES LM STUDIO</button>
-        <button type="button" id="wbh-auto">MODE AUTO 60 S</button>
+        <div class="wbh-auto-settings">
+          <label for="wbh-auto-duration">Durée auto</label>
+          <input type="number" id="wbh-auto-duration" min="10" max="86400" step="10" inputmode="numeric">
+          <span>s</span>
+        </div>
+        <button type="button" id="wbh-auto">${getAutoButtonInactiveLabel()}</button>
         <button type="button" id="wbh-clear-memory">Effacer mémoire</button>
         <button type="button" id="wbh-stop">Arrêter</button>
         <div class="wbh-debug-actions" aria-label="Actions de debug">
@@ -881,6 +899,31 @@ Ne jamais afficher cet auto-contrôle.`;
       #${PANEL_ID} .wbh-debug-actions button {
         margin: 0;
       }
+      #${PANEL_ID} .wbh-auto-settings {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin: 0 0 8px 0;
+      }
+      #${PANEL_ID} .wbh-auto-settings label {
+        font-size: 12px;
+        font-weight: 700;
+      }
+      #${PANEL_ID} #wbh-auto-duration {
+        width: 76px;
+        min-width: 0;
+        border: 1px solid #6d8bd4;
+        border-radius: 6px;
+        padding: 5px 7px;
+        color: #14264a;
+        font-size: 12px;
+        font-weight: 700;
+        box-sizing: border-box;
+      }
+      #${PANEL_ID} .wbh-auto-settings span {
+        font-size: 12px;
+        font-weight: 700;
+      }
       #${PANEL_ID} #wbh-show-logs,
       #${PANEL_ID} #wbh-copy-debug-package,
       #${PANEL_ID} #wbh-clear-logs {
@@ -936,6 +979,14 @@ Ne jamais afficher cet auto-contrôle.`;
     document.getElementById("wbh-collapse").addEventListener("click", toggleWedaPanelCollapsed);
     document.getElementById("wbh-start").addEventListener("click", startWedaWorkflow);
     document.getElementById("wbh-auto").addEventListener("click", toggleAutoMode);
+    document.getElementById("wbh-auto-duration").addEventListener("change", applyAutoDurationFromInput);
+    document.getElementById("wbh-auto-duration").addEventListener("blur", applyAutoDurationFromInput);
+    document.getElementById("wbh-auto-duration").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.currentTarget.blur();
+      }
+    });
     document.getElementById("wbh-clear-memory").addEventListener("click", clearRememberedTitles);
     document.getElementById("wbh-show-logs").addEventListener("click", toggleDebugLogPanel);
     document.getElementById("wbh-copy-debug-package").addEventListener("click", copyDebugPackage);
@@ -1043,10 +1094,110 @@ Ne jamais afficher cet auto-contrôle.`;
     return Math.min(Math.max(Number(value), min), max);
   }
 
+  function normalizeAutoIntervalMs(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return AUTO_INTERVAL_DEFAULT_MS;
+    }
+
+    const clamped = clampNumber(numeric, AUTO_INTERVAL_MIN_MS, AUTO_INTERVAL_MAX_MS);
+    return Math.round(clamped / 1000) * 1000;
+  }
+
+  function getAutoIntervalMs() {
+    return normalizeAutoIntervalMs(GM_getValue(AUTO_INTERVAL_KEY, AUTO_INTERVAL_DEFAULT_MS));
+  }
+
+  function setAutoIntervalMs(intervalMs) {
+    const normalized = normalizeAutoIntervalMs(intervalMs);
+    GM_setValue(AUTO_INTERVAL_KEY, normalized);
+    return normalized;
+  }
+
+  function getAutoButtonInactiveLabel() {
+    return `MODE AUTO ${formatAutoIntervalShort(getAutoIntervalMs())}`;
+  }
+
+  function formatAutoIntervalShort(intervalMs) {
+    const seconds = Math.round(normalizeAutoIntervalMs(intervalMs) / 1000);
+    if (seconds < 60) {
+      return `${seconds} S`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    if (!remainingSeconds) {
+      return `${minutes} MIN`;
+    }
+
+    return `${minutes} MIN ${remainingSeconds} S`;
+  }
+
+  function formatAutoIntervalLong(intervalMs) {
+    const seconds = Math.round(normalizeAutoIntervalMs(intervalMs) / 1000);
+    if (seconds < 60) {
+      return `${seconds} seconde(s)`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return remainingSeconds
+      ? `${minutes} minute(s) ${remainingSeconds} seconde(s)`
+      : `${minutes} minute(s)`;
+  }
+
+  function applyAutoDurationFromInput() {
+    const input = document.getElementById("wbh-auto-duration");
+    if (!input) {
+      return getAutoIntervalMs();
+    }
+
+    const previousIntervalMs = getAutoIntervalMs();
+    const rawValue = String(input.value || "").trim().replace(",", ".");
+    const seconds = Number(rawValue);
+
+    if (!rawValue || !Number.isFinite(seconds)) {
+      input.value = String(Math.round(previousIntervalMs / 1000));
+      return previousIntervalMs;
+    }
+
+    const nextIntervalMs = setAutoIntervalMs(seconds * 1000);
+    input.value = String(Math.round(nextIntervalMs / 1000));
+
+    if (nextIntervalMs === previousIntervalMs) {
+      syncPanelWithState();
+      return nextIntervalMs;
+    }
+
+    appendDebugLog("weda:auto-interval-updated", {
+      previousIntervalMs,
+      nextIntervalMs,
+    });
+
+    const state = getState();
+    if (state.autoEnabled && !state.running) {
+      const nextCheckAt = Date.now() + nextIntervalMs;
+      setState({
+        autoRefreshPending: false,
+        autoNextCheckAt: nextCheckAt,
+        message: `Mode auto : durée ${formatAutoIntervalLong(nextIntervalMs)}. Prochaine vérification vers ${formatTime(nextCheckAt)}.`,
+      });
+      scheduleAutoRefresh();
+      return nextIntervalMs;
+    }
+
+    syncPanelWithState();
+    if (!state.running) {
+      setPanelStatus(`Durée auto réglée sur ${formatAutoIntervalLong(nextIntervalMs)}.`);
+    }
+    return nextIntervalMs;
+  }
+
   function syncPanelWithState() {
     const state = getState();
     const startButton = document.getElementById("wbh-start");
     const autoButton = document.getElementById("wbh-auto");
+    const autoDurationInput = document.getElementById("wbh-auto-duration");
     const stopButton = document.getElementById("wbh-stop");
 
     applyWedaPanelCollapsed(Boolean(state.panelCollapsed));
@@ -1056,9 +1207,13 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     if (autoButton) {
-      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : "MODE AUTO 60 S";
+      autoButton.textContent = state.autoEnabled ? "DÉSACTIVER AUTO" : getAutoButtonInactiveLabel();
       autoButton.classList.toggle("wbh-auto-on", Boolean(state.autoEnabled));
       autoButton.disabled = false;
+    }
+
+    if (autoDurationInput && document.activeElement !== autoDurationInput) {
+      autoDurationInput.value = String(Math.round(getAutoIntervalMs() / 1000));
     }
 
     if (stopButton) {
@@ -1690,7 +1845,7 @@ Ne jamais afficher cet auto-contrôle.`;
       return;
     }
 
-    const nextCheckAt = state.autoNextCheckAt || Date.now() + AUTO_INTERVAL_MS;
+    const nextCheckAt = state.autoNextCheckAt || Date.now() + getAutoIntervalMs();
     const delay = Math.max(1000, nextCheckAt - Date.now());
 
     autoRefreshTimer = window.setTimeout(() => {
@@ -1813,7 +1968,7 @@ Ne jamais afficher cet auto-contrôle.`;
     }
 
     markRowsSeen(getBiologyRows());
-    const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+    const nextCheckAt = Date.now() + applyAutoDurationFromInput();
     setState({
       autoEnabled: true,
       autoRefreshPending: false,
@@ -1928,7 +2083,7 @@ Ne jamais afficher cet auto-contrôle.`;
     });
 
     if (!newRows.length) {
-      const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+      const nextCheckAt = Date.now() + getAutoIntervalMs();
       markRowsSeen(rows);
       setState({
         autoRefreshPending: false,
@@ -1998,6 +2153,206 @@ Ne jamais afficher cet auto-contrôle.`;
         rows: [],
       };
     }
+  }
+
+  function setupPendingBiologyFaviconBadge() {
+    attachPendingBiologyFaviconObserver();
+    attachPendingBiologyFaviconHeadObserver();
+    updatePendingBiologyFaviconBadge();
+    window.setTimeout(() => {
+      attachPendingBiologyFaviconObserver();
+      attachPendingBiologyFaviconHeadObserver();
+      updatePendingBiologyFaviconBadge();
+    }, 1500);
+  }
+
+  function attachPendingBiologyFaviconObserver() {
+    if (typeof MutationObserver !== "function") {
+      return;
+    }
+
+    const target = document.querySelector("#ContentPlaceHolder1_HprimsGrid") || document.body;
+    if (!target || target === pendingFaviconObservedTarget) {
+      return;
+    }
+
+    if (pendingFaviconObserver) {
+      pendingFaviconObserver.disconnect();
+    }
+
+    pendingFaviconObserver = new MutationObserver(schedulePendingBiologyFaviconBadgeUpdate);
+    pendingFaviconObserver.observe(target, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    pendingFaviconObservedTarget = target;
+  }
+
+  function attachPendingBiologyFaviconHeadObserver() {
+    if (typeof MutationObserver !== "function" || !document.head || pendingFaviconHeadObserver) {
+      return;
+    }
+
+    pendingFaviconHeadObserver = new MutationObserver(schedulePendingBiologyFaviconBadgeUpdate);
+    pendingFaviconHeadObserver.observe(document.head, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "rel"],
+    });
+  }
+
+  function schedulePendingBiologyFaviconBadgeUpdate() {
+    window.clearTimeout(pendingFaviconUpdateTimer);
+    pendingFaviconUpdateTimer = window.setTimeout(() => {
+      attachPendingBiologyFaviconObserver();
+      attachPendingBiologyFaviconHeadObserver();
+      updatePendingBiologyFaviconBadge();
+    }, 150);
+  }
+
+  function countPendingBiologyRows() {
+    return getBiologyRows().length;
+  }
+
+  function updatePendingBiologyFaviconBadge() {
+    const pendingCount = countPendingBiologyRows();
+    if (pendingCount === lastPendingFaviconCount && hasPendingBiologyFaviconLinks() && !hasCompetingFaviconLinks()) {
+      return;
+    }
+
+    lastPendingFaviconCount = pendingCount;
+    setPendingBiologyFaviconBadge(pendingCount);
+  }
+
+  function setPendingBiologyFaviconBadge(pendingCount) {
+    try {
+      const canvas = createPendingBiologyFaviconCanvas(pendingCount);
+      const renderToken = ++pendingFaviconRenderToken;
+      applyPendingBiologyFaviconHref(canvas.toDataURL("image/png"), pendingCount, "data-url");
+
+      if (typeof canvas.toBlob === "function" && window.URL && typeof window.URL.createObjectURL === "function") {
+        canvas.toBlob((blob) => {
+          if (!blob || renderToken !== pendingFaviconRenderToken) {
+            return;
+          }
+
+          const previousObjectUrl = pendingFaviconObjectUrl;
+          pendingFaviconObjectUrl = window.URL.createObjectURL(blob);
+          applyPendingBiologyFaviconHref(pendingFaviconObjectUrl, pendingCount, "blob-url");
+
+          if (previousObjectUrl && previousObjectUrl !== pendingFaviconObjectUrl && typeof window.URL.revokeObjectURL === "function") {
+            window.setTimeout(() => window.URL.revokeObjectURL(previousObjectUrl), 60000);
+          }
+        }, "image/png");
+      }
+    } catch (error) {
+      appendDebugLog("weda:pending-favicon-error", {
+        pendingCount,
+        error: error.message,
+      });
+    }
+  }
+
+  function hasPendingBiologyFaviconLinks() {
+    return Boolean(document.getElementById(PENDING_FAVICON_LINK_ID) && document.getElementById(PENDING_FAVICON_SHORTCUT_LINK_ID));
+  }
+
+  function hasCompetingFaviconLinks() {
+    return getCompetingFaviconLinks().length > 0;
+  }
+
+  function getCompetingFaviconLinks() {
+    if (!document.head) {
+      return [];
+    }
+
+    return Array.from(document.head.querySelectorAll("link[rel]"))
+      .filter((link) => isFaviconLink(link) && !isPendingBiologyFaviconLink(link));
+  }
+
+  function isFaviconLink(link) {
+    return /\bicon\b/i.test(String(link && link.getAttribute("rel") || ""));
+  }
+
+  function isPendingBiologyFaviconLink(link) {
+    const id = link && link.id || "";
+    return id === PENDING_FAVICON_LINK_ID || id === PENDING_FAVICON_SHORTCUT_LINK_ID;
+  }
+
+  function applyPendingBiologyFaviconHref(href, pendingCount, source) {
+    if (!document.head) {
+      return;
+    }
+
+    removeCompetingFaviconLinks();
+    upsertPendingBiologyFaviconLink(PENDING_FAVICON_LINK_ID, "icon", href);
+    upsertPendingBiologyFaviconLink(PENDING_FAVICON_SHORTCUT_LINK_ID, "shortcut icon", href);
+
+    appendDebugLog("weda:pending-favicon-updated", {
+      pendingCount,
+      source,
+      hrefKind: String(href || "").slice(0, 5),
+      competingLinks: getCompetingFaviconLinks().length,
+    });
+  }
+
+  function removeCompetingFaviconLinks() {
+    getCompetingFaviconLinks().forEach((link) => {
+      try {
+        link.parentNode.removeChild(link);
+      } catch (_error) {
+        link.setAttribute("rel", "weda-original-icon-disabled");
+      }
+    });
+  }
+
+  function upsertPendingBiologyFaviconLink(id, rel, href) {
+    let link = document.getElementById(id);
+    if (!link) {
+      link = document.createElement("link");
+      link.id = id;
+      document.head.appendChild(link);
+    } else if (link.parentNode !== document.head) {
+      document.head.appendChild(link);
+    }
+
+    link.setAttribute("rel", rel);
+    link.setAttribute("type", "image/png");
+    link.setAttribute("sizes", "64x64");
+    link.setAttribute("href", href);
+  }
+
+  function createPendingBiologyFaviconCanvas(pendingCount) {
+    const canvas = document.createElement("canvas");
+    const size = 64;
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("canvas favicon indisponible");
+    }
+
+    const count = Math.max(0, Number(pendingCount) || 0);
+    const label = count > 99 ? "99+" : String(count);
+
+    context.clearRect(0, 0, size, size);
+    context.beginPath();
+    context.arc(size / 2, size / 2, 29, 0, Math.PI * 2);
+    context.fillStyle = "#1d4ed8";
+    context.fill();
+    context.lineWidth = 3;
+    context.strokeStyle = "rgba(255, 255, 255, 0.92)";
+    context.stroke();
+
+    context.fillStyle = "#ffffff";
+    context.font = `700 ${label.length > 2 ? 22 : label.length > 1 ? 28 : 34}px Arial, sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(label, size / 2, size / 2 + 2);
+
+    return canvas;
   }
 
   function startWedaWorkflow() {
@@ -3289,7 +3644,7 @@ Ne jamais afficher cet auto-contrôle.`;
   }
 
   function finishAutoCycle(message) {
-    const nextCheckAt = Date.now() + AUTO_INTERVAL_MS;
+    const nextCheckAt = Date.now() + getAutoIntervalMs();
     setState({
       running: false,
       mode: "manual",
@@ -4937,7 +5292,7 @@ Ne jamais afficher cet auto-contrôle.`;
     });
     GM_deleteValue(JOB_KEY);
     const state = getState();
-    const nextCheckAt = state.autoEnabled ? Date.now() + AUTO_INTERVAL_MS : state.autoNextCheckAt;
+    const nextCheckAt = state.autoEnabled ? Date.now() + getAutoIntervalMs() : state.autoNextCheckAt;
     setState({
       running: false,
       mode: "manual",
