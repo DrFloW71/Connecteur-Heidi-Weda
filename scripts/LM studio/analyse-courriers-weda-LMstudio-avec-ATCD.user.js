@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.33
+// @version      0.1.35
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -66,7 +66,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.33";
+  const SCRIPT_VERSION = "0.1.35";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const MAX_PDF_TEXT_LENGTH = 70000;
   const MAX_RESULT_SOURCE_TEXT_LENGTH = 30000;
@@ -262,6 +262,7 @@
   const REMEMBERED_PATIENT_TOUCH_INTERVAL_MS = 12 * 60 * 60 * 1000;
   const MAX_AUTO_SEEN_ROWS = 1000;
   const MAX_DEBUG_LOG_ENTRIES = 800;
+  const DEBUG_LOG_NOISY_EVENT_DEDUP_MS = 5000;
 
   let titleAutofillInterval = null;
   let titleAutofillInputOpening = false;
@@ -290,6 +291,13 @@
   let lastPatientImportSelectionIssue = null;
   let lastPatientImportSelectionContext = null;
   const wedaFindPatientRescueAttemptKeys = new Map();
+  const debugLogNoisyEventLastSeen = new Map();
+  const backgroundTaskQueue = [];
+  const backgroundTimerTasks = new Map();
+  let backgroundTaskChannel = null;
+  let backgroundTimerWorker = null;
+  let backgroundTimerWorkerUnavailable = false;
+  let backgroundTimerTaskSequence = 0;
 
   const LMSTUDIO_PROMPT_ACTIVE = `Tu dois produire trois blocs balisés, et uniquement ces trois blocs.
 
@@ -492,7 +500,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     const state = getState();
     if (state.running) {
-      window.setTimeout(() => resumeWedaWorkflow(), 700);
+      scheduleBackgroundTask(() => resumeWedaWorkflow(), 700);
     }
 
     setupRememberedTitleAutofill();
@@ -1524,7 +1532,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   function scheduleAutoRefresh() {
-    window.clearTimeout(autoRefreshTimer);
+    cancelBackgroundTask(autoRefreshTimer);
     autoRefreshTimer = null;
 
     const state = getState();
@@ -1543,7 +1551,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const nextCheckAt = state.autoNextCheckAt || Date.now() + getAutoIntervalMs();
     const delay = Math.max(1000, nextCheckAt - Date.now());
 
-    autoRefreshTimer = window.setTimeout(() => {
+    autoRefreshTimer = scheduleBackgroundTask(() => {
       const latest = getState();
       if (!latest.autoEnabled) {
         return;
@@ -1568,7 +1576,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function setupAutoHeartbeat() {
     if (!autoHeartbeatTimer) {
-      autoHeartbeatTimer = window.setInterval(autoHeartbeat, AUTO_HEARTBEAT_MS);
+      const runAutoHeartbeat = () => {
+        autoHeartbeat();
+        autoHeartbeatTimer = scheduleBackgroundTask(runAutoHeartbeat, AUTO_HEARTBEAT_MS);
+      };
+      autoHeartbeatTimer = scheduleBackgroundTask(runAutoHeartbeat, AUTO_HEARTBEAT_MS);
     }
 
     window.addEventListener("focus", autoHeartbeat);
@@ -1638,7 +1650,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       message: "Veille auto : reprise après cycle bloqué, nouvelle actualisation...",
     });
 
-    window.setTimeout(() => window.location.reload(), 1000);
+    scheduleBackgroundTask(() => window.location.reload(), 1000);
     return true;
   }
 
@@ -1646,7 +1658,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const state = getState();
 
     if (state.autoEnabled) {
-      window.clearTimeout(autoRefreshTimer);
+      cancelBackgroundTask(autoRefreshTimer);
       autoRefreshTimer = null;
       if (state.mode === "auto") {
         GM_deleteValue(JOB_KEY);
@@ -1705,7 +1717,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         autoRefreshPending: false,
         message: "Veille auto : recherche de nouveaux courriers...",
       });
-      window.setTimeout(() => startAutoWorkflowIfNeeded(), 1600);
+      scheduleBackgroundTask(() => startAutoWorkflowIfNeeded(), 1600);
       return;
     }
 
@@ -1714,7 +1726,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         autoRefreshPending: true,
         message: "Veille auto : actualisation de Weda...",
       });
-      window.setTimeout(() => window.location.reload(), 400);
+      scheduleBackgroundTask(() => window.location.reload(), 400);
       return;
     }
 
@@ -1965,13 +1977,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (state.phase === "savingTitle") {
       setPanelStatus("Titre transmis à Weda, préparation du courrier suivant...");
-      window.setTimeout(() => goToNextBiology(state.currentJobId), NEXT_AFTER_RELOAD_SAVE_MS);
+      scheduleBackgroundTask(() => goToNextBiology(state.currentJobId), NEXT_AFTER_RELOAD_SAVE_MS);
       return;
     }
 
     if (state.phase === "deletingDuplicate") {
       setPanelStatus("Suppression d'un doublon strict, reprise de la liste...");
-      window.setTimeout(() => continueAfterStrictDuplicateDeletion(), WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS);
+      scheduleBackgroundTask(() => continueAfterStrictDuplicateDeletion(), WEDA_STRICT_DUPLICATE_DELETE_SETTLE_MS);
       return;
     }
 
@@ -2183,7 +2195,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const targetStableKey = targetRow ? targetRow.stableKey : "";
 
     WEDA_ROW_OPEN_RETRY_DELAYS_MS.forEach((delay, retryIndex) => {
-      window.setTimeout(() => {
+      scheduleBackgroundTask(() => {
         const state = getState();
 
         if (
@@ -3478,7 +3490,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function scheduleWedaSpecialtySelectionCommit(select, choice) {
     [250, 900, 1800, 3200].forEach((delay) => {
-      window.setTimeout(() => {
+      scheduleBackgroundTask(() => {
         if (!select || !document.contains(select)) {
           return;
         }
@@ -5461,8 +5473,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     const freshSelect = findWedaFindPatientModeSelect();
-    if (freshSelect && freshSelect.name) {
-      callWedaPostBack(freshSelect.name, "");
+    if (freshSelect) {
+      appendDebugLog("weda:find-patient-mode-retry", {
+        currentMode: String(freshSelect.value || ""),
+        expectedMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+        hasPostBackTarget: Boolean(freshSelect.name),
+      });
+
+      if (String(freshSelect.value || "") !== WEDA_FIND_PATIENT_NAME_MODE_VALUE) {
+        await ensureWedaFindPatientNameModeSelected(freshSelect);
+      } else {
+        triggerWedaFindPatientModePostBack(freshSelect);
+        await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
+      }
     }
 
     const inputAfterPostback = await waitForWedaFindPatientNameSearchInput("le champ de recherche patient par nom après postback");
@@ -5508,9 +5531,28 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       option.selected = option === nameOption;
     });
     setNativeSelectValue(select, WEDA_FIND_PATIENT_NAME_MODE_VALUE);
-    dispatchWedaSelectValueEvents(select);
+    const postBackMethod = triggerWedaFindPatientModePostBack(select);
+    appendDebugLog("weda:find-patient-mode-postback", {
+      selectedMode: String(select.value || ""),
+      expectedMode: WEDA_FIND_PATIENT_NAME_MODE_VALUE,
+      method: postBackMethod,
+    });
     await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
     return true;
+  }
+
+  function triggerWedaFindPatientModePostBack(select) {
+    if (!select) {
+      return "missing-select";
+    }
+
+    const target = String(select.name || "");
+    if (target && callWedaPostBack(target, "")) {
+      return "direct-postback";
+    }
+
+    dispatchWedaSelectValueEvents(select);
+    return "change-event-fallback";
   }
 
   async function waitForWedaFindPatientNameSearchInput(description) {
@@ -7556,6 +7598,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         reason,
         totalPages: rendered.totalPages,
         renderedPages: rendered.images.map((image) => image.pageNumber),
+        renderers: Array.from(new Set(rendered.images.map((image) => image.renderer).filter(Boolean))),
         imageCount: rendered.images.length,
         totalDataUrlLength: rendered.totalDataUrlLength,
         byteLength: rendered.byteLength || 0,
@@ -7663,9 +7706,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const page = await pdf.getPage(pageNumber);
     const scale = getPdfImageFallbackScale(page);
     const viewport = page.getViewport({ scale });
-    const canvas = document.createElement("canvas");
     const width = Math.max(1, Math.ceil(viewport.width));
     const height = Math.max(1, Math.ceil(viewport.height));
+    let renderer = "dom-canvas";
+    let canvas = null;
+
+    if (typeof OffscreenCanvas === "function") {
+      try {
+        canvas = new OffscreenCanvas(width, height);
+        renderer = "offscreen-canvas";
+      } catch (_error) {
+        canvas = null;
+      }
+    }
+
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+    }
 
     canvas.width = width;
     canvas.height = height;
@@ -7683,7 +7740,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       background: "white",
     }).promise;
 
-    const dataUrl = canvas.toDataURL(LMSTUDIO_PDF_IMAGE_MIME_TYPE, LMSTUDIO_PDF_IMAGE_QUALITY);
+    const dataUrl = await convertPdfCanvasToDataUrl(
+      canvas,
+      LMSTUDIO_PDF_IMAGE_MIME_TYPE,
+      LMSTUDIO_PDF_IMAGE_QUALITY
+    );
 
     try {
       page.cleanup();
@@ -7700,8 +7761,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       mimeType: LMSTUDIO_PDF_IMAGE_MIME_TYPE,
       width,
       height,
+      renderer,
       dataUrlLength: dataUrl.length,
     };
+  }
+
+  async function convertPdfCanvasToDataUrl(canvas, mimeType, quality) {
+    if (canvas && typeof canvas.convertToBlob === "function") {
+      const blob = await canvas.convertToBlob({ type: mimeType, quality });
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      return `data:${blob.type || mimeType};base64,${uint8ArrayToBase64(bytes)}`;
+    }
+
+    if (canvas && typeof canvas.toDataURL === "function") {
+      return canvas.toDataURL(mimeType, quality);
+    }
+
+    throw new Error("conversion du canvas PDF en image indisponible");
   }
 
   function getPdfImageFallbackScale(page) {
@@ -10210,7 +10286,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
-    window.setTimeout(() => {
+    scheduleBackgroundTask(() => {
       const state = getState();
       if (
         state.running &&
@@ -11075,7 +11151,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       });
 
       openWedaAntecedentWorkerIfNeeded(result, title, resolveWedaPatientContextForAntecedent(null, result, titleInputTarget));
-      window.setTimeout(() => goToNextBiology(result.jobId), 500);
+      scheduleBackgroundTask(() => goToNextBiology(result.jobId), 500);
       return;
     }
 
@@ -11181,7 +11257,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
 
     openWedaAntecedentWorkerIfNeeded(result, title, patientContext);
-    window.setTimeout(() => goToNextBiology(result.jobId), NEXT_AFTER_TITLE_STABLE_MS);
+    scheduleBackgroundTask(() => goToNextBiology(result.jobId), NEXT_AFTER_TITLE_STABLE_MS);
   }
 
   function setNativeInputValue(input, value) {
@@ -11452,7 +11528,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         currentJobId: null,
         message: "Autre pièce jointe détectée : analyse du PDF suivant...",
       });
-      window.setTimeout(() => extractAndSendCurrentBiology(), 250);
+      scheduleBackgroundTask(() => extractAndSendCurrentBiology(), 250);
       return;
     }
 
@@ -17350,6 +17426,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function appendDebugLog(eventName, data = {}) {
     try {
+      if (shouldDeduplicateNoisyDebugEvent(eventName, data)) {
+        return;
+      }
+
       const logs = GM_getValue(DEBUG_LOG_KEY, []);
       const nextLogs = Array.isArray(logs) ? logs : [];
       const entry = {
@@ -17370,6 +17450,36 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         // Rien d'autre à faire si la console est inaccessible.
       }
     }
+  }
+
+  function shouldDeduplicateNoisyDebugEvent(eventName, data = {}) {
+    if (!/^weda:remembered-(?:title|specialty)-(?:skip-|already-present)/.test(String(eventName || ""))) {
+      return false;
+    }
+
+    const signature = [
+      eventName,
+      data.reason || "",
+      data.phase || "",
+      data.currentIndex == null ? "" : data.currentIndex,
+      data.rowIndex == null ? "" : data.rowIndex,
+      data.currentJobId || data.jobId || "",
+      data.rowStableKey || "",
+      data.rememberedRowStableKey || "",
+    ].join("|");
+    const now = Date.now();
+    const previousAt = Number(debugLogNoisyEventLastSeen.get(signature) || 0);
+
+    debugLogNoisyEventLastSeen.set(signature, now);
+    if (debugLogNoisyEventLastSeen.size > 200) {
+      for (const [key, seenAt] of debugLogNoisyEventLastSeen) {
+        if (now - seenAt > DEBUG_LOG_NOISY_EVENT_DEDUP_MS * 4) {
+          debugLogNoisyEventLastSeen.delete(key);
+        }
+      }
+    }
+
+    return previousAt > 0 && now - previousAt < DEBUG_LOG_NOISY_EVENT_DEDUP_MS;
   }
 
   function getDebugEnvironment() {
@@ -17510,18 +17620,57 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const startedAt = Date.now();
 
     return new Promise((resolve, reject) => {
-      const check = () => {
+      let settled = false;
+      let timerId = null;
+      let observer = null;
+      let observerCheckQueued = false;
+
+      const cleanup = () => {
+        if (timerId != null) {
+          cancelBackgroundTask(timerId);
+          timerId = null;
+        }
+        if (observer) {
+          observer.disconnect();
+          observer = null;
+        }
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      };
+
+      const finishResolve = (result) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+
+      const finishReject = (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+
+      const check = (scheduleNext = true) => {
+        if (settled) {
+          return;
+        }
+
         let result = null;
 
         try {
           result = condition();
         } catch (error) {
-          reject(error);
+          finishReject(error);
           return;
         }
 
         if (result) {
-          resolve(result);
+          finishResolve(result);
           return;
         }
 
@@ -17532,19 +17681,199 @@ SOURCE: fragment très court du courrier justifiant l’ajout
             interval,
             elapsed: Date.now() - startedAt,
           });
-          reject(new Error(`délai dépassé en attendant ${description}`));
+          finishReject(new Error(`délai dépassé en attendant ${description}`));
           return;
         }
 
-        window.setTimeout(check, interval);
+        if (scheduleNext) {
+          timerId = scheduleBackgroundTask(() => check(true), interval);
+        }
       };
 
-      check();
+      const requestObserverCheck = () => {
+        if (settled || observerCheckQueued) {
+          return;
+        }
+        observerCheckQueued = true;
+        dispatchBackgroundTask(() => {
+          observerCheckQueued = false;
+          check(false);
+        });
+      };
+
+      const handleVisibilityChange = () => requestObserverCheck();
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+
+      if (typeof MutationObserver === "function" && document.documentElement) {
+        observer = new MutationObserver(requestObserverCheck);
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+        });
+      }
+
+      check(true);
     });
   }
 
   function sleep(ms) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
+    return new Promise((resolve) => scheduleBackgroundTask(resolve, ms));
+  }
+
+  function scheduleBackgroundTask(callback, delay = 0, ...args) {
+    const delayMs = Math.max(0, Number(delay) || 0);
+    const taskId = `background-timer-${++backgroundTimerTaskSequence}`;
+    const nativeTimerId = window.setTimeout(() => completeBackgroundTask(taskId), delayMs);
+
+    backgroundTimerTasks.set(taskId, {
+      callback,
+      args,
+      nativeTimerId,
+    });
+
+    const worker = ensureBackgroundTimerWorker();
+    if (worker) {
+      try {
+        worker.postMessage({
+          type: "schedule",
+          id: taskId,
+          delay: delayMs,
+        });
+      } catch (_error) {
+        disableBackgroundTimerWorker("schedule-postmessage-error");
+      }
+    }
+
+    return taskId;
+  }
+
+  function cancelBackgroundTask(taskId) {
+    const task = backgroundTimerTasks.get(taskId);
+    if (!task) {
+      return;
+    }
+
+    backgroundTimerTasks.delete(taskId);
+    window.clearTimeout(task.nativeTimerId);
+
+    if (backgroundTimerWorker) {
+      try {
+        backgroundTimerWorker.postMessage({ type: "cancel", id: taskId });
+      } catch (_error) {
+        disableBackgroundTimerWorker("cancel-postmessage-error");
+      }
+    }
+  }
+
+  function completeBackgroundTask(taskId) {
+    const task = backgroundTimerTasks.get(taskId);
+    if (!task) {
+      return;
+    }
+
+    backgroundTimerTasks.delete(taskId);
+    window.clearTimeout(task.nativeTimerId);
+
+    if (backgroundTimerWorker) {
+      try {
+        backgroundTimerWorker.postMessage({ type: "cancel", id: taskId });
+      } catch (_error) {
+        disableBackgroundTimerWorker("complete-postmessage-error");
+      }
+    }
+
+    dispatchBackgroundTask(() => task.callback.apply(window, task.args));
+  }
+
+  function ensureBackgroundTimerWorker() {
+    if (backgroundTimerWorker || backgroundTimerWorkerUnavailable) {
+      return backgroundTimerWorker;
+    }
+
+    if (typeof Worker !== "function" || typeof Blob !== "function" || !window.URL || typeof window.URL.createObjectURL !== "function") {
+      backgroundTimerWorkerUnavailable = true;
+      appendDebugLog("weda:background-timer-worker-unavailable", {
+        reason: "worker-api-missing",
+      });
+      return null;
+    }
+
+    let workerUrl = "";
+    try {
+      const workerSource = `
+        const timers = new Map();
+        self.onmessage = (event) => {
+          const data = event.data || {};
+          if (data.type === "schedule") {
+            const previous = timers.get(data.id);
+            if (previous != null) clearTimeout(previous);
+            const timerId = setTimeout(() => {
+              timers.delete(data.id);
+              self.postMessage({ id: data.id });
+            }, Math.max(0, Number(data.delay) || 0));
+            timers.set(data.id, timerId);
+          } else if (data.type === "cancel") {
+            const timerId = timers.get(data.id);
+            if (timerId != null) clearTimeout(timerId);
+            timers.delete(data.id);
+          }
+        };
+      `;
+      workerUrl = window.URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+      backgroundTimerWorker = new Worker(workerUrl);
+      backgroundTimerWorker.onmessage = (event) => completeBackgroundTask(event && event.data && event.data.id);
+      backgroundTimerWorker.onerror = () => disableBackgroundTimerWorker("worker-runtime-error");
+      appendDebugLog("weda:background-timer-worker-ready", {});
+      return backgroundTimerWorker;
+    } catch (_error) {
+      disableBackgroundTimerWorker("worker-creation-error");
+      return null;
+    } finally {
+      if (workerUrl) {
+        try {
+          window.URL.revokeObjectURL(workerUrl);
+        } catch (_error) {
+          // L'URL temporaire sera libérée par le navigateur à la fermeture de la page.
+        }
+      }
+    }
+  }
+
+  function disableBackgroundTimerWorker(reason = "worker-disabled") {
+    const wasUnavailable = backgroundTimerWorkerUnavailable;
+    backgroundTimerWorkerUnavailable = true;
+    if (backgroundTimerWorker) {
+      try {
+        backgroundTimerWorker.terminate();
+      } catch (_error) {
+        // Le minuteur natif déjà armé reste le filet de sécurité.
+      }
+      backgroundTimerWorker = null;
+    }
+    if (!wasUnavailable) {
+      appendDebugLog("weda:background-timer-worker-unavailable", { reason });
+    }
+  }
+
+  function dispatchBackgroundTask(callback) {
+    if (typeof MessageChannel !== "function") {
+      Promise.resolve().then(callback);
+      return;
+    }
+
+    if (!backgroundTaskChannel) {
+      backgroundTaskChannel = new MessageChannel();
+      backgroundTaskChannel.port1.onmessage = () => {
+        const task = backgroundTaskQueue.shift();
+        if (typeof task === "function") {
+          task();
+        }
+      };
+    }
+
+    backgroundTaskQueue.push(callback);
+    backgroundTaskChannel.port2.postMessage(0);
   }
 
   function createId(prefix) {

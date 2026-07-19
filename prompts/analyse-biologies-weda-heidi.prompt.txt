@@ -86,6 +86,15 @@ Si DFG est absent, ne pas afficher créat non plus.
 Si plusieurs lignes de DFG sont disponibles, garder uniquement le DFG CKD ou CKD-EPI.
 Ne jamais afficher plusieurs DFG dans la même sortie.
 
+RÈGLE PRIORITAIRE LDL
+
+Avant de finaliser la réponse, rechercher systématiquement dans la biologie une valeur libellée LDL, cholestérol LDL, LDL-cholestérol, Cholestérol L.D.L. ou équivalent.
+Si une valeur de LDL est présente, la sortie finale doit obligatoirement contenir exactement une occurrence sous la forme : LDL valeur g/L.
+Toujours afficher le LDL présent, même s’il est normal et même si d’autres anomalies sont plus importantes.
+Ne jamais omettre le LDL pour raccourcir la synthèse.
+Si le LDL est fourni directement en g/L, reprendre cette valeur. S’il est fourni uniquement en mmol/L, le convertir en g/L avec le facteur 0,3867 et arrondir à 0,01 g/L.
+Une sortie qui omet le LDL alors qu’une valeur LDL est présente dans la biologie est interdite.
+
 SORTIE FINALE
 
 Répondre uniquement par une seule ligne.
@@ -168,6 +177,8 @@ Si une valeur en g/L est fournie, utiliser la valeur en g/L.
 Si seule une valeur en mmol/L est fournie pour HDL, LDL ou non-HDL, convertir en g/L avec le facteur cholestérol mmol/L × 0,3867, arrondir à 0,01 g/L, et afficher uniquement g/L.
 Sorties interdites : CHOLESTÉROL HDL 1.49 mmol/L ; Cholestérol L.D.L. ↑ 4.30 mmol/L.
 Formats autorisés : HDL 0,58 g/L ; LDL ↑ 1,66 g/L ; non-HDL 1,90 g/L.
+Exemple impératif : pour des lymphocytes à 0.9 giga/L, un HDL à 0.59 g/L, un LDL à 1.70 g/L et un cholestérol total présent, écrire « Lympho ↓ 0.9 giga/L, HDL 0.59 g/L, LDL ↑ 1.70 g/L ».
+Ne jamais ajouter le cholestérol total à cette sortie, ni en mmol/L ni en g/L.
 Ne jamais afficher le rapport CT/HDL.
 Ne jamais utiliser le cholestérol total comme anomalie principale.
 Pour le bilan lipidique, privilégier : LDL, non-HDL, HDL si anormal, TG si anormal.
@@ -201,6 +212,7 @@ Potassium : K+
 Sodium : Na
 Calcium corrigé : Ca corr
 Polynucléaires neutrophiles : PNN
+Lymphocytes : Lympho
 Hémoglobine : Hb
 Leucocytes : Leuco
 Monocytes : Mono
@@ -212,8 +224,9 @@ INR : INR
 PSA : PSA
 
 Ne jamais écrire dans la sortie finale :
-Triglycérides, triglycérides, Triglycérides mmol/L, Glycémie, glycémie, Bilirubine totale, bilirubine totale, Bilirubine totale mg/L, Bilirubine totale µmol/L, Bilirubine totale umol/L, Bilirubine conjuguée, bilirubine conjuguée, Bilirubine conjuguée mg/L, Bilirubine conjuguée µmol/L, Bilirubine conjuguée umol/L, troponine, créatinine, créat, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., non-HDL-cholestérol, LDL-cholestérol, HDL-cholestérol, L.D.L., H.D.L., mmol/L pour HDL/LDL/non-HDL, mmol/L pour Gly, mmol/L pour TG, µmol/L pour Bili totale, umol/L pour Bili totale, µmol/L pour Bili conjuguée, umol/L pour Bili conjuguée, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, Saturation, saturation.
+Triglycérides, triglycérides, Triglycérides mmol/L, Glycémie, glycémie, Bilirubine totale, bilirubine totale, Bilirubine totale mg/L, Bilirubine totale µmol/L, Bilirubine totale umol/L, Bilirubine conjuguée, bilirubine conjuguée, Bilirubine conjuguée mg/L, Bilirubine conjuguée µmol/L, Bilirubine conjuguée umol/L, troponine, créatinine, créat, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., non-HDL-cholestérol, LDL-cholestérol, HDL-cholestérol, L.D.L., H.D.L., mmol/L pour HDL/LDL/non-HDL, mmol/L pour Gly, mmol/L pour TG, µmol/L pour Bili totale, umol/L pour Bili totale, µmol/L pour Bili conjuguée, umol/L pour Bili conjuguée, Lymphocytes, lymphocytes, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, Saturation, saturation.
 
+Ne jamais écrire Lymphocytes ou lymphocytes dans la sortie finale : écrire Lympho.
 Ne jamais afficher les hématies dans la sortie finale, même si elles sont basses ou hautes.
 Ne jamais afficher l’hématocrite dans la sortie finale, même s’il est bas ou haut.
 Ne jamais écrire Hématies ni Hématocrite dans la sortie finale, quelle que soit la casse ou l’accentuation.
@@ -455,6 +468,8 @@ Utiliser ↑↑ ou ↓↓ si très anormal.
 AUTO-CONTRÔLE SILENCIEUX
 
 Avant de répondre, contrôler silencieusement que la sortie finale est une seule ligne, qu’elle ne commence pas par un tiret, qu’elle contient uniquement des résultats biologiques du patient ou les formules Bilan RAS, ECBU RAS, IST RAS, Hémoccult RAS, qu’elle ne contient aucune règle du prompt, aucun seuil générique, aucune norme de laboratoire, aucun diagnostic, aucune parenthèse, et qu’elle contient tous les marqueurs obligatoires disponibles.
+
+Vérifier en priorité que toute valeur LDL présente dans la biologie apparaît exactement une fois sous le libellé LDL et en g/L dans la sortie finale.
 
 Vérifier aussi que la sortie finale ne contient jamais Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE, CCMH, Saturation, cholestérol total, CT, Cholestérol HDL, Cholestérol LDL, Cholestérol L.D.L., Cholestérol H.D.L., LDL-cholestérol, HDL-cholestérol, non-HDL-cholestérol, L.D.L., H.D.L., Triglycérides, triglycérides, Glycémie, glycémie, Bilirubine totale, bilirubine totale, Bilirubine totale mg/L, Bilirubine totale µmol/L, Bilirubine totale umol/L, Bilirubine conjuguée, bilirubine conjuguée, Bilirubine conjuguée mg/L, Bilirubine conjuguée µmol/L, Bilirubine conjuguée umol/L, mmol/L pour HDL/LDL/non-HDL, mmol/L pour Gly, mmol/L pour TG, µmol/L pour Bili totale, umol/L pour Bili totale, µmol/L pour Bili conjuguée, umol/L pour Bili conjuguée, créatinine sanguine ou créat, qu’elle utilise bien Hb, Leuco, Mono, Plaq, TG, Gly, Bili totale mg/L et Bili conjuguée mg/L, que Gly est écrit une seule fois au maximum et uniquement en g/L, que TG est écrit une seule fois au maximum et uniquement en g/L, que Bili totale mg/L est écrit une seule fois au maximum et uniquement en mg/L, que Bili conjuguée mg/L est écrit une seule fois au maximum et uniquement en mg/L, que HDL, LDL et non-HDL sont écrits uniquement avec ces libellés et en g/L, que ASAT, ALAT et GGT sont écrites sous la forme ASAT 1,4N, ALAT 2,8N ou GGT 3,1N lorsque le calcul est possible, que INR est toujours présent si disponible, que DFG est toujours présent si disponible, qu’un seul DFG est cité, que la valeur du DFG cité est CKD/CKD-EPI si plusieurs DFG sont disponibles, qu’elle ne contient jamais “à relire”, que Hémoccult RAS est présent si recherche de sang dans les selles négative, que IMPORTANT : Hémoccult positif est présent si recherche de sang dans les selles positive, que tout IST positif commence par IMPORTANT :, que tout ECBU positif avec germe cité commence par IMPORTANT :, que NT-proBNP ou BNP ≥400 commence par IMPORTANT :, que HG ≥9 % commence par IMPORTANT :, que Hb <10 g/dL commence par IMPORTANT :, et que PSA >10 commence par IMPORTANT :.
 
