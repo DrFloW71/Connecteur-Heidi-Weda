@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Antécédents CIM-10 WEDA avec LM Studio AVEC colorisation
 // @namespace    http://tampermonkey.net/
-// @version      6.2.5
-// @description  Touche Inser/Insert : exporte les antécédents WEDA non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
+// @version      6.2.6
+// @description  Sur la page Antécédents patient WEDA, la touche Inser/Insert exporte les antécédents non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @all-frames   true
 // @run-at       document-idle
@@ -25,7 +25,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.5-LMstudio-avec-colorisation';
+    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.6-LMstudio-avec-colorisation';
 
     const HOST_WEDA = 'secure.weda.fr';
     const HOST_HEIDI = 'scribe.heidihealth.com';
@@ -4717,6 +4717,12 @@ END_ATCD`;
         return isWeda() && /\/foldermedical\/antecedentform\.aspx/i.test(location.pathname);
     }
 
+    function isAntecedentLauncherPageWeda() {
+        return isWeda()
+            && /\/foldermedical\/antecedentform\.aspx$/i.test(location.pathname)
+            && /(?:\?|&)PatDk=/i.test(location.search);
+    }
+
     function getWedaAntecedentRoot() {
         return findElementDeep(SELECTOR_WEDA_ANTECEDENT_UPDATE_PANEL) || null;
     }
@@ -4853,7 +4859,7 @@ END_ATCD`;
         const existingPanel = document.getElementById(panelId);
         const legacyButton = document.getElementById(mainButtonId);
 
-        if (!isAntecedentPageWeda()) {
+        if (!isAntecedentLauncherPageWeda()) {
             if (existingPanel) existingPanel.remove();
             if (legacyButton && (!existingPanel || !existingPanel.contains(legacyButton))) legacyButton.remove();
             return;
@@ -5021,8 +5027,8 @@ END_ATCD`;
     }
 
     function startAtcdCim10ExportFromWeda(source = 'manual') {
-        if (!isWeda()) {
-            showBadge('À lancer depuis WEDA.', { error: true });
+        if (!isAntecedentLauncherPageWeda()) {
+            showBadge('À lancer uniquement depuis la page Antécédents du patient WEDA.', { error: true, duration: 8000 });
             return;
         }
 
@@ -5031,11 +5037,6 @@ END_ATCD`;
             clearWorkerJobIdForThisTab();
         } else if (activeWorkerJob) {
             showBadge('Cet onglet est un worker d’import.\nLance le script depuis un onglet WEDA patient normal.', { error: true, duration: 8000 });
-            return;
-        }
-
-        if (!isPatientAccueilWeda() && !isAntecedentPageWeda()) {
-            showBadge('Ouvre d’abord l’accueil patient WEDA ou la page Antécédents.', { error: true, duration: 8000 });
             return;
         }
 
@@ -15001,7 +15002,7 @@ ${HEIDI_ASK_AI_PROMPT}`
 
     function installKeyboardShortcut() {
         window.addEventListener('keydown', (event) => {
-            if (!isWeda()) return;
+            if (!isAntecedentLauncherPageWeda()) return;
             if (event.repeat) return;
             if (isEditableTarget(event.target)) return;
 

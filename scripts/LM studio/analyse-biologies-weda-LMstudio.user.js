@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec LM Studio local
 // @namespace    https://secure.weda.fr/
-// @version      0.1.10
+// @version      0.1.12
 // @description  Analyse les résultats HPRIM avec l'API OpenAI-compatible de LM Studio en local. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @grant        GM_addValueChangeListener
@@ -32,7 +32,7 @@
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const ANAPATH_SIGNAL = "ANAPATH À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "0.1.10";
+  const SCRIPT_VERSION = "0.1.12";
 
   const STORAGE_PREFIX = "wedaBioLmStudio.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
@@ -74,7 +74,10 @@
   const WEDA_ROW_OPEN_RETRY_DELAYS_MS = [4500, 11000];
   const WEDA_ROW_OPEN_RETRY_MIN_GAP_MS = 8000;
   const NEXT_AFTER_SAVE_MS = 5500;
-  const NEXT_AFTER_RELOAD_SAVE_MS = 3200;
+  // Le rechargement Weda confirme déjà la fin du postback de sauvegarde.
+  // Une courte marge suffit avant de passer à la biologie suivante.
+  const NEXT_AFTER_RELOAD_SAVE_MS = 500;
+  const TITLE_SAVE_NAVIGATION_TIMEOUT_MS = 8000;
   const HEIDI_ANSWER_STABLE_WITH_COPY_MS = 1000;
   const HEIDI_ANSWER_STABLE_WITHOUT_COPY_MS = 2800;
   const HEIDI_ANSWER_STABLE_WITH_STUCK_THINKING_MS = 7000;
@@ -128,6 +131,8 @@
   let manualTitleEditState = null;
   let wedaPageUnloading = false;
   let wedaTitleSavePending = false;
+  let wedaTitleSaveWatchdogTimer = null;
+  let wedaTitleAsyncPostBackCleanup = null;
   let lastWedaRowOpenAttempt = null;
 
   const HEIDI_PROMPT = "Tu es médecin généraliste en France.\n\nAnalyse uniquement le compte-rendu de biologie fourni après le signal :\nBIOLOGIE À ANALYSER CI-DESSOUS\n\nOBJECTIF\n\nProduire une seule ligne de synthèse biologique courte, avec :\n- les anomalies biologiques utiles ;\n- les marqueurs obligatoires disponibles, même normaux ;\n- les bilans normaux utiles sous forme abrégée : ECBU RAS, IST RAS ;\n- les anomalies les plus graves en premier ;\n- uniquement des résultats biologiques bruts ;\n- aucun diagnostic ;\n- aucune interprétation médicale ;\n- aucune conduite à tenir ;\n- aucun commentaire long.\n\nRÈGLE ANTI-RECOPIE DU PROMPT\n\nLa sortie finale ne doit jamais contenir une phrase, un seuil, une règle, une consigne, un titre ou une liste provenant du prompt.\nLa sortie finale ne doit jamais commencer par un tiret.\nLa sortie finale ne doit jamais reprendre une phrase du type “si”, “ne jamais”, “toujours”, “commencer la ligne”, “citer”, “écrire”, “vérifier”, “critère”, “règle”, “prompt”.\nSi une consigne du prompt risque d’être recopiée, l’ignorer et produire uniquement les vrais résultats biologiques du patient.\n\nRÈGLE ANTI-FAUX BILAN RAS\n\nAvant de répondre “Bilan RAS”, analyser toute la biologie ligne par ligne.\n\nNe jamais répondre “Bilan RAS” si au moins une valeur est :\n- hors intervalle Minimum / Maximum du laboratoire ;\n- affichée en rouge, gras rouge, couleur d’anomalie ou signalée comme anormale ;\n- accompagnée d’une flèche ou d’un commentaire d’alerte ;\n- manifestement pathologique selon les seuils d’urgence.\n\nSi le tableau contient les colonnes Libellé / Valeur / Unité / Minimum / Maximum :\ncomparer la valeur mesurée au Minimum et au Maximum.\nSi Valeur < Minimum : citer la valeur avec ↓.\nSi Valeur > Maximum : citer la valeur avec ↑.\nNe jamais afficher les Minimum / Maximum dans la sortie finale.\n\nEn cas de doute entre “Bilan RAS” et citer une valeur anormale, citer la valeur anormale.\n“Bilan RAS” est autorisé uniquement si aucune valeur anormale, aucun marqueur obligatoire, aucun ECBU normal et aucun bilan IST normal ne doit être cité.\n\nSOURCE UNIQUE\n\nUtilise uniquement les résultats fournis après le signal :\nBIOLOGIE À ANALYSER CI-DESSOUS\n\nNe jamais inventer une valeur, une unité, une norme, une date ou un contexte clinique.\nLes normes du laboratoire sont prioritaires.\nSi une norme manque, ne pas conclure sauf seuil d’urgence évident.\nTenir compte des unités.\nNe pas interpréter cliniquement au-delà du résultat biologique.\n\nMARQUEURS OBLIGATOIRES\n\nToujours citer ces marqueurs s’ils sont disponibles, même normaux :\nLDL, non-HDL, TROPO, CRP, PCT, BNP, HG, LIPASE, DFG, HCG.\n\nNotation obligatoire :\nLDL : écrire LDL\nnon-HDL : écrire non-HDL sans espace avant la valeur\ntroponine : écrire TROPO\nCRP : écrire CRP\nprocalcitonine : écrire PCT\nNT-proBNP ou BNP : écrire BNP\nHbA1c ou hémoglobine glyquée : écrire HG\nlipase : écrire LIPASE\nDFG : écrire DFG, sans unité\nbêta-HCG : écrire HCG\n\nNe jamais répondre seulement “Bilan RAS”, “ECBU RAS” ou “IST RAS” si un marqueur obligatoire est disponible.\nSi un marqueur obligatoire est présent dans la biologie, il doit être présent dans la sortie finale.\n\nSORTIE FINALE\n\nRépondre uniquement par une seule ligne.\nNe jamais faire de retour à la ligne.\nNe jamais écrire d’explication.\nNe jamais écrire de liste.\nNe jamais commencer par un tiret.\n\nLa sortie finale doit contenir uniquement :\n- des résultats biologiques bruts du patient ;\n- ou Bilan RAS avec marqueurs obligatoires disponibles ;\n- ou ECBU RAS avec marqueurs obligatoires disponibles ;\n- ou IST RAS avec marqueurs obligatoires disponibles ;\n- ou URGENCE : suivi des vrais résultats biologiques urgents du patient.\n\nNe jamais écrire :\nRésumé, Anomalies, Alarme, À RELIRE, IMPORTANT, AUCUNE, Bilans RAS.\n\nÉcrire toujours “Bilan RAS” au singulier, jamais “Bilans RAS”.\n\nLe seul préfixe autorisé est :\nURGENCE :\n\nUtiliser URGENCE : uniquement si un critère d’urgence est présent.\nSinon, ne mettre aucun préfixe.\n\nSi aucune anomalie significative, aucun marqueur obligatoire disponible, aucun ECBU normal et aucun bilan IST normal :\nBilan RAS\n\nSi aucune anomalie significative mais marqueurs obligatoires disponibles :\nBilan RAS, puis les marqueurs obligatoires disponibles.\n\nSi ECBU présent et normal sans anomalie associée :\nECBU RAS\n\nSi ECBU présent et normal avec marqueurs obligatoires disponibles :\nECBU RAS, puis les marqueurs obligatoires disponibles.\n\nSi bilan IST présent et normal sans anomalie associée :\nIST RAS\n\nSi bilan IST présent et normal avec marqueurs obligatoires disponibles :\nIST RAS, puis les marqueurs obligatoires disponibles.\n\nSi anomalie biologique :\nécrire directement les anomalies avec nom du marqueur, flèche si nécessaire, valeur et unité.\n\nNORMES\n\nNe jamais afficher les limites, normes, minimums ou maximums du laboratoire dans la sortie finale.\nLes normes servent uniquement à savoir si une valeur est normale ou anormale.\nLa sortie finale doit contenir uniquement la valeur mesurée et son unité.\nException : pour ASAT, ALAT et GGT élevées, utiliser la norme haute uniquement pour calculer le nombre de fois la norme, mais ne jamais afficher la norme elle-même.\n\nCHOLESTÉROL / LIPIDES\n\nNe jamais afficher le cholestérol total.\nNe jamais afficher CT.\nMême si cholestérol total ou CT est anormal, ne pas le citer dans la sortie finale.\nLDL doit toujours être affiché s’il est disponible.\nnon-HDL doit toujours être affiché s’il est disponible.\nHDL doit être affiché uniquement s’il est anormal ou utile.\nTG doit être affiché uniquement s’il est anormal ou utile.\nNe jamais afficher le rapport CT/HDL.\nNe jamais utiliser le cholestérol total comme anomalie principale.\nPour le bilan lipidique, privilégier : LDL, non-HDL, HDL si anormal, TG si anormal.\n\nABRÉVIATIONS OBLIGATOIRES\n\nTriglycérides : TG\nGlycémie : Gly\nPotassium : K+\nPolynucléaires neutrophiles : PNN\nHémoglobine : Hb\nLeucocytes : Leuco\nMonocytes : Mono\nPlaquettes : Plaq\nFerritine : ferr\nCréatinine : créat\nCréatinine urinaire : Créat U\nRapport protéinurie/créatininurie, Ratio PTU/CU, Rapport ProtU/CrU ou équivalent : RAC\n\nNe jamais écrire dans la sortie finale :\ntriglycérides, glycémie, troponine, créatinine, Créatinine urinaire, Rapport ProtU/CrU, cholestérol total, CT, rapport CT/HDL, non-HDL-cholestérol, Hémoglobine, Leucocytes, Monocytes, Plaquettes, plaquettes, Hématies, hématies, HÉMATIES, Hématocrite, hématocrite, HÉMATOCRITE.\n\nNe jamais afficher les hématies dans la sortie finale, même si elles sont basses ou hautes.\nNe jamais afficher l’hématocrite dans la sortie finale, même s’il est bas ou haut.\nPour une anomalie de l’hémoglobine, afficher uniquement Hb.\nPour une anomalie des leucocytes, afficher uniquement Leuco.\nPour une anomalie des monocytes, afficher uniquement Mono.\nPour une anomalie des plaquettes, afficher uniquement Plaq.\n\nUNITÉS À PRÉFÉRER SI PLUSIEURS SONT DISPONIBLES\n\nLDL : g/L\nnon-HDL : g/L\nHDL : g/L\nTG : g/L\nHG : %\ncréat : µmol/L\nHb : g/dL\nDFG : valeur seule sans unité\nPour les autres marqueurs : garder l’unité fournie.\n\nNe citer qu’une seule fois une même analyse.\nNe pas citer les unités alternatives si l’unité préférée est disponible.\nNe pas citer les valeurs historiques sauf évolution clairement utile.\n\nRÈGLES SPÉCIALES\n\nSi Hb basse selon la norme :\nciter Hb, et ajouter ferr et VGM s’ils sont disponibles.\nNe pas citer les hématies.\nNe pas citer l’hématocrite.\n\nSi TSH anormale :\nciter TSH et ajouter T4L si disponible.\n\nSi B12 ou folates bas :\nciter B12 ou folates, et ajouter VGM si disponible.\n\nSi BNP élevé :\nciter BNP et ajouter DFG si disponible.\n\nSi HCG disponible :\ntoujours citer HCG.\nNe pas écrire grossesse sauf si explicitement écrit dans le compte-rendu.\n\nECBU\n\nSi un ECBU est présent et normal, écrire :\nECBU RAS\n\nConsidérer ECBU normal si le compte-rendu mentionne une culture stérile, des cultures restées stériles, une absence d’infection urinaire, une absence de colonisation, une absence de bactériurie significative, une absence de leucocyturie significative, une absence de germe pathogène ou un examen cytobactériologique normal.\n\nSi ECBU normal et autres marqueurs obligatoires disponibles, écrire ECBU RAS, puis les marqueurs obligatoires disponibles.\n\nSi ECBU anormal, ne pas écrire ECBU RAS.\nCiter uniquement les éléments utiles : germe, leucocyturie, hématurie, nitrites, bactériurie, antibiogramme si pertinent, commentaire à contrôler si présent.\n\nNe jamais confondre ECBU RAS avec IST RAS.\n\nIST\n\nSi bilan IST présent et tous les résultats fournis sont négatifs ou normaux :\najouter IST RAS.\n\nSi un résultat IST est positif, douteux, limite, indéterminé ou à contrôler :\nne pas écrire IST RAS, citer uniquement le résultat concerné.\n\nIST inclut notamment VIH, syphilis, TPHA, VDRL, Chlamydia, gonocoque, Mycoplasma genitalium, VHB, VHC, Ag HBs, Ac anti-HBs, Ac anti-HBc.\n\nASAT / ALAT / GGT\n\nSi ASAT, ALAT ou GGT sont élevées :\n- si la limite supérieure de la norme est disponible et cohérente, afficher uniquement le nombre de fois la norme ;\n- calculer valeur divisée par limite supérieure ;\n- arrondir à une décimale ;\n- écrire directement sous la forme : ASAT ↑ 1.4N, ALAT ↑ 2.8N ou GGT ↑ 3.1N ;\n- ne pas afficher la valeur mesurée ni l’unité si le calcul en N est possible ;\n- ne pas écrire ≈ ;\n- ne pas écrire x ;\n- ne pas écrire U/L si le calcul en N est possible.\n\nSi la norme haute est absente, incohérente ou aberrante :\nciter la valeur mesurée avec son unité.\n\nSi la valeur est normale :\nne pas calculer en N et ne pas citer sauf nécessité particulière.\n\nFAUX POSITIFS À ÉVITER\n\nNe pas citer les pourcentages de formule leucocytaire si la valeur absolue correspondante est normale.\nNe pas citer les hématies.\nNe pas citer l’hématocrite.\nNe pas citer le rapport CT/HDL.\nNe pas citer les ratios sans utilité clinique associée, sauf RAC élevé.\nNe pas citer poids, taille ou IMC comme biologie.\nIgnorer les normes manifestement aberrantes.\nNe pas citer les anomalies minimes isolées sans pertinence évidente.\nNe pas citer une valeur signalée artefactuelle comme anomalie certaine.\nSi hémolyse, prélèvement coagulé, résultat douteux, limite, indéterminé, à contrôler ou non interprétable : le signaler brièvement dans la ligne.\n\nANOMALIES À CITER\n\nCiter les valeurs hors norme utiles, notamment :\nHb basse ou haute, Leuco élevés ou bas, PNN élevés ou bas, Mono élevés ou bas, Plaq anormales, CRP élevée, VS élevée, PCT élevée, DFG bas, créat augmentée, albuminurie/protéinurie, RAC élevé, ASAT/ALAT/GGT/PAL/bilirubine élevées, HG élevée, Gly élevée, LDL élevé, non-HDL élevé, HDL bas ou élevé selon norme, TG élevés, TSH anormale, T4L anormale, ferr basse ou très élevée, B12 basse, folates bas, vitamine D basse, PSA élevé, LIPASE élevée, BNP élevé, TROPO élevée, ECBU positif, bilan IST positif ou douteux.\n\nNe jamais citer cholestérol total ou CT, même si hors norme.\nNe jamais citer hématies ou hématocrite, même si hors norme.\n\nURGENCE\n\nCommencer la ligne par URGENCE : si au moins un critère suivant est présent :\nvaleur critique signalée par le laboratoire ;\nrésultat urgent ou appel prescripteur signalé par le laboratoire ;\nK+ très bas ou très élevé, sauf hémolyse signalée ;\nsodium très bas ou très élevé ;\ncalcium corrigé très bas ou très élevé ;\nGly très basse ou très élevée ;\nHb très basse ;\nPlaq très basses ;\nPNN très bas ;\nLeuco très élevés ;\nINR très élevé ;\nfibrinogène très bas ;\nlactates élevés ;\npH très acide ou très alcalin ;\nASAT ou ALAT très élevées ;\ncréat très élevée ou insuffisance rénale aiguë mentionnée, surtout avec hyperkaliémie ;\nLIPASE très élevée avec douleur abdominale ou contexte évocateur fourni ;\nhémoculture positive, paludisme positif ou LCR évocateur d’infection bactérienne ;\nTROPO élevée avec variation significative si deux dosages sont fournis ;\nTROPO ou D-dimères critiques si le laboratoire le signale ou si le contexte clinique fourni évoque douleur thoracique, dyspnée, embolie pulmonaire, syncope, déficit neurologique ou urgence cardiovasculaire.\n\nSi K+ élevé avec hémolyse signalée :\nciter K+ et hémolyse, mais ne pas mettre URGENCE uniquement pour ce K+.\n\nSTYLE FINAL\n\nUne seule ligne.\nStyle médical télégraphique.\nUniquement résultats bruts.\nForme normale : nom valeur unité.\nForme anormale : nom flèche nombre unité.\nPour ASAT, ALAT et GGT anormales : nom flèche nombreN si calcul possible.\nNe jamais écrire ASAT ↑ 72 U/L 1.4N.\nÉcrire ASAT ↑ 1.4N.\nNe jamais écrire d’interprétation médicale.\nNe jamais écrire de diagnostic.\nNe jamais écrire hypercholestérolémie, hypertriglycéridémie, dyslipidémie, syndrome inflammatoire, cytolyse, cholestase, anémie, diabète déséquilibré, pancréatite, infarctus, SCA, IDM, grossesse, infection, sauf si explicitement écrit dans le compte-rendu.\nNe jamais regrouper les résultats sous un diagnostic.\nNe jamais mettre les résultats entre parenthèses.\nNe jamais écrire une règle du prompt.\nNe jamais écrire un seuil générique du prompt.\nÉcrire uniquement les résultats biologiques bruts utiles.\nNe jamais ajouter les normes, minimums ou maximums après la valeur.\nSéparer par des virgules.\nUtiliser et uniquement avant le dernier élément.\nUtiliser ↑ ou ↓ si hors norme.\nUtiliser ↑↑ ou ↓↓ si très anormal.\n\nAUTO-CONTRÔLE SILENCIEUX\n\nAvant de répondre, contrôler silencieusement que la sortie finale est une seule ligne, qu’elle ne commence pas par un tiret, qu’elle contient uniquement des résultats biologiques du patient ou les formules Bilan RAS, ECBU RAS, IST RAS, qu’elle ne contient aucune règle du prompt, aucun seuil générique, aucune norme de laboratoire, aucun diagnostic, aucune parenthèse, et qu’elle contient tous les marqueurs obligatoires disponibles.\n\nVérifier aussi que la sortie finale ne contient jamais Hématies ni Hématocrite, et qu’elle utilise bien Hb, Leuco, Mono et Plaq.\n\nNe jamais afficher cet auto-contrôle.";
@@ -745,6 +750,13 @@ Ne jamais afficher cet auto-contrôle.`;
   function initWeda() {
     window.addEventListener("beforeunload", () => {
       wedaPageUnloading = true;
+      if (wedaTitleSaveWatchdogTimer) {
+        window.clearTimeout(wedaTitleSaveWatchdogTimer);
+        wedaTitleSaveWatchdogTimer = null;
+      }
+      if (wedaTitleAsyncPostBackCleanup) {
+        wedaTitleAsyncPostBackCleanup();
+      }
     }, { capture: true });
     registerWedaWindowName();
     createWedaPanel();
@@ -2461,6 +2473,7 @@ Ne jamais afficher cet auto-contrôle.`;
 
   function stopWedaWorkflow() {
     GM_deleteValue(JOB_KEY);
+    resetWedaTitleSaveTracking();
     setState({
       running: false,
       mode: "manual",
@@ -4939,6 +4952,7 @@ Ne jamais afficher cet auto-contrôle.`;
 
     const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
     const postBackTarget = input.name || "ctl00$ContentPlaceHolder1$TextBoxHprimTitre";
+    const hasNativeChangeHandler = Boolean(input.getAttribute("onchange") || typeof input.onchange === "function");
 
     appendDebugLog("weda:title-save-trigger", {
       source,
@@ -4947,6 +4961,7 @@ Ne jamais afficher cet auto-contrôle.`;
       rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
       titleLength: input ? sanitizeTitle(input.value).length : 0,
       hasDoPostBack: Boolean(pageWindow && typeof pageWindow.__doPostBack === "function"),
+      hasNativeChangeHandler,
       postBackTarget,
     });
 
@@ -4967,8 +4982,10 @@ Ne jamais afficher cet auto-contrôle.`;
       }
     }
 
+    let asyncPostBackArmed = registerWedaTitleAsyncPostBackCompletion(pageWindow, assignmentGuard, source);
+    wedaTitleSavePending = true;
+
     if (typeof pageWindow.__doPostBack === "function") {
-      wedaTitleSavePending = true;
       appendDebugLog("weda:title-save-postback", {
         source,
         jobId: assignmentGuard && assignmentGuard.jobId || "",
@@ -4976,30 +4993,168 @@ Ne jamais afficher cet auto-contrôle.`;
         rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
         postBackTarget,
         method: "__doPostBack-single",
+        asyncPostBackArmed,
       });
 
       try {
         pageWindow.__doPostBack(postBackTarget, "");
+        scheduleWedaTitleSaveWatchdog(assignmentGuard, source);
         return true;
       } catch (error) {
         wedaTitleSavePending = false;
+        clearWedaTitleAsyncPostBackCompletion();
         appendDebugLog("weda:title-save-postback-error", {
           source,
           error: error.message,
         });
+        asyncPostBackArmed = registerWedaTitleAsyncPostBackCompletion(pageWindow, assignmentGuard, source);
       }
     }
 
     // Repli rare : si Weda n'expose pas __doPostBack, un seul événement change
-    // est émis. Ne jamais le combiner avec des événements Entrée, qui pourraient
-    // provoquer une seconde soumission du même ViewState ASP.NET.
+    // est émis. Ne jamais le combiner avec des événements Entrée.
     wedaTitleSavePending = true;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
     appendDebugLog("weda:title-save-fallback", {
       source,
+      jobId: assignmentGuard && assignmentGuard.jobId || "",
+      contentKey: assignmentGuard && assignmentGuard.contentKey || getDisplayedBiologyContentKey(),
+      rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
+      postBackTarget,
       method: "change-single",
+      hasNativeChangeHandler,
+      asyncPostBackArmed,
     });
+
+    try {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (error) {
+      wedaTitleSavePending = false;
+      clearWedaTitleAsyncPostBackCompletion();
+      appendDebugLog("weda:title-save-change-error", {
+        source,
+        error: error.message,
+      });
+      failWeda(`Impossible de déclencher la sauvegarde Weda : ${error.message}`);
+      return false;
+    }
+
+    scheduleWedaTitleSaveWatchdog(assignmentGuard, source);
     return true;
+  }
+
+  function registerWedaTitleAsyncPostBackCompletion(pageWindow, assignmentGuard = null, source = "") {
+    clearWedaTitleAsyncPostBackCompletion();
+
+    const pageRequestManagerType = pageWindow && pageWindow.Sys && pageWindow.Sys.WebForms &&
+      pageWindow.Sys.WebForms.PageRequestManager;
+    if (!pageRequestManagerType || typeof pageRequestManagerType.getInstance !== "function") {
+      return false;
+    }
+
+    let manager = null;
+    try {
+      manager = pageRequestManagerType.getInstance();
+    } catch (_error) {
+      return false;
+    }
+
+    if (!manager || typeof manager.add_endRequest !== "function") {
+      return false;
+    }
+
+    const expectedJobId = assignmentGuard && assignmentGuard.jobId || "";
+    const endRequestHandler = () => {
+      clearWedaTitleAsyncPostBackCompletion();
+
+      if (!wedaTitleSavePending || wedaPageUnloading) {
+        return;
+      }
+
+      const state = getState();
+      if (!state.running || state.phase !== "savingTitle" || expectedJobId && state.currentJobId !== expectedJobId) {
+        return;
+      }
+
+      wedaTitleSavePending = false;
+      if (wedaTitleSaveWatchdogTimer) {
+        window.clearTimeout(wedaTitleSaveWatchdogTimer);
+        wedaTitleSaveWatchdogTimer = null;
+      }
+
+      appendDebugLog("weda:title-save-async-complete", {
+        source,
+        jobId: expectedJobId,
+        contentKey: assignmentGuard && assignmentGuard.contentKey || getDisplayedBiologyContentKey(),
+        rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
+      });
+      window.setTimeout(() => goToNextBiology(expectedJobId), NEXT_AFTER_RELOAD_SAVE_MS);
+    };
+
+    try {
+      manager.add_endRequest(endRequestHandler);
+    } catch (_error) {
+      return false;
+    }
+    wedaTitleAsyncPostBackCleanup = () => {
+      try {
+        if (typeof manager.remove_endRequest === "function") {
+          manager.remove_endRequest(endRequestHandler);
+        }
+      } catch (_error) {
+        // La page peut déjà être en cours de remplacement.
+      }
+      wedaTitleAsyncPostBackCleanup = null;
+    };
+    return true;
+  }
+
+  function clearWedaTitleAsyncPostBackCompletion() {
+    if (wedaTitleAsyncPostBackCleanup) {
+      const cleanup = wedaTitleAsyncPostBackCleanup;
+      wedaTitleAsyncPostBackCleanup = null;
+      cleanup();
+    }
+  }
+
+  function resetWedaTitleSaveTracking() {
+    wedaTitleSavePending = false;
+    if (wedaTitleSaveWatchdogTimer) {
+      window.clearTimeout(wedaTitleSaveWatchdogTimer);
+      wedaTitleSaveWatchdogTimer = null;
+    }
+    clearWedaTitleAsyncPostBackCompletion();
+  }
+
+  function scheduleWedaTitleSaveWatchdog(assignmentGuard = null, source = "") {
+    if (wedaTitleSaveWatchdogTimer) {
+      window.clearTimeout(wedaTitleSaveWatchdogTimer);
+    }
+
+    const expectedJobId = assignmentGuard && assignmentGuard.jobId || "";
+    wedaTitleSaveWatchdogTimer = window.setTimeout(() => {
+      wedaTitleSaveWatchdogTimer = null;
+
+      if (!wedaTitleSavePending || wedaPageUnloading) {
+        return;
+      }
+
+      const state = getState();
+      if (!state.running || state.phase !== "savingTitle" || expectedJobId && state.currentJobId !== expectedJobId) {
+        return;
+      }
+
+      wedaTitleSavePending = false;
+      clearWedaTitleAsyncPostBackCompletion();
+      appendDebugLog("weda:title-save-timeout", {
+        source,
+        jobId: expectedJobId,
+        contentKey: assignmentGuard && assignmentGuard.contentKey || getDisplayedBiologyContentKey(),
+        rowIndex: assignmentGuard ? assignmentGuard.rowIndex : null,
+        titleLength: sanitizeTitle((document.querySelector("#ContentPlaceHolder1_TextBoxHprimTitre") || {}).value).length,
+        timeoutMs: TITLE_SAVE_NAVIGATION_TIMEOUT_MS,
+      });
+      failWeda("Weda n'a pas confirmé la sauvegarde du titre. Le titre reste mémorisé ; relancez l'analyse pour réessayer.");
+    }, TITLE_SAVE_NAVIGATION_TIMEOUT_MS);
   }
 
   function goToNextBiology(jobId) {
@@ -5562,6 +5717,7 @@ Ne jamais afficher cet auto-contrôle.`;
       state: getState(),
     });
     GM_deleteValue(JOB_KEY);
+    resetWedaTitleSaveTracking();
     const state = getState();
     const nextCheckAt = state.autoEnabled ? Date.now() + getAutoIntervalMs() : state.autoNextCheckAt;
     setState({
