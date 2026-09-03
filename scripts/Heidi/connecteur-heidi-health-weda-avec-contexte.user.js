@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Heidi Health vers WEDA
 // @namespace    http://tampermonkey.net/
-// @version      7.97
+// @version      7.100
 // @description  PageUp : lance Heidi + récupération du contexte. PageDown : transfert WEDA. Remplit constantes, suivis structurés, ajoute les étiquettes WEDA, contrôle qualité, notifications renforcées, retour accueil direct et fermeture accélérée. + DEBUG
 // @match        https://*/*
 // @exclude      https://secure.weda.fr/FolderMedical/HprimForm.aspx*
@@ -24,7 +24,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_HH = '7.97';
+    const VERSION_AUTO_HH = '7.100';
 
     const CLE_SIGNAL = 'auto_hh_signal_stable_v768';
     const CLE_SIGNAL_LEGACY = 'auto_hh_signal_stable';
@@ -68,6 +68,10 @@
     const URL_HEIDI_DEDIEE = 'https://scribe.heidihealth.com/';
 
     const SELECTEUR_NOUVELLE_SESSION = [
+        'button[data-testid="session-toolbar-cta-main"]',
+        '[data-testid="session-toolbar-cta-main"]',
+        'button[aria-label="Nouvelle session"]',
+        '[role="button"][aria-label="Nouvelle session"]',
         '[data-testid="global-create-new-session"]',
         '[role="menuitem"][data-testid="global-create-new-session"]',
         'button[data-testid="sessions-panel-action-new-session"]'
@@ -5268,72 +5272,24 @@ function annulerJobsContexteActifsAutoHH(raison) {
             document.querySelector(SELECTEUR_NOUVELLE_SESSION);
     }
 
-    function elementEstDeclencheurCreationSessionHeidi(element) {
-        const cible = getCibleCliquableHeidi(element) || element;
-        if (!cible || !isVisible(cible)) return false;
-        if (cible.matches?.(SELECTEUR_NOUVELLE_SESSION)) return false;
-        if (elementEstMenuTranscriptionHeidi(cible) || elementEstBoutonTranscriptionDemarrageHeidi(cible)) return false;
-
-        const testId = String(cible.getAttribute?.('data-testid') || cible.getAttribute?.('data-test-id') || '').toLowerCase();
-        const texte = getTexteAccessibleElementHeidi(cible);
-        const ariaHasPopup = String(cible.getAttribute?.('aria-haspopup') || '').toLowerCase();
-
-        if (/global.*create|create.*global|new.*session|session.*new/.test(testId)) return true;
-        if (ariaHasPopup === 'menu' && /\b(?:creer|create|new|nouveau|nouvelle)\b/.test(texte)) return true;
-        if (/\b(?:creer|create|new|nouveau|nouvelle)\b/.test(texte) && /\b(?:session|consultation|note|scribe)\b/.test(texte)) return true;
-
-        return false;
-    }
-
-    function getDeclencheurCreationSessionHeidi() {
-        const selecteurCandidats = [
-            'button[data-testid*="global"]',
-            '[role="button"][data-testid*="global"]',
-            'button[data-testid*="create"]',
-            '[role="button"][data-testid*="create"]',
-            'button[data-testid*="new"]',
-            '[role="button"][data-testid*="new"]',
-            'button[aria-haspopup="menu"]',
-            '[role="button"][aria-haspopup="menu"]',
-            'button[aria-label]',
-            '[role="button"][aria-label]',
-            'button[title]',
-            '[role="button"][title]'
-        ].join(', ');
-
-        return [...document.querySelectorAll(selecteurCandidats)]
-            .map(getCibleCliquableHeidi)
-            .filter((element, index, tableau) => element && tableau.indexOf(element) === index)
-            .find(elementEstDeclencheurCreationSessionHeidi) || null;
-    }
-
     async function attendreBoutonNouvelleSessionHeidi(signal = null) {
         let bouton = getBoutonNouvelleSession();
-        if (bouton && isVisible(bouton)) return bouton;
-
-        let declencheur = getDeclencheurCreationSessionHeidi();
-        if (!declencheur) {
-            bouton = await waitForElement(getBoutonNouvelleSession, 'Nouvelle session', Math.min(1200, TIMEOUT_BOUTON_MS));
-            if (bouton) return bouton;
-
-            declencheur = await waitForElement(getDeclencheurCreationSessionHeidi, 'menu création Heidi', Math.min(2500, TIMEOUT_BOUTON_MS));
+        if (!bouton) {
+            bouton = await waitForElement(getBoutonNouvelleSession, 'Bouton + Nouvelle session', TIMEOUT_BOUTON_MS);
         }
 
-        ajouterLogAutoHH('heidi-new-session-menu-trigger-search', {
+        if (!bouton || !isVisible(bouton)) return null;
+
+        // Le bouton peut être rendu juste avant la fin de l'hydratation React.
+        // Une courte stabilisation puis une réacquisition évitent un clic trop précoce.
+        await sleep(300);
+        bouton = getBoutonNouvelleSession() || bouton;
+
+        ajouterLogAutoHH('heidi-new-session-main-button-ready', {
             signal,
-            declencheur: decrireBoutonHeidi(declencheur),
-            directMenuItem: decrireBoutonHeidi(document.querySelector('[data-testid="global-create-new-session"]'))
+            bouton: decrireBoutonHeidi(bouton)
         });
 
-        if (!declencheur) {
-            return await waitForElement(getBoutonNouvelleSession, 'Nouvelle session sans menu création', Math.min(2500, TIMEOUT_BOUTON_MS));
-        }
-
-        afficherBadge('AUTO-HH : ouverture menu création Heidi', 2000);
-        clickElement(declencheur, 'Menu création Heidi');
-        await sleep(150);
-
-        bouton = await waitForElement(getBoutonNouvelleSession, 'Nouvelle session après ouverture menu', 5000);
         return bouton;
     }
 
@@ -10384,7 +10340,7 @@ if (!signal) return;
     const CLE_DEBUG_LAST_REPORT = 'auto_hh_debug_last_report_stable';
 
     const SELECTEURS = {
-        heidiNouvelleSession: '[data-testid="global-create-new-session"], [role="menuitem"][data-testid="global-create-new-session"], button[data-testid="sessions-panel-action-new-session"]',
+        heidiNouvelleSession: 'button[data-testid="session-toolbar-cta-main"], [data-testid="session-toolbar-cta-main"], button[aria-label="Nouvelle session"], [role="button"][aria-label="Nouvelle session"]',
         heidiTexteGenere: '#template-block-editor-content > div',
         heidiOngletContexte: 'button[data-testid="session-tab-context"]',
         heidiChampContexte: 'div[data-testid="context-tab-block-editor"] [contenteditable="true"]',

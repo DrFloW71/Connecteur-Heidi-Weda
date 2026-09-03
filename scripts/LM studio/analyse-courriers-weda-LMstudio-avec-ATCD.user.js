@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.55
+// @version      0.1.59
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -71,7 +71,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.55";
+  const SCRIPT_VERSION = "0.1.59";
   const PDFJS_MAIN_RESOURCE_NAME = "PDFJS_MAIN";
   const PDFJS_WORKER_RESOURCE_NAME = "PDFJS_WORKER";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
@@ -101,17 +101,20 @@
   const SPECIALTIES_KEY = `${STORAGE_PREFIX}rememberedSpecialties.v7`;
   const PATIENTS_KEY = `${STORAGE_PREFIX}rememberedPatients.v1`;
   const AUTO_SEEN_ROWS_KEY = `${STORAGE_PREFIX}autoSeenRows.v1`;
+  const AUTO_RETRYABLE_FAILURE_MIGRATION_KEY = `${STORAGE_PREFIX}autoRetryablePatientFailures.v2`;
   const AUTO_INTERVAL_KEY = `${STORAGE_PREFIX}autoIntervalMs.v1`;
   const HEIDI_COURRIER_TAB_ROLE_KEY = `${STORAGE_PREFIX}heidiTabRole`;
   const HEIDI_COURRIER_SESSION_ID_KEY = `${STORAGE_PREFIX}heidiSessionId`;
   const HEIDI_COURRIER_SESSION_URL_KEY = `${STORAGE_PREFIX}heidiSessionUrl`;
   const HEIDI_COURRIER_SESSION_PHASE_KEY = `${STORAGE_PREFIX}heidiSessionPhase`;
   const SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY = `${STORAGE_PREFIX}wedaAtcdWorkerJobId`;
-  const SESSION_WEDA_ATCD_DEDICATED_TAB_KEY = `${STORAGE_PREFIX}wedaAtcdDedicatedTab.v1`;
+  const SESSION_WEDA_ATCD_DEDICATED_TAB_KEY = `${STORAGE_PREFIX}wedaAtcdDedicatedTab.v2`;
+  const SESSION_WEDA_ATCD_PENDING_CLAIM_KEY = `${STORAGE_PREFIX}wedaAtcdPendingClaim.v1`;
   const WEDA_ATCD_WORKER_HASH_PREFIX = "WEDA_ATCD_LMSTUDIO_WORKER=";
   const WEDA_ATCD_WORKER_HASH_PREFIX_LEGACY = "AUTO_LMSTUDIO_WEDA_WORKER=";
   const WEDA_ATCD_WORKER_LOCK_MS = 45000;
   const WEDA_ATCD_PENDING_OPEN_MS = 0; // 0 = pas d'expiration : le job ATCD reste récupérable jusqu'à validation humaine ou abandon manuel.
+  const WEDA_ATCD_PENDING_ADOPTION_MAX_AGE_MS = 60000;
   const WEDA_ATCD_ALREADY_KNOWN_CLOSE_DELAY_MS = 0;
   const WEDA_ATCD_WORKER_CLOSE_RETRY_MS = 300;
   const WEDA_ATCD_WORKER_CLOSE_MAX_ATTEMPTS = 20;
@@ -187,10 +190,11 @@
   const WEDA_FIND_PATIENT_NAME_MODE_VALUE = "Nom";
   const WEDA_FIND_PATIENT_BIRTH_DATE_MODE_VALUE = "Naissance";
   const WEDA_FIND_PATIENT_MODE_WAIT_MS = 6000;
-  const WEDA_FIND_PATIENT_MODE_RETRY_WAIT_MS = 1800;
+  const WEDA_FIND_PATIENT_MODE_RETRY_WAIT_MS = 6000;
   const WEDA_FIND_PATIENT_MODE_SETTLE_MS = 500;
   const WEDA_FIND_PATIENT_RESULT_WAIT_MS = 9000;
   const WEDA_FIND_PATIENT_SEARCH_SETTLE_MS = 900;
+  const WEDA_FIND_PATIENT_STALE_RESULT_GUARD_MS = 3500;
   const WEDA_FIND_PATIENT_SELECTION_SETTLE_MS = 1200;
   const WEDA_FIND_PATIENT_MIN_SCORE = 420;
   const WEDA_FIND_PATIENT_AMBIGUITY_MARGIN = 160;
@@ -481,10 +485,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   const isHeidiPage = false;
   const isWedaAtcdWorkerPage = location.hostname === WEDA_HOST && Boolean(getWedaAtcdWorkerJobIdForThisTab());
 
-  if (isWedaPage) {
-    initWeda();
-  } else if (isWedaAtcdWorkerPage) {
+  if (isWedaAtcdWorkerPage) {
     initWedaAtcdWorker();
+  } else if (isWedaPage) {
+    initWeda();
   }
 
   if (isHeidiPage) {
@@ -572,6 +576,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     setupManualArchiveNextNavigation();
     setupWedaMssanteAutoReconnect();
     setupAutoHeartbeat();
+    releaseRetryablePatientFailuresFromSeenRows();
     handleAutoOnLoad();
   }
 
@@ -2459,6 +2464,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         sessionStorage.removeItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY);
         sessionStorage.removeItem(SESSION_WEDA_ATCD_DEDICATED_TAB_KEY);
         purged = purged || Boolean(sessionJobId);
+      }
+      const pendingClaimJobId = sessionStorage.getItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY) || "";
+      if (!targetJobId || !pendingClaimJobId || pendingClaimJobId === targetJobId) {
+        sessionStorage.removeItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY);
+        purged = purged || Boolean(pendingClaimJobId);
       }
     } catch (_error) {
       // sessionStorage peut être indisponible.
@@ -5703,9 +5713,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       hasBirthDate: Boolean(identity.birthDate),
       searchLength: identity.searchLabel.length,
     });
+    const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
     clickButtonLikeUser(searchButton);
 
-    let selection = await waitForWedaFindPatientSearchSelection(identity);
+    let selection = await waitForWedaFindPatientSearchSelection(identity, {}, previousGrid);
     if ((!selection || !selection.link) && identity.birthDate) {
       selection = await searchWedaFindPatientByBirthDate(identity, options, selection);
     }
@@ -5800,11 +5811,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       reason: options.reason || "",
       hasBirthDate: true,
     });
+    const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
     clickButtonLikeUser(searchButton);
 
     const selection = await waitForWedaFindPatientSearchSelection(identity, {
       allowUniqueBirthDateOnly: true,
-    });
+    }, previousGrid);
     appendDebugLog(selection && selection.link
       ? "weda:find-patient-birthdate-selection-resolved"
       : "weda:find-patient-birthdate-selection-blocked", {
@@ -5818,9 +5830,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return selection;
   }
 
-  async function waitForWedaFindPatientSearchSelection(identity, selectionOptions = {}) {
+  async function waitForWedaFindPatientSearchSelection(identity, selectionOptions = {}, previousGrid = null) {
     let selection = null;
     const searchStartedAt = Date.now();
+    let resultRefreshObserved = !previousGrid;
     try {
       selection = await waitFor(() => {
         if (
@@ -5830,14 +5843,33 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           return null;
         }
 
+        const grid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
+        if (previousGrid && grid && grid !== previousGrid) {
+          resultRefreshObserved = true;
+        }
+
+        if (
+          !resultRefreshObserved &&
+          Date.now() - searchStartedAt < WEDA_FIND_PATIENT_STALE_RESULT_GUARD_MS
+        ) {
+          return null;
+        }
+
         const candidates = collectWedaFindPatientGridCandidates();
         if (!candidates.length) {
-          const grid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
           return grid && isElementVisible(grid)
             ? resolveWedaFindPatientGridSelection(identity, [], selectionOptions)
             : null;
         }
-        return resolveWedaFindPatientGridSelection(identity, candidates, selectionOptions);
+        const currentSelection = resolveWedaFindPatientGridSelection(identity, candidates, selectionOptions);
+        if (!resultRefreshObserved && !currentSelection.link) {
+          return {
+            ...currentSelection,
+            blocked: false,
+            reason: "stale-results",
+          };
+        }
+        return currentSelection;
       }, {
         timeout: WEDA_FIND_PATIENT_RESULT_WAIT_MS,
         interval: 400,
@@ -6111,6 +6143,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
+    await waitForWedaFindPatientPostBackIdle();
+    select = findWedaFindPatientModeSelect() || select;
+
     const modeSwitched = await ensureWedaFindPatientModeSelected(select, modeValue);
     if (modeSwitched === null) {
       return null;
@@ -6141,7 +6176,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         await ensureWedaFindPatientModeSelected(freshSelect, modeValue);
       } else {
         triggerWedaFindPatientModePostBack(freshSelect);
-        await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
+        await waitForWedaFindPatientPostBackIdle();
       }
     }
 
@@ -6162,6 +6197,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function ensureWedaFindPatientModeSelected(select, modeValue) {
+    await waitForWedaFindPatientPostBackIdle();
+    select = findWedaFindPatientModeSelect() || select;
     const currentMode = String(select && select.value || "");
     const modeOption = findWedaFindPatientModeOption(select, modeValue);
     if (!modeOption) {
@@ -6199,6 +6236,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       requestedMode: modeValue,
       method: postBackMethod,
     });
+    await waitForWedaFindPatientPostBackIdle();
     await sleep(WEDA_FIND_PATIENT_MODE_SETTLE_MS);
     return true;
   }
@@ -6236,13 +6274,45 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return "missing-select";
     }
 
-    const target = String(select.name || "");
-    if (target && callWedaPostBack(target, "")) {
-      return "direct-postback";
+    const hasChangeHandler = Boolean(
+      select.getAttribute("onchange") || typeof select.onchange === "function"
+    );
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    if (hasChangeHandler) {
+      return "change-event";
     }
 
-    dispatchWedaSelectValueEvents(select);
-    return "change-event-fallback";
+    const target = String(select.name || "");
+    if (target && callWedaPostBack(target, "")) {
+      return "direct-postback-fallback";
+    }
+
+    return "change-event-only";
+  }
+
+  async function waitForWedaFindPatientPostBackIdle(timeout = WEDA_FIND_PATIENT_MODE_WAIT_MS) {
+    let idleSince = 0;
+    try {
+      await waitFor(() => {
+        if (isWedaAsyncPostBackActive()) {
+          idleSince = 0;
+          return null;
+        }
+
+        if (!idleSince) {
+          idleSince = Date.now();
+        }
+        return Date.now() - idleSince >= 250 ? true : null;
+      }, {
+        timeout,
+        interval: 100,
+        description: "la stabilisation de la recherche patient WEDA",
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   async function waitForWedaFindPatientSearchInputForMode(
@@ -6570,7 +6640,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function buildWedaFindPatientGridCandidate(row, index) {
     const cells = Array.from(row.children || []).filter((cell) => /^(?:td|th)$/i.test(cell.tagName || ""));
-    const patientLink = row.querySelector("a[id*='LinkButtonOldPatientGetNomPrenom']") ||
+    const patientLink = row.querySelector("a[id*='LinkButtonPatientGetNomPrenom'], a[id*='LinkButtonOldPatientGetNomPrenom']") ||
       (cells[2] ? cells[2].querySelector("a") : null);
     const birthDateLink = row.querySelector("a[id*='LinkButtonOldPatienDateNaissance']") ||
       (cells[3] ? cells[3].querySelector("a") : null);
@@ -6706,6 +6776,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const family = normalizePatientCompareText(identity.familyName || "").trim();
     const given = normalizePatientCompareText(identity.givenName || "").trim();
     const full = normalizePatientCompareText(identity.searchLabel || "").trim();
+    const labelTokens = new Set(labelText.trim().split(/\s+/).filter(Boolean));
+    const familyTokens = family.split(/\s+/).filter(Boolean);
+    const givenTokens = given.split(/\s+/).filter(Boolean);
 
     if (identity.birthDate && candidate.birthDate === identity.birthDate) {
       value += 1200;
@@ -6720,6 +6793,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     if (family && given && labelText.includes(` ${family} `) && labelText.includes(` ${given} `)) {
       value += 650;
+      nameMatch = true;
+      strongNameMatch = true;
+    }
+
+    const familyTokenMatch = familyTokens.length > 0 && familyTokens.every((token) => labelTokens.has(token));
+    const givenTokenMatchCount = givenTokens.filter((token) => token.length >= 2 && labelTokens.has(token)).length;
+    if (
+      !strongNameMatch &&
+      birthDateMatch &&
+      familyTokenMatch &&
+      givenTokenMatchCount > 0
+    ) {
+      value += 620;
       nameMatch = true;
       strongNameMatch = true;
     }
@@ -11728,6 +11814,56 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     saveSeenRowMap(seen);
   }
 
+  function unmarkRowSeen(rowKey) {
+    if (!rowKey) {
+      return false;
+    }
+
+    const seen = getSeenRowMap();
+    if (!seen[rowKey]) {
+      return false;
+    }
+
+    delete seen[rowKey];
+    saveSeenRowMap(seen);
+    return true;
+  }
+
+  function isRetryableWedaDocumentFailure(message = "") {
+    const normalized = normalizeForCompare(message);
+    return normalized.includes("plusieurs patients restent plausibles") ||
+      normalized.includes("impossible de selectionner automatiquement le patient") ||
+      normalized.includes("champ titre indisponible apres ouverture un patient");
+  }
+
+  function releaseRetryablePatientFailuresFromSeenRows() {
+    if (GM_getValue(AUTO_RETRYABLE_FAILURE_MIGRATION_KEY, false)) {
+      return;
+    }
+
+    const logs = GM_getValue(DEBUG_LOG_KEY, []);
+    const retryableRowKeys = new Set((Array.isArray(logs) ? logs : [])
+      .filter((entry) => /weda:skip-(?:auto|manual)-document/.test(String(entry && entry.event || "")))
+      .filter((entry) => isRetryableWedaDocumentFailure(entry && entry.data && entry.data.message || ""))
+      .map((entry) => String(entry && entry.data && entry.data.currentRowKey || ""))
+      .filter(Boolean));
+    let released = 0;
+    retryableRowKeys.forEach((rowKey) => {
+      released += unmarkRowSeen(rowKey) ? 1 : 0;
+    });
+    GM_setValue(AUTO_RETRYABLE_FAILURE_MIGRATION_KEY, {
+      version: SCRIPT_VERSION,
+      at: Date.now(),
+      released,
+    });
+
+    if (released) {
+      appendDebugLog("weda:auto-retryable-patient-failures-released", {
+        released,
+      });
+    }
+  }
+
   function saveSeenRowMap(seen) {
     const entries = Object.entries(seen)
       .sort((left, right) => (right[1] || 0) - (left[1] || 0))
@@ -11736,11 +11872,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     GM_setValue(AUTO_SEEN_ROWS_KEY, Object.fromEntries(entries));
   }
 
-  function findNextAutoRowIndex(state = getState()) {
+  function findNextAutoRowIndex(state = getState(), excludedRowKey = "") {
     const rows = getBiologyRows();
     const seen = getSeenRowMap();
     const targetKeys = new Set(state.autoTargetKeys || []);
-    const next = rows.find((row) => targetKeys.has(getAutoRowKey(row)) && !isAutoRowSeen(row, seen));
+    const next = rows.find((row) => {
+      const rowKey = getAutoRowKey(row);
+      return rowKey !== excludedRowKey && targetKeys.has(rowKey) && !isAutoRowSeen(row, seen);
+    });
 
     return next ? next.index : -1;
   }
@@ -12260,13 +12399,27 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return;
     }
 
+    const currentRowKey = state.currentRowKey || state.currentStableKey || "";
+    const retryablePatientFailure = isRetryableWedaDocumentFailure(message);
+    if (retryablePatientFailure) {
+      unmarkRowSeen(currentRowKey);
+    }
+
     if (state.mode === "auto") {
       appendDebugLog("weda:skip-auto-document", {
         message,
         currentRowKey: state.currentRowKey || state.currentStableKey,
       });
-      markRowSeen(state.currentRowKey || state.currentStableKey);
-      const nextAutoIndex = findNextAutoRowIndex(state);
+      if (!retryablePatientFailure) {
+        markRowSeen(currentRowKey);
+      }
+      const remainingAutoTargetKeys = retryablePatientFailure
+        ? (state.autoTargetKeys || []).filter((rowKey) => rowKey !== currentRowKey)
+        : state.autoTargetKeys || [];
+      const nextAutoIndex = findNextAutoRowIndex({
+        ...state,
+        autoTargetKeys: remainingAutoTargetKeys,
+      }, currentRowKey);
 
       if (nextAutoIndex >= 0) {
         if (isWorkflowStopped()) {
@@ -12288,14 +12441,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           allowUnchangedContentKey: "",
           previousContentKey: null,
           currentJobId: null,
+          autoTargetKeys: remainingAutoTargetKeys,
           manualTargetKeys: [],
-          message: message + " Courrier ignoré, passage au suivant.",
+          message: message + (retryablePatientFailure
+            ? " Courrier reporté au prochain cycle, passage au suivant."
+            : " Courrier ignoré, passage au suivant."),
         });
         clickBiologyRow(nextAutoIndex);
         return;
       }
 
-      finishAutoCycle(message + " Courrier ignoré.");
+      finishAutoCycle(message + (retryablePatientFailure
+        ? " Courrier conservé pour un nouvel essai au prochain cycle."
+        : " Courrier ignoré."));
       return;
     }
 
@@ -14093,6 +14251,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       patientLabel,
       createdAt: now,
     });
+    const sessionClaimArmed = armWedaAtcdPendingClaimForCurrentTab(workerJobId);
 
     const clicked = clickWedaHelperPatientNameForAntecedents(patientLauncher);
     appendDebugLog(clicked
@@ -14103,8 +14262,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       item,
       missingContext,
       patientLabel,
-      pendingOpenMs: 0,
-      persistentUntilAdopted: true,
+      sessionClaimArmed,
+      pendingAdoptionMaxAgeMs: WEDA_ATCD_PENDING_ADOPTION_MAX_AGE_MS,
+      adoptionGuard: "inherited-session-claim-or-matching-source-referrer",
     });
 
     if (!clicked) {
@@ -14116,7 +14276,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return false;
     }
 
-    setPanelStatus(`Titre inséré. Ouverture directe des antécédents du patient : ${item.label} [${item.code}].`);
+    setPanelStatus(`Titre inséré. Ouverture directe des antécédents du patient dans un onglet dédié : ${item.label} [${item.code}].`);
     return true;
   }
 
@@ -14477,6 +14637,30 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     );
   }
 
+  function armWedaAtcdPendingClaimForCurrentTab(workerJobId) {
+    try {
+      sessionStorage.setItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY, workerJobId);
+      scheduleBackgroundTask(
+        () => clearWedaAtcdPendingClaimForThisTab(workerJobId),
+        WEDA_ATCD_PENDING_ADOPTION_MAX_AGE_MS
+      );
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function clearWedaAtcdPendingClaimForThisTab(workerJobId = "") {
+    try {
+      const current = sessionStorage.getItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY) || "";
+      if (!workerJobId || current === workerJobId) {
+        sessionStorage.removeItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY);
+      }
+    } catch (_error) {
+      // sessionStorage peut être indisponible.
+    }
+  }
+
   function clickWedaHelperPatientNameForAntecedents(element) {
     if (!element) {
       return false;
@@ -14494,15 +14678,16 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       // Le span Weda-Helper n'est pas toujours focusable.
     }
 
+    let clickDispatched = false;
     ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((eventName) => {
-      dispatchModifiedMouseEvent(element, eventName, {
+      clickDispatched = dispatchModifiedMouseEvent(element, eventName, {
         ctrlKey: true,
         button: 0,
         buttons: eventName.endsWith("down") ? 1 : 0,
-      });
+      }) || clickDispatched;
     });
 
-    return true;
+    return clickDispatched;
   }
 
   function dispatchModifiedMouseEvent(element, eventName, options = {}) {
@@ -14536,6 +14721,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         }));
         return true;
       } catch (_fallbackError) {
+        appendDebugLog("weda:pdf-parser-patient-modified-click-failed", {
+          eventName,
+        });
         return false;
       }
     }
@@ -14819,7 +15007,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         }
       }
     } catch (_error) {
-      // Si sessionStorage est indisponible, on tente quand même l'adoption sécurisée ci-dessous.
+      // Si sessionStorage est indisponible, l'adoption contrôlée vérifie encore le referrer WEDA.
     }
 
     return adoptPendingWedaAtcdWorkerJobForThisTab();
@@ -14830,18 +15018,53 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return "";
     }
 
-    const pending = GM_getValue(WEDA_ATCD_PENDING_OPEN_KEY, null);
+    let inheritedClaimJobId = "";
+    try {
+      inheritedClaimJobId = sessionStorage.getItem(SESSION_WEDA_ATCD_PENDING_CLAIM_KEY) || "";
+    } catch (_error) {
+      // Le referrer peut encore authentifier l'ouverture Weda-Helper.
+    }
+
+    const legacyPending = GM_getValue(WEDA_ATCD_PENDING_OPEN_KEY, null);
+    const pending = inheritedClaimJobId
+      ? getPendingWedaAtcdWorkerOpen(inheritedClaimJobId)
+      : legacyPending;
     if (!pending || !pending.workerJobId || pending.source !== "pdf-parser-patient-name") {
       return "";
     }
 
-    const job = getWedaAtcdWorkerJob(pending.workerJobId);
-    if (!job) {
-      appendDebugLog("weda-atcd-worker:pending-open-job-missing", {
+    const now = Date.now();
+    const createdAt = Number(pending.createdAt || 0);
+    const pendingAgeMs = createdAt ? now - createdAt : Number.POSITIVE_INFINITY;
+    if (pendingAgeMs < 0 || pendingAgeMs > WEDA_ATCD_PENDING_ADOPTION_MAX_AGE_MS) {
+      appendDebugLog("weda-atcd-worker:pending-open-too-old", {
         workerJobId: pending.workerJobId,
-        source: pending.source || "",
+        pendingAgeMs,
+        maxAgeMs: WEDA_ATCD_PENDING_ADOPTION_MAX_AGE_MS,
       });
+      clearWedaAtcdPendingClaimForThisTab(pending.workerJobId);
       clearPendingWedaAtcdWorkerOpen(pending.workerJobId);
+      return "";
+    }
+
+    const inheritedClaimMatches = inheritedClaimJobId === pending.workerJobId;
+    const sourceReferrerMatches = doesWedaAtcdPendingOpenSourceMatchThisTab(pending);
+    if (!inheritedClaimMatches && !sourceReferrerMatches) {
+      appendDebugLog("weda-atcd-worker:pending-open-untrusted-tab", {
+        workerJobId: pending.workerJobId,
+        path: location.pathname,
+        hasInheritedClaim: Boolean(inheritedClaimJobId),
+        hasReferrer: Boolean(document.referrer),
+      });
+      return "";
+    }
+
+    const job = getWedaAtcdWorkerJob(pending.workerJobId);
+    if (!job || (job.status && job.status !== "PENDING_WEDA_WORKER")) {
+      appendDebugLog("weda-atcd-worker:pending-open-job-unavailable", {
+        workerJobId: pending.workerJobId,
+        status: job && job.status ? job.status : "",
+      });
       return "";
     }
 
@@ -14851,15 +15074,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         workerJobId: pending.workerJobId,
         path: location.pathname,
         search: location.search,
-        patientLabel: pending.patientLabel || job.patientLabel || "",
       });
       return "";
     }
 
-    if (
-      pending.patientId &&
-      !sameWedaPatDk(pending.patientId, currentPatientId)
-    ) {
+    if (pending.patientId && !sameWedaPatDk(pending.patientId, currentPatientId)) {
       appendDebugLog("weda-atcd-worker:pending-open-patient-mismatch", {
         workerJobId: pending.workerJobId,
         expectedPatientId: pending.patientId,
@@ -14870,22 +15089,27 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return "";
     }
 
+    const tabId = getOrCreateWedaAtcdWorkerTabId();
     updateWedaAtcdWorkerJob(pending.workerJobId, {
+      status: "ADOPTED_WEDA_HELPER_TAB",
       patientId: currentPatientId,
       patientUrl: buildWedaPatientUrlFromPatDk(currentPatientId, location.href),
       patientContextSource: job.patientContextSource || "pdfParserPatientName",
-      patientOpenMode: job.patientOpenMode || "pending-open-adopted",
+      patientOpenMode: job.patientOpenMode || "ctrl-click-antecedents",
       workerUrl: location.href,
       adoptedFromPendingOpen: true,
+      adoptedTabId: tabId,
+      adoptedAt: now,
     });
 
     try {
       sessionStorage.setItem(SESSION_WEDA_ATCD_WORKER_JOB_ID_KEY, pending.workerJobId);
       sessionStorage.setItem(SESSION_WEDA_ATCD_DEDICATED_TAB_KEY, "1");
     } catch (_error) {
-      // sessionStorage peut être indisponible.
+      // Le worker reste identifiable pendant ce chargement grâce à son job adopté.
     }
 
+    clearWedaAtcdPendingClaimForThisTab(pending.workerJobId);
     clearPendingWedaAtcdWorkerOpen(pending.workerJobId);
     appendDebugLog("weda-atcd-worker:pending-open-adopted", {
       workerJobId: pending.workerJobId,
@@ -14895,9 +15119,52 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       patientLabel: pending.patientLabel || job.patientLabel || "",
       itemCode: pending.itemCode || "",
       itemLabel: pending.itemLabel || "",
+      inheritedClaimMatches,
+      sourceReferrerMatches,
+      pendingAgeMs,
     });
 
     return pending.workerJobId;
+  }
+
+  function doesWedaAtcdPendingOpenSourceMatchThisTab(pending) {
+    const expected = normalizeComparableWedaAtcdSourceUrl(pending && pending.sourceWedaUrl || "");
+    if (!expected || !expected.pathname.toLowerCase().startsWith(WEDA_PATH_PREFIX.toLowerCase())) {
+      return false;
+    }
+
+    const possibleSources = [document.referrer || ""];
+    try {
+      if (window.opener && window.opener.location) {
+        possibleSources.push(String(window.opener.location.href || ""));
+      }
+    } catch (_error) {
+      // Un opener non accessible ne peut pas servir de preuve.
+    }
+
+    return possibleSources.some((candidate) => {
+      const actual = normalizeComparableWedaAtcdSourceUrl(candidate);
+      return actual &&
+        actual.origin === expected.origin &&
+        actual.pathname.toLowerCase() === expected.pathname.toLowerCase() &&
+        actual.search === expected.search;
+    });
+  }
+
+  function normalizeComparableWedaAtcdSourceUrl(value) {
+    try {
+      const url = new URL(String(value || ""), location.origin);
+      if (url.hostname !== WEDA_HOST) {
+        return null;
+      }
+      return {
+        origin: url.origin,
+        pathname: url.pathname,
+        search: url.search,
+      };
+    } catch (_error) {
+      return null;
+    }
   }
 
   function isLikelyWedaAtcdPendingOpenTargetPage() {
@@ -14986,6 +15253,21 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function runWedaAtcdWorker(workerJobId) {
+    const authenticatedWorkerJobId = getWedaAtcdWorkerJobIdForThisTab();
+    if (!authenticatedWorkerJobId || authenticatedWorkerJobId !== workerJobId) {
+      appendDebugLog("weda-atcd-worker:run-refused-unmarked-tab", {
+        expectedWorkerJobId: workerJobId || "",
+        currentWorkerJobId: authenticatedWorkerJobId || "",
+        path: location.pathname,
+        search: location.search,
+      });
+      showWedaAtcdWorkerBadge("Sécurité : préparation ATCD refusée dans un onglet WEDA non dédié.", {
+        error: true,
+        duration: 7000,
+      });
+      return;
+    }
+
     let job = await waitFor(() => getWedaAtcdWorkerJob(workerJobId), {
       timeout: 30000,
       interval: 250,
@@ -15113,9 +15395,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       hasBirthDate: Boolean(identity.birthDate),
       searchLength: identity.searchLabel.length,
     });
+    const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
     clickButtonLikeUser(searchButton);
 
-    let selection = await waitForWedaFindPatientSearchSelection(identity);
+    let selection = await waitForWedaFindPatientSearchSelection(identity, {}, previousGrid);
     if ((!selection || !selection.link) && identity.birthDate) {
       selection = await searchWedaFindPatientByBirthDate(identity, {
         jobId: currentJob.id,
@@ -18306,7 +18589,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       // Le bouton peut rester cliquable même si focus échoue.
     }
 
-    ["mousedown", "mouseup", "click"].forEach((eventName) => {
+    ["mousedown", "mouseup"].forEach((eventName) => {
       try {
         button.dispatchEvent(new MouseEvent(eventName, {
           bubbles: true,
@@ -18326,8 +18609,17 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     try {
       button.click();
+      return true;
     } catch (_error) {
-      // Les événements précédents ont déjà été tentés.
+      try {
+        button.dispatchEvent(new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+        }));
+        return true;
+      } catch (_fallbackError) {
+        return false;
+      }
     }
   }
 
