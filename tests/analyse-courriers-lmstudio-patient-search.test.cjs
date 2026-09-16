@@ -58,6 +58,7 @@ test("accepte un prénom composé raccourci seulement avec nom et naissance conc
   );
 
   const scoreCandidate = new Function(`
+    const uniqueStrings = (values) => Array.from(new Set((values || []).filter(Boolean)));
     const normalizePatientCompareText = (value) => {
       const text = String(value || "")
         .normalize("NFD")
@@ -87,6 +88,139 @@ test("accepte un prénom composé raccourci seulement avec nom et naissance conc
   assert.equal(result.birthDateMatch, true);
   assert.equal(result.strongNameMatch, true);
   assert.ok(result.value >= 1820);
+});
+
+test("recherche d'abord par nom de famille puis essaie le nom alternatif avant la naissance", () => {
+  const body = getFunctionSource(
+    "rescueWedaFindPatientPanelWithDocumentIdentity",
+    "searchWedaFindPatientByAlternateFamilyNames"
+  );
+
+  assert.match(body, /getWedaFindPatientFamilySearchLabels\(identity\)/);
+  assert.match(body, /initialSearchLabel = familySearchLabels\[0\]/);
+  assert.ok(
+    body.indexOf("searchWedaFindPatientByAlternateFamilyNames") <
+      body.indexOf("searchWedaFindPatientByBirthDate")
+  );
+});
+
+test("conserve les noms d'usage et de naissance comme recherches possibles", () => {
+  const normalizeBody = getFunctionSource(
+    "normalizeWedaFindPatientIdentity",
+    "cleanWedaFindPatientNamePart"
+  );
+  const cleanBody = getFunctionSource(
+    "cleanWedaFindPatientNamePart",
+    "hasUsableWedaFindPatientIdentity"
+  );
+  const labelsBody = getFunctionSource(
+    "getWedaFindPatientFamilySearchLabels",
+    "hasExplicitWedaFindPatientIdentitySource"
+  );
+  const normalizeIdentity = new Function(`
+    const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const uniqueStrings = (values) => Array.from(new Set((values || []).map(normalizeText).filter(Boolean)));
+    const parsePatientImportName = () => ({ familyName: "", givenName: "" });
+    const normalizePatientBirthDate = (value) => String(value || "");
+    ${cleanBody}
+    ${normalizeBody}
+    return normalizeWedaFindPatientIdentity;
+  `)();
+  const getLabels = new Function(`
+    const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const uniqueStrings = (values) => Array.from(new Set((values || []).map(normalizeText).filter(Boolean)));
+    ${cleanBody}
+    ${labelsBody}
+    return getWedaFindPatientFamilySearchLabels;
+  `)();
+
+  const identity = normalizeIdentity({
+    familyName: "DUPONT",
+    usageName: "DUPONT",
+    birthName: "MARTIN",
+    givenName: "Alice",
+  });
+
+  assert.deepEqual(identity.familyNames, ["DUPONT", "MARTIN"]);
+  assert.deepEqual(getLabels(identity), ["DUPONT", "MARTIN"]);
+});
+
+test("extrait séparément nom d'usage et nom de naissance dans un en-tête en colonnes", () => {
+  const body = getFunctionSource(
+    "extractWedaFindPatientIdentityHeuristically",
+    "requestLmStudioPatientIdentity"
+  ).replace(/\s+async\s*$/, "");
+  const extractIdentity = new Function(`
+    const normalizeMultilineText = (value) => String(value || "");
+    const extractLikelyPatientIdentitySourceText = (value) => value;
+    const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const extractPatientBirthDateHints = () => ["01/02/1950"];
+    const normalizeWedaFindPatientIdentity = (identity) => identity;
+    const hasUsableWedaFindPatientIdentity = (identity) => Boolean(identity.familyName && identity.givenName);
+    const parsePatientImportName = () => ({ familyName: "", givenName: "" });
+    ${body}
+    return extractWedaFindPatientIdentityHeuristically;
+  `)();
+
+  const identity = extractIdentity(
+    "Nom d'usage : DUPONT  Prénom : Alice  Nom de naissance : MARTIN  N° de dossier : 42  Date de naissance : 01/02/1950"
+  );
+
+  assert.equal(identity.familyName, "DUPONT");
+  assert.equal(identity.usageName, "DUPONT");
+  assert.equal(identity.birthName, "MARTIN");
+  assert.equal(identity.givenName, "Alice");
+});
+
+test("score aussi un patient avec le nom de naissance alternatif", () => {
+  const body = getFunctionSource(
+    "scoreWedaFindPatientGridCandidate",
+    "buildWedaFindPatientIssue"
+  );
+  const scoreCandidate = new Function(`
+    const uniqueStrings = (values) => Array.from(new Set((values || []).filter(Boolean)));
+    const normalizePatientCompareText = (value) => {
+      const text = String(value || "")
+        .normalize("NFD")
+        .replace(/[\\u0300-\\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\\s+/g, " ")
+        .trim();
+      return text ? \` \${text} \` : " ";
+    };
+    const parsePatientImportName = () => ({ familyName: "MARTIN", givenName: "ALICE" });
+    ${body}
+    return scoreWedaFindPatientGridCandidate;
+  `)();
+
+  const result = scoreCandidate({
+    patientLabel: "MARTIN ALICE",
+    birthDate: "",
+    nameParts: { familyName: "MARTIN", givenName: "ALICE" },
+  }, {
+    familyName: "DUPONT",
+    familyNames: ["DUPONT", "MARTIN"],
+    givenName: "ALICE",
+    searchLabel: "DUPONT ALICE",
+    birthDate: "",
+  });
+
+  assert.equal(result.strongNameMatch, true);
+  assert.ok(result.value >= 650);
+});
+
+test("gère aussi la grille patient WEDA actuelle et attend la fin du postback", () => {
+  assert.match(source, /FindPatientUcForm1_PatientsGrid\"/);
+  assert.match(source, /LinkButtonPatienDateNaissance/);
+  assert.match(source, /LinkButtonPatientNomJeuneFille/);
+
+  const body = getFunctionSource(
+    "waitForWedaFindPatientSelectionApplied",
+    "waitForOptionalTitleInput"
+  );
+  assert.match(body, /waitForWedaFindPatientPostBackIdle\(12000\)/);
+  assert.match(body, /weda:find-patient-title-missing-after-selection/);
 });
 
 test("n'émet qu'un seul clic sur les contrôles WEDA", () => {

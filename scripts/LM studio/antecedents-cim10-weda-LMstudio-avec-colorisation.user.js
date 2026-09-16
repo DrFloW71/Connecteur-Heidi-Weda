@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Antécédents CIM-10 WEDA avec LM Studio AVEC colorisation
 // @namespace    http://tampermonkey.net/
-// @version      6.2.6
+// @version      6.2.7
 // @description  Sur la page Antécédents patient WEDA, la touche Inser/Insert exporte les antécédents non codés vers LM Studio local, récupère le résultat CIM10, réimporte dans WEDA puis colorise via règles locales. Bouton dédié pour coloriser seulement. :)
 // @match        https://secure.weda.fr/*
 // @all-frames   true
@@ -25,7 +25,7 @@
      * CONFIGURATION
      ************************************************************/
 
-    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.6-LMstudio-avec-colorisation';
+    const VERSION_AUTO_ATCD_CIM10_LMSTUDIO = '6.2.7-LMstudio-avec-colorisation';
 
     const HOST_WEDA = 'secure.weda.fr';
     const HOST_HEIDI = 'scribe.heidihealth.com';
@@ -7050,6 +7050,7 @@ ${HEIDI_ASK_AI_PROMPT}`
     }
 
     function isLmStudioContextLimitError(error) {
+        if (error && error.code === "LMSTUDIO_INCOMPLETE_RESPONSE") return false;
         const message = String(error && error.message ? error.message : error || '');
         return /context|token|max_tokens|maximum context|too many|trop long|400/i.test(message);
     }
@@ -7099,7 +7100,24 @@ ${HEIDI_ASK_AI_PROMPT}`
         const choices = Array.isArray(response && response.choices) ? response.choices : [];
         const firstChoice = choices[0] || {};
         const message = firstChoice.message || {};
-        const content = typeof message.content === 'string' ? message.content : firstChoice.text || '';
+        const rawContent = message.content == null ? firstChoice.text || "" : message.content;
+        const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent)
+            ? rawContent.filter((part) => part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string").map((part) => part.text).join("\n")
+            : "";
+        const finishReason = firstChoice.finish_reason || "unknown";
+        const usage = response && response.usage || {};
+        const reasoningTokens = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+        // Ne jamais utiliser reasoning_content comme résultat médical, même si content est vide.
+        if (finishReason === "length" || !content.trim() || (finishReason !== "stop" && finishReason !== "unknown")) {
+            const reason = finishReason === "length"
+                ? "limite de génération atteinte avant la fin de la réponse ; augmentez le budget de génération"
+                : !content.trim() && (message.reasoning_content || message.reasoning || reasoningTokens > 0)
+                    ? "raisonnement reçu sans réponse finale"
+                    : "réponse finale absente ou interrompue";
+            const error = new Error(`LM Studio : ${reason} (finish_reason=${finishReason}, completion_tokens=${usage.completion_tokens ?? "?"}, reasoning_tokens=${reasoningTokens ?? "?"}).`);
+            error.code = "LMSTUDIO_INCOMPLETE_RESPONSE";
+            throw error;
+        }
         return normalizeSpaces(content);
     }
 

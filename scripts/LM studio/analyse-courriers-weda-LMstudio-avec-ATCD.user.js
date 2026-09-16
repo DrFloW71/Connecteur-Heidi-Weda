@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse courriers PDF LM Studio + ATCD CIM-10
 // @namespace    https://secure.weda.fr/
-// @version      0.1.59
+// @version      0.1.64
 // @description  Analyse les courriers PDF de Weda Échanges avec LM Studio local, renseigne le titre et la spécialité, puis prépare l'ajout d'un nouvel antécédent CIM-10 certifié.
 // @match        https://secure.weda.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -37,8 +37,9 @@
   const LMSTUDIO_MODEL = "";
   const LMSTUDIO_REQUEST_TIMEOUT_MS = 300000;
   const LMSTUDIO_TEMPERATURE = 0;
-  const LMSTUDIO_MAX_TOKENS = 900;
-  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 220;
+  // max_tokens inclut le raisonnement et la réponse finale des modèles Gemma/Qwen.
+  const LMSTUDIO_MAX_TOKENS = 8192;
+  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 4096;
   const LMSTUDIO_MAX_DOCUMENT_TEXT_LENGTH = 45000;
   const LMSTUDIO_PDF_IMAGE_FALLBACK_ENABLED = true;
   const LMSTUDIO_PDF_TEXT_SPARSE_FALLBACK_ENABLED = true;
@@ -71,7 +72,7 @@
   const UNUSABLE_PDF_TITLE = "PDF sans texte exploitable - analyse manuelle/OCR nécessaire.";
   const DOCUMENT_SIGNAL = "COURRIER MÉDICAL À SYNTHÉTISER CI-DESSOUS";
   const BIOLOGY_SIGNAL = DOCUMENT_SIGNAL;
-  const SCRIPT_VERSION = "0.1.59";
+  const SCRIPT_VERSION = "0.1.64";
   const PDFJS_MAIN_RESOURCE_NAME = "PDFJS_MAIN";
   const PDFJS_WORKER_RESOURCE_NAME = "PDFJS_WORKER";
   const PDFJS_WORKER_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
@@ -184,9 +185,15 @@
   const PDF_PARSER_RESET_SELECTOR = "#pdfParserResetButton";
   const WEDA_FIND_PATIENT_PANEL_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PanelFindPatient";
   const WEDA_FIND_PATIENT_MODE_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_DropDownListRechechePatient";
-  const WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche";
+  const WEDA_FIND_PATIENT_SEARCH_INPUT_SELECTOR = [
+    "#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherche",
+    "#ContentPlaceHolder1_FindPatientUcForm1_TextBoxRecherchePatientByDate",
+  ].join(", ");
   const WEDA_FIND_PATIENT_SEARCH_BUTTON_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_ButtonRecherchePatient";
-  const WEDA_FIND_PATIENT_GRID_SELECTOR = "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld";
+  const WEDA_FIND_PATIENT_GRID_SELECTOR = [
+    "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGridOld",
+    "#ContentPlaceHolder1_FindPatientUcForm1_PatientsGrid",
+  ].join(", ");
   const WEDA_FIND_PATIENT_NAME_MODE_VALUE = "Nom";
   const WEDA_FIND_PATIENT_BIRTH_DATE_MODE_VALUE = "Naissance";
   const WEDA_FIND_PATIENT_MODE_WAIT_MS = 6000;
@@ -250,8 +257,7 @@
   const PATIENT_IMPORT_CLICK_ATTEMPT_DELAYS_MS = [0, 450, 1200];
   const PATIENT_IMPORT_CLICK_VERIFY_MS = 700;
   const PATIENT_IMPORT_TITLE_ONLY_CONFIRM_MS = 650;
-  const MANUAL_ARCHIVE_NEXT_SETTLE_MS = 900;
-  const MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS = 8000;
+  const MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS = 3000;
   const WEDA_ROW_OPEN_RETRY_DELAYS_MS = [3500, 9000];
   const NEXT_AFTER_SAVE_MS = 4200;
   const NEXT_AFTER_RELOAD_SAVE_MS = 2500;
@@ -309,6 +315,7 @@
   let patientImportTitleHandoffSequence = 0;
   let patientImportTitleHandoffLastCapture = null;
   let manualArchiveNextTimer = null;
+  let manualArchivePendingSequence = 0;
   let titleManualEditState = null;
   let titleManualEditCommitTimer = null;
   let autoRefreshTimer = null;
@@ -456,7 +463,7 @@ Consignes pour l’antécédent :
 - Pour l’imagerie, un résultat positif peut être retenu même si le courrier ne dit pas explicitement “antécédent”, à condition qu’il soit affirmatif et suffisamment caractérisé : par exemple fracture, lithiase, anévrysme, sténose, tumeur ou nodule suspect, séquelle, malformation, hernie discale significative, arthrose évoluée, lésion dégénérative structurée, anomalie vasculaire, atteinte d’organe, masse ou kyste pathologique.
 - Ne pas retenir une suspicion, une hypothèse, un diagnostic différentiel, un simple motif d’examen, un symptôme isolé, une anomalie mineure non spécifique, une variante anatomique, une anomalie en cours d’exploration non conclue, une absence de diagnostic ou une recommandation de dépistage.
 - Ne pas retenir un antécédent simplement listé comme déjà connu dans le courrier, dans une rubrique “antécédents”, “ATCD”, “histoire connue”, “connu pour”, “suivi pour”, “porteur de” ou équivalent.
-- L’objectif est de signaler un antécédent nouveau par rapport à l'historique médical du patient.
+- Tu n'as pas accès à la liste des antécédents du dossier WEDA : ne réponds pas NON uniquement parce que tu ignores si le diagnostic y figure déjà. Le script vérifiera les doublons dans WEDA avant de proposer l'ajout.
 - Ne pas retenir un antécédent familial sauf si le courrier affirme explicitement qu’un antécédent familial doit être ajouté.
 - Si plusieurs nouveaux éléments certains sont présents, choisir le plus structurant pour le suivi en médecine générale.
 - Chercher le code CIM-10 français le plus adapté correspondant au nouvel antécédent ou au résultat positif.
@@ -480,6 +487,21 @@ CERTITUDE: raison courte montrant que le diagnostic est certifié
 SOURCE: fragment très court du courrier justifiant l’ajout
 </ANTECEDENT_CIM10>`;
   const HEIDI_PROMPT = LMSTUDIO_PROMPT_ACTIVE;
+
+  const LMSTUDIO_ANTECEDENT_RECHECK_PROMPT = `Seconde lecture ciblée du courrier médical : cherche uniquement un diagnostic ou résultat positif d'examen qui pourrait constituer un nouvel antécédent utile au suivi en médecine générale.
+Tu n'as pas accès aux antécédents du dossier WEDA. Ne conclus pas NON au seul motif que tu ne peux pas comparer avec ce dossier : un contrôle de doublon séparé sera fait ensuite.
+Retenir une pathologie, lésion ou complication affirmée, diagnostiquée ou objectivée par l'examen, même si le mot « antécédent » n'est pas écrit. Ne pas retenir une simple suspicion, un symptôme isolé, une anomalie mineure non spécifique, un motif d'examen, un résultat normal ou un diagnostic seulement cité comme déjà connu dans le courrier.
+Si plusieurs éléments certains sont présents, choisir le plus structurant. Si aucun n'est certain, répondre NON. N'invente ni diagnostic, ni code, ni citation. SOURCE doit reproduire un court extrait du courrier qui appuie le diagnostic.
+Réponds uniquement avec ce bloc :
+<ANTECEDENT_CIM10>
+STATUT: OUI ou NON
+SECTION: medical ou chirurgical ou familial
+LIBELLE: diagnostic court, sinon vide
+CODE: code CIM-10 correspondant, sinon vide
+DATE: date du diagnostic seulement si explicitement indiquée, sinon vide
+CERTITUDE: justification courte du caractère affirmé, sinon vide
+SOURCE: court extrait du courrier, sinon vide
+</ANTECEDENT_CIM10>`;
 
   const isWedaPage = location.hostname === WEDA_HOST && location.pathname.toLowerCase().startsWith(WEDA_PATH_PREFIX.toLowerCase());
   const isHeidiPage = false;
@@ -5313,7 +5335,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
+    if (reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
     await resetPdfParserBeforePatientImport(jobId);
+    if (reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
 
     appendDebugLog("weda:import-patient-click", {
       jobId,
@@ -5324,6 +5352,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     lastPatientImportPerformanceStartTime = getCurrentPerformanceTime();
     await clickImportPatientButtonWithRetry(patientButton, jobId, reason, options);
     await sleep(PATIENT_IMPORT_SETTLE_MS);
+    if (reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
 
     let input = findWedaTitleInput(options);
     let findPatientPanel = findWedaFindPatientPanel();
@@ -5441,6 +5472,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         await sleep(delay);
       }
 
+      if (reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+        return lastOpenState;
+      }
       if (jobId && !isCurrentJobStillActive(jobId, ["waitingLmStudio", "savingTitle"])) {
         appendDebugLog("weda:import-patient-click-cancelled", {
           jobId,
@@ -5479,6 +5513,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         return lastOpenState;
       }
 
+      if (reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+        return lastOpenState;
+      }
       dispatchImportPatientKeyboardShortcut();
       lastOpenState = await waitForPatientImportOpenState(PATIENT_IMPORT_CLICK_VERIFY_MS, options);
       if (lastOpenState.confirmed) {
@@ -5622,6 +5659,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function rescueWedaFindPatientPanelWithDocumentIdentity(options = {}) {
+    if (options.reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
     const panel = findWedaFindPatientPanel();
     if (!panel) {
       return null;
@@ -5691,6 +5731,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     setPanelStatus("Patient WEDA non identifié : recherche à partir de l'identité du courrier...");
 
     const input = await ensureWedaFindPatientNameSearchInput();
+    if (options.reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
     if (!input) {
       const issue = buildWedaFindPatientIssue("missing-search-input", identity, 0, 0, 0);
       recordPatientImportSelectionIssue(issue);
@@ -5698,7 +5741,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
-    setWedaFindPatientSearchInputValue(input, identity.searchLabel);
+    const familySearchLabels = getWedaFindPatientFamilySearchLabels(identity);
+    const initialSearchLabel = familySearchLabels[0] || identity.familyName || identity.searchLabel;
+    setWedaFindPatientSearchInputValue(input, initialSearchLabel);
     const searchButton = findWedaFindPatientSearchButton();
     if (!searchButton) {
       const issue = buildWedaFindPatientIssue("missing-search-button", identity, 0, 0, 0);
@@ -5711,12 +5756,24 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       jobId: options.jobId || "",
       reason: options.reason || "",
       hasBirthDate: Boolean(identity.birthDate),
-      searchLength: identity.searchLabel.length,
+      searchLength: initialSearchLabel.length,
+      queryKind: "family-name",
     });
     const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
     clickButtonLikeUser(searchButton);
 
     let selection = await waitForWedaFindPatientSearchSelection(identity, {}, previousGrid);
+    if (options.reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
+    if ((!selection || !selection.link) && familySearchLabels.length > 1) {
+      selection = await searchWedaFindPatientByAlternateFamilyNames(
+        identity,
+        familySearchLabels.slice(1),
+        options,
+        selection
+      );
+    }
     if ((!selection || !selection.link) && identity.birthDate) {
       selection = await searchWedaFindPatientByBirthDate(identity, options, selection);
     }
@@ -5742,6 +5799,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
+    if (options.reason === "remembered-patient-autofill" && manualArchivePendingSequence) {
+      return null;
+    }
     clearPatientImportSelectionIssue();
     appendDebugLog("weda:find-patient-row-click", {
       jobId: options.jobId || "",
@@ -5775,6 +5835,52 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     }
 
     return appliedInput;
+  }
+
+  async function searchWedaFindPatientByAlternateFamilyNames(
+    identity,
+    familySearchLabels = [],
+    options = {},
+    previousSelection = null
+  ) {
+    let selection = previousSelection;
+
+    for (let index = 0; index < familySearchLabels.length; index += 1) {
+      const familySearchLabel = familySearchLabels[index];
+      const input = await ensureWedaFindPatientNameSearchInput();
+      if (!input) {
+        return selection;
+      }
+
+      setWedaFindPatientSearchInputValue(input, familySearchLabel);
+      const searchButton = findWedaFindPatientSearchButton();
+      if (!searchButton) {
+        return selection;
+      }
+
+      appendDebugLog("weda:find-patient-family-fallback-click", {
+        jobId: options.jobId || "",
+        reason: options.reason || "",
+        attempt: index + 1,
+        searchLength: familySearchLabel.length,
+      });
+      const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
+      clickButtonLikeUser(searchButton);
+      selection = await waitForWedaFindPatientSearchSelection(identity, {}, previousGrid);
+      if (selection && selection.link) {
+        appendDebugLog("weda:find-patient-family-fallback-resolved", {
+          jobId: options.jobId || "",
+          reason: selection.reason || "",
+          attempt: index + 1,
+          candidateCount: selection.candidateCount || 0,
+          selectedIndex: selection.selectedIndex,
+          score: selection.score || 0,
+        });
+        return selection;
+      }
+    }
+
+    return selection;
   }
 
   async function searchWedaFindPatientByBirthDate(identity, options = {}, previousSelection = null) {
@@ -6410,7 +6516,8 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         sourceLength: String(options.sourceText || "").length,
         imageCount: getLmStudioPdfPageImages(options).length,
       });
-      return heuristic;
+      // Une panne du moteur ne prouve pas que l'identité est absente du document.
+      throw error;
     }
   }
 
@@ -6418,6 +6525,20 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const source = normalizeMultilineText(extractLikelyPatientIdentitySourceText(sourceText) || sourceText);
     const compact = normalizeText(source);
     const birthDate = extractPatientBirthDateHints(source, { allowLooseParentheses: true })[0] || "";
+
+    const usageNameMatch = compact.match(/\bnom\s+d['’ ]usage\s*[:\-]\s*([^:;\n,]{2,80}?)(?=\s+(?:nom\s+de\s+naissance|pr[eé]nom|n[°o]\s+de\s+dossier|date\s+de\s+naissance|[âa]ge|sexe|appareil|service)\b|$)/i);
+    const birthNameMatch = compact.match(/\bnom\s+de\s+naissance\s*[:\-]\s*([^:;\n,]{2,80}?)(?=\s+(?:nom\s+d['’ ]usage|pr[eé]nom|n[°o]\s+de\s+dossier|date\s+de\s+naissance|[âa]ge|sexe|appareil|service)\b|$)/i);
+    const givenNameMatch = compact.match(/\bpr[eé]nom\s*[:\-]\s*([^:;\n,]{2,80}?)(?=\s+(?:nom\s+d['’ ]usage|nom\s+de\s+naissance|date\s+de\s+naissance|naissance|n[°o]\s+de\s+dossier|[âa]ge|sexe)\b|$)/i);
+    if ((usageNameMatch || birthNameMatch) && givenNameMatch) {
+      return normalizeWedaFindPatientIdentity({
+        familyName: usageNameMatch ? usageNameMatch[1] : birthNameMatch[1],
+        usageName: usageNameMatch ? usageNameMatch[1] : "",
+        birthName: birthNameMatch ? birthNameMatch[1] : "",
+        givenName: givenNameMatch[1],
+        birthDate,
+        source: "heuristic-usage-birth-fields",
+      });
+    }
 
     const patientLineMatch = source.match(
       /(?:^|\n)\s*(?:patient|patiente|b[ée]n[ée]ficiaire|assur[ée]e?|concerne|identit[ée])\s*[:\-]\s*([^\n]{3,120})/i
@@ -6521,9 +6642,11 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       "N'invente rien. Si une information est absente ou incertaine, laisse le champ vide.",
       "Format obligatoire, sans texte autour :",
       "<PATIENT_IDENTITE>",
-      "NOM: nom de famille du patient, en majuscules si possible",
+      "NOM: nom principal du patient si un seul nom est présent, en majuscules si possible",
+      "NOM_USAGE: nom d'usage ou nom marital explicitement indiqué, sinon vide",
+      "NOM_NAISSANCE: nom de naissance explicitement indiqué, sinon vide",
       "PRENOM: prénom usuel du patient",
-      "DATE_NAISSANCE: JJ/MM/AAAA si explicitement présent, sinon vide",
+      "DATE_NAISSANCE: JJ/MM/AAAA uniquement si la date est explicitement présentée comme date de naissance du patient ; ne jamais utiliser une date d'adresse, d'examen ou de courrier",
       "</PATIENT_IDENTITE>",
       "",
       "COURRIER:",
@@ -6554,7 +6677,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const fields = parseSimpleKeyValueBlock(block);
 
     return normalizeWedaFindPatientIdentity({
-      familyName: fields.NOM || fields.NOM_PATIENT || fields.PATIENT_NOM || "",
+      familyName: fields.NOM_USAGE || fields.NOM || fields.NOM_PATIENT || fields.PATIENT_NOM || fields.NOM_NAISSANCE || "",
+      usageName: fields.NOM_USAGE || fields.NOM_MARITAL || "",
+      birthName: fields.NOM_NAISSANCE || fields.NOM_DE_NAISSANCE || "",
       givenName: fields.PRENOM || fields.PRENOM_PATIENT || fields.PATIENT_PRENOM || "",
       birthDate: fields.DATE_NAISSANCE || fields.NAISSANCE || fields.DATE_DE_NAISSANCE || "",
       source: "lmstudio",
@@ -6565,6 +6690,12 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     let familyName = cleanWedaFindPatientNamePart(identity.familyName || identity.nom || "");
     let givenName = cleanWedaFindPatientNamePart(identity.givenName || identity.prenom || "");
     const fullName = cleanWedaFindPatientNamePart(identity.fullName || identity.patientLabel || "");
+    const suppliedFamilyNames = [
+      familyName,
+      identity.usageName || identity.nomUsage || "",
+      identity.birthName || identity.nomNaissance || "",
+      ...(Array.isArray(identity.familyNames) ? identity.familyNames : []),
+    ];
 
     if ((!familyName || !givenName) && fullName) {
       const parsed = parsePatientImportName(fullName);
@@ -6580,11 +6711,15 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     familyName = cleanWedaFindPatientNamePart(familyName).toUpperCase();
     givenName = cleanWedaFindPatientNamePart(givenName);
+    const familyNames = uniqueStrings([familyName, ...suppliedFamilyNames]
+      .map((value) => cleanWedaFindPatientNamePart(value).toUpperCase()));
+    familyName = familyNames[0] || familyName;
     const birthDate = normalizePatientBirthDate(identity.birthDate || identity.dateNaissance || "");
     const searchLabel = normalizeText([familyName, givenName].filter(Boolean).join(" "));
 
     return {
       familyName,
+      familyNames,
       givenName,
       birthDate,
       searchLabel,
@@ -6608,6 +6743,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     return Boolean(identity && identity.searchLabel && identity.familyName && (identity.givenName || identity.birthDate));
   }
 
+  function getWedaFindPatientFamilySearchLabels(identity = {}) {
+    return uniqueStrings([
+      ...(Array.isArray(identity.familyNames) ? identity.familyNames : []),
+      identity.familyName || "",
+    ].map((value) => cleanWedaFindPatientNamePart(value).toUpperCase()));
+  }
+
   function hasExplicitWedaFindPatientIdentitySource(options = {}) {
     return Boolean(
       normalizePdfText([options.sourceText || "", options.documentText || "", options.tableText || ""].join("\n")).length ||
@@ -6622,18 +6764,23 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       options.urlKey || "",
       options.rowStableKey || "",
       options.pdfUrl ? hashString(options.pdfUrl) : "",
-      hashString([identity.searchLabel || "", identity.birthDate || ""].join("|")),
+      hashString([
+        identity.searchLabel || "",
+        ...(Array.isArray(identity.familyNames) ? identity.familyNames : []),
+        identity.birthDate || "",
+      ].join("|")),
     ].filter(Boolean).join("|") || hashString(Date.now() + "|" + Math.random());
   }
 
   function collectWedaFindPatientGridCandidates() {
-    const grid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
-    if (!grid || !isElementVisible(grid)) {
+    const grids = Array.from(document.querySelectorAll(WEDA_FIND_PATIENT_GRID_SELECTOR))
+      .filter((grid) => grid && isElementVisible(grid));
+    if (!grids.length) {
       return [];
     }
 
-    return Array.from(grid.querySelectorAll("tr"))
-      .filter((row) => row && !row.classList.contains("grid-header"))
+    return grids.flatMap((grid) => Array.from(grid.querySelectorAll("tr")))
+      .filter((row) => row && !row.classList.contains("grid-header") && !row.classList.contains("grid-pager"))
       .map((row, index) => buildWedaFindPatientGridCandidate(row, index))
       .filter((candidate) => candidate && candidate.link && (candidate.patientLabel || candidate.birthDate));
   }
@@ -6642,9 +6789,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const cells = Array.from(row.children || []).filter((cell) => /^(?:td|th)$/i.test(cell.tagName || ""));
     const patientLink = row.querySelector("a[id*='LinkButtonPatientGetNomPrenom'], a[id*='LinkButtonOldPatientGetNomPrenom']") ||
       (cells[2] ? cells[2].querySelector("a") : null);
-    const birthDateLink = row.querySelector("a[id*='LinkButtonOldPatienDateNaissance']") ||
+    const birthDateLink = row.querySelector("a[id*='LinkButtonOldPatienDateNaissance'], a[id*='LinkButtonPatienDateNaissance']") ||
       (cells[3] ? cells[3].querySelector("a") : null);
-    const maidenNameLink = row.querySelector("a[id*='LinkButtonOldPatientNomJeuneFille']") ||
+    const maidenNameLink = row.querySelector("a[id*='LinkButtonOldPatientNomJeuneFille'], a[id*='LinkButtonPatientNomJeuneFille']") ||
       (cells[6] ? cells[6].querySelector("a") : null);
     const patientLabel = cleanPatientImportLabel(patientLink ? patientLink.textContent : (cells[2] ? cells[2].textContent : ""));
     const birthDate = normalizePatientBirthDate(birthDateLink ? birthDateLink.textContent : (cells[3] ? cells[3].textContent : ""));
@@ -6773,11 +6920,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const candidateName = candidate.nameParts || parsePatientImportName(candidate.patientLabel || "");
     const candidateFamily = normalizePatientCompareText(candidateName.familyName || "").trim();
     const candidateGiven = normalizePatientCompareText(candidateName.givenName || "").trim();
-    const family = normalizePatientCompareText(identity.familyName || "").trim();
+    const families = uniqueStrings([
+      ...(Array.isArray(identity.familyNames) ? identity.familyNames : []),
+      identity.familyName || "",
+    ].map((familyName) => normalizePatientCompareText(familyName).trim())).filter(Boolean);
     const given = normalizePatientCompareText(identity.givenName || "").trim();
     const full = normalizePatientCompareText(identity.searchLabel || "").trim();
     const labelTokens = new Set(labelText.trim().split(/\s+/).filter(Boolean));
-    const familyTokens = family.split(/\s+/).filter(Boolean);
+    const familyTokenGroups = families.map((familyName) => familyName.split(/\s+/).filter(Boolean));
     const givenTokens = given.split(/\s+/).filter(Boolean);
 
     if (identity.birthDate && candidate.birthDate === identity.birthDate) {
@@ -6791,13 +6941,14 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       strongNameMatch = true;
     }
 
-    if (family && given && labelText.includes(` ${family} `) && labelText.includes(` ${given} `)) {
+    const matchingFamily = families.find((familyName) => labelText.includes(` ${familyName} `)) || "";
+    if (matchingFamily && given && labelText.includes(` ${given} `)) {
       value += 650;
       nameMatch = true;
       strongNameMatch = true;
     }
 
-    const familyTokenMatch = familyTokens.length > 0 && familyTokens.every((token) => labelTokens.has(token));
+    const familyTokenMatch = familyTokenGroups.some((tokens) => tokens.length > 0 && tokens.every((token) => labelTokens.has(token)));
     const givenTokenMatchCount = givenTokens.filter((token) => token.length >= 2 && labelTokens.has(token)).length;
     if (
       !strongNameMatch &&
@@ -6810,10 +6961,10 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       strongNameMatch = true;
     }
 
-    if (family && candidateFamily === family) {
+    if (families.includes(candidateFamily)) {
       value += 260;
       nameMatch = true;
-    } else if (family && labelText.includes(` ${family} `)) {
+    } else if (matchingFamily) {
       value += 160;
     }
 
@@ -6868,8 +7019,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       return null;
     }
 
+    await waitForWedaFindPatientPostBackIdle(12000).catch(() => false);
     await sleep(WEDA_FIND_PATIENT_SELECTION_SETTLE_MS);
-    return waitForOptionalTitleInput(TITLE_INPUT_WAIT_AFTER_PATIENT_MS, "le champ titre après recherche patient WEDA", options);
+    const input = await waitForOptionalTitleInput(
+      TITLE_INPUT_WAIT_AFTER_PATIENT_MS,
+      "le champ titre après recherche patient WEDA",
+      options
+    );
+    if (!input) {
+      appendDebugLog("weda:find-patient-title-missing-after-selection", {
+        reason: options.reason || "",
+        panelOpen: Boolean(findWedaFindPatientPanel()),
+        hasPatientHelper: Boolean(document.querySelector(SELECTOR_WEDA_HELPER_PATIENT_NAME)),
+        asyncPostBackActive: isWedaAsyncPostBackActive(),
+      });
+    }
+    return input;
   }
 
   async function waitForOptionalTitleInput(timeout, description, options = {}) {
@@ -10026,6 +10191,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
     const expectedNextRow = rows[item.index + 1] || null;
     const snapshot = {
+      sequence: ++manualArchivePendingSequence,
       index: item.index,
       key: item.key || "",
       stableKey: item.stableKey || "",
@@ -10052,92 +10218,110 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           error: error && error.message ? error.message : String(error),
         });
       });
-    }, MANUAL_ARCHIVE_NEXT_SETTLE_MS);
+    }, 0);
   }
 
   async function advanceToNextRowAfterManualArchive(snapshot) {
-    if (getState().running) {
-      return;
-    }
-
-    const change = await waitForManualArchiveListChange(snapshot);
-    if (!change.changed || getState().running) {
-      appendDebugLog("weda:manual-archive-next-skip", {
-        reason: change.changed ? "workflow-started" : "list-unchanged",
-        rowIndex: snapshot.index,
-        rowStableKey: snapshot.stableKey,
-        rowCount: change.rows.length,
-      });
-      return;
-    }
-
-    const snapshotRowStillPresent = Boolean(findManualArchiveSnapshotRow(snapshot, change.rows));
-    const selectedIndex = change.rows.length < snapshot.rowCount || !snapshotRowStillPresent
-      ? -1
-      : change.selectedIndex;
-    const nextIndex = findNextManualArchiveRowIndex(snapshot, change.rows, selectedIndex);
-    if (nextIndex < 0) {
-      appendDebugLog("weda:manual-archive-next-none", {
-        rowIndex: snapshot.index,
-        rowStableKey: snapshot.stableKey,
-        rowCount: change.rows.length,
-      });
-      return;
-    }
-
-    const nextRow = change.rows[nextIndex];
-    appendDebugLog("weda:manual-archive-next-click", {
-      archivedRowIndex: snapshot.index,
-      archivedRowStableKey: snapshot.stableKey,
-      nextIndex,
-      nextStableKey: nextRow ? nextRow.stableKey : "",
-      rowCount: change.rows.length,
-    });
-
-    const alreadySelected = change.selectedIndex === nextIndex && nextRow.row.classList.contains("selected");
-    if (alreadySelected) {
-      appendDebugLog("weda:manual-archive-next-already-selected", {
-        nextIndex,
-        nextStableKey: nextRow.stableKey,
-      });
-    } else {
-      triggerWedaBiologyRowOpen(nextRow, "manual-archive-next");
-    }
-    scheduleBackgroundTask(() => {
-      applyRememberedDocumentFieldsForSelectedRow({ autoSave: false, notifyInput: true, noRetry: true, silent: true });
-    }, 700);
-  }
-
-  async function waitForManualArchiveListChange(snapshot) {
-    const startedAt = Date.now();
-    let rows = getBiologyRows();
-    let selectedIndex = getSelectedBiologyIndex();
-
-    while (Date.now() - startedAt < MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS) {
-      rows = getBiologyRows();
-      selectedIndex = getSelectedBiologyIndex();
-
-      const snapshotRow = findManualArchiveSnapshotRow(snapshot, rows);
-      const changed = rows.length < snapshot.rowCount ||
-        !snapshotRow ||
-        (selectedIndex >= 0 && selectedIndex !== snapshot.index);
-
-      if (changed) {
-        return {
-          changed: true,
-          rows,
-          selectedIndex,
-        };
+    try {
+      if (getState().running) {
+        return;
       }
 
-      await sleep(250);
-    }
+      const change = await waitForManualArchiveListChange(snapshot);
+      if (snapshot.sequence !== manualArchivePendingSequence) {
+        return;
+      }
+      manualArchivePendingSequence = 0;
+      if (!change.changed || getState().running) {
+        appendDebugLog("weda:manual-archive-next-skip", {
+          reason: change.changed ? "workflow-started" : "list-unchanged",
+          rowIndex: snapshot.index,
+          rowStableKey: snapshot.stableKey,
+          rowCount: change.rows.length,
+        });
+        return;
+      }
 
-    return {
-      changed: false,
-      rows,
-      selectedIndex,
-    };
+      const snapshotRowStillPresent = Boolean(findManualArchiveSnapshotRow(snapshot, change.rows));
+      const selectedIndex = change.rows.length < snapshot.rowCount || !snapshotRowStillPresent
+        ? -1
+        : change.selectedIndex;
+      const nextIndex = findNextManualArchiveRowIndex(snapshot, change.rows, selectedIndex);
+      if (nextIndex < 0) {
+        appendDebugLog("weda:manual-archive-next-none", {
+          rowIndex: snapshot.index,
+          rowStableKey: snapshot.stableKey,
+          rowCount: change.rows.length,
+        });
+        return;
+      }
+
+      const nextRow = change.rows[nextIndex];
+      appendDebugLog("weda:manual-archive-next-click", {
+        archivedRowIndex: snapshot.index,
+        archivedRowStableKey: snapshot.stableKey,
+        nextIndex,
+        nextStableKey: nextRow ? nextRow.stableKey : "",
+        rowCount: change.rows.length,
+      });
+
+      const alreadySelected = change.selectedIndex === nextIndex && nextRow.row.classList.contains("selected");
+      if (alreadySelected) {
+        appendDebugLog("weda:manual-archive-next-already-selected", {
+          nextIndex,
+          nextStableKey: nextRow.stableKey,
+        });
+      } else {
+        triggerWedaBiologyRowOpen(nextRow, "manual-archive-next");
+      }
+      scheduleBackgroundTask(() => {
+        applyRememberedDocumentFieldsForSelectedRow({ autoSave: false, notifyInput: true, noRetry: true, silent: true });
+      }, 700);
+    } finally {
+      if (snapshot.sequence === manualArchivePendingSequence) {
+        manualArchivePendingSequence = 0;
+      }
+    }
+  }
+
+  function waitForManualArchiveListChange(snapshot) {
+    return new Promise((resolve) => {
+      let observer = null;
+      let checkTimer = null;
+      let timeoutTimer = null;
+      const finish = (result) => {
+        if (observer) observer.disconnect();
+        cancelBackgroundTask(checkTimer);
+        cancelBackgroundTask(timeoutTimer);
+        resolve(result);
+      };
+      const check = (expired = false) => {
+        const rows = getBiologyRows();
+        const selected = rows.find((item) => item.row.classList.contains("selected"));
+        const selectedIndex = selected ? selected.index : -1;
+        const snapshotRow = findManualArchiveSnapshotRow(snapshot, rows);
+        const changed = rows.length < snapshot.rowCount || !snapshotRow ||
+          (selectedIndex >= 0 && selectedIndex !== snapshot.index);
+        if (changed || expired || snapshot.sequence !== manualArchivePendingSequence) {
+          finish({ changed, rows, selectedIndex });
+        }
+      };
+
+      if (typeof MutationObserver === "function" && document.body) {
+        observer = new MutationObserver(() => {
+          cancelBackgroundTask(checkTimer);
+          checkTimer = scheduleBackgroundTask(() => check(), 40);
+        });
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class"],
+        });
+      }
+      timeoutTimer = scheduleBackgroundTask(() => check(true), MANUAL_ARCHIVE_NEXT_MAX_WAIT_MS);
+      check();
+    });
   }
 
   function findManualArchiveSnapshotRow(snapshot, rows = getBiologyRows()) {
@@ -10170,7 +10354,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function applyRememberedDocumentFieldsForSelectedRow(options = {}) {
+    if (manualArchivePendingSequence) {
+      return false;
+    }
     const patientHandoff = await applyRememberedPatientForSelectedRow(options);
+    if (manualArchivePendingSequence) {
+      return false;
+    }
     const documentOptions = patientHandoff && patientHandoff.applied
       ? {
         ...options,
@@ -10218,6 +10408,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     });
 
     while (Date.now() - startedAt < watchTimeoutMs) {
+      if (manualArchivePendingSequence) {
+        return false;
+      }
       if (options.handoffToken && options.handoffToken !== patientImportTitleHandoffSequence) {
         return false;
       }
@@ -10302,7 +10495,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   async function applyRememberedPatientForSelectedRow(options = {}) {
     const state = getState();
-    if (state.running || rememberedPatientAutofillInProgress) {
+    if (state.running || rememberedPatientAutofillInProgress || manualArchivePendingSequence) {
       return false;
     }
 
@@ -10379,6 +10572,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         });
       }
 
+      if (manualArchivePendingSequence) {
+        return false;
+      }
       if (findWedaFindPatientPanel()) {
         input = await rescueWedaFindPatientPanelWithDocumentIdentity({
           ...options,
@@ -12269,7 +12465,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         hasAnyPdfElement: Boolean(getDisplayedPdfEmbed()),
       });
 
-      skipOrFailCurrentDocument("Impossible de lire le courrier : " + error.message);
+      skipOrFailCurrentDocument("Impossible de lire le courrier : " + error.message, error);
     }
   }
 
@@ -12386,7 +12582,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     };
   }
 
-  function skipOrFailCurrentDocument(message) {
+  function skipOrFailCurrentDocument(message, error = null) {
     const state = getState();
 
     if (isWorkflowStopped(state)) {
@@ -12396,6 +12592,13 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         currentIndex: state.currentIndex,
         currentRowKey: state.currentRowKey || state.currentStableKey,
       });
+      return;
+    }
+
+    if (isLmStudioBlockingError(error)) {
+      // Conserver la ligne courante et suspendre les relances automatiques.
+      setState({ autoEnabled: false, autoRefreshPending: false, autoNextCheckAt: null });
+      failWeda(message);
       return;
     }
 
@@ -12595,7 +12798,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         jobId: result.jobId,
         error: result.error || "erreur inconnue",
       });
-      skipOrFailCurrentDocument(`LM Studio n'a pas renvoyé de titre : ${result.error || "erreur inconnue"}`);
+      skipOrFailCurrentDocument(`LM Studio n'a pas renvoyé de titre : ${result.error || "erreur inconnue"}`, { code: result.errorCode });
       return;
     }
 
@@ -13455,6 +13658,29 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         throw new Error("réponse LM Studio sans titre utilisable");
       }
 
+      if (shouldRecheckLmStudioAntecedent(activeJob, parsedResult.antecedent)) {
+        updateLmStudioStatus(job.id, "Vérification ciblée des nouveaux antécédents...");
+        parsedResult.antecedent = await recheckLmStudioAntecedent(activeJob, model, parsedResult.antecedent);
+      }
+
+      let patientIdentity = normalizeWedaFindPatientIdentity({});
+      if (parsedResult.antecedent && parsedResult.antecedent.status === "OUI") {
+        patientIdentity = extractWedaFindPatientIdentityHeuristically(activeJob.tableText || "");
+        if (!hasUsableWedaFindPatientIdentity(patientIdentity)) {
+          updateLmStudioStatus(job.id, "Identification du patient pour l'antécédent...");
+          patientIdentity = await requestLmStudioPatientIdentity({
+            sourceText: activeJob.tableText || "",
+            pdfPageImages: getLmStudioPdfPageImages(activeJob),
+          });
+        }
+        appendDebugLog("lmstudio:atcd-patient-identity-ready", {
+          jobId: job.id,
+          usable: hasUsableWedaFindPatientIdentity(patientIdentity),
+          source: patientIdentity.source || "",
+          hasBirthDate: Boolean(patientIdentity.birthDate),
+        });
+      }
+
       GM_deleteValue(JOB_KEY);
 
       return {
@@ -13464,6 +13690,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         title,
         specialtyCode: parsedResult.specialtyCode || "",
         antecedent: parsedResult.antecedent || null,
+        patientIdentity: hasUsableWedaFindPatientIdentity(patientIdentity) ? patientIdentity : null,
         sourceText: truncateResultSourceText(activeJob.tableText || ""),
         rowIndex: job.rowIndex,
         rowStableKey: job.rowStableKey || "",
@@ -13489,7 +13716,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
       GM_deleteValue(JOB_KEY);
 
-      if (getLmStudioPdfPageImages(activeJobForError).length) {
+      if (!isLmStudioBlockingError(error) && getLmStudioPdfPageImages(activeJobForError).length) {
         appendDebugLog("lmstudio:image-fail-closed-local-result", {
           jobId: job.id,
           sourceType: activeJobForError.sourceType || "",
@@ -13505,6 +13732,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
         jobId: job.id,
         ok: false,
         error: errorMessage,
+        errorCode: error.code || "",
         rowIndex: job.rowIndex,
         rowStableKey: job.rowStableKey || "",
         rowIdentity: job.rowIdentity || "",
@@ -13655,42 +13883,33 @@ SOURCE: fragment très court du courrier justifiant l’ajout
   }
 
   async function getLmStudioModelId() {
-    if (LMSTUDIO_MODEL) {
-      return LMSTUDIO_MODEL;
+    // Revalider à chaque tâche : un modèle peut avoir été déchargé ou remplacé.
+    const response = await gmJsonRequest({
+      method: "GET",
+      url: LMSTUDIO_MODELS_URL,
+      timeout: 12000,
+    });
+    const models = Array.isArray(response && response.data) ? response.data : [];
+    const selectedModel = models.find((model) => model && model.id && (!LMSTUDIO_MODEL || model.id === LMSTUDIO_MODEL));
+    if (!selectedModel) {
+      throw createLmStudioServiceError(LMSTUDIO_MODEL
+        ? "le modèle configuré n'est pas disponible ; chargez-le dans LM Studio puis relancez ce courrier"
+        : "aucun modèle disponible ; chargez un modèle dans LM Studio puis relancez ce courrier");
     }
-
-    if (cachedLmStudioModelId) {
-      return cachedLmStudioModelId;
-    }
-
-    try {
-      const response = await gmJsonRequest({
-        method: "GET",
-        url: LMSTUDIO_MODELS_URL,
-        timeout: 12000,
-      });
-      const models = Array.isArray(response && response.data) ? response.data : [];
-      const firstModel = models.find((model) => model && model.id);
-      if (firstModel && firstModel.id) {
-        cachedLmStudioModelId = String(firstModel.id);
-        appendDebugLog("lmstudio:model-detected", {
-          model: cachedLmStudioModelId,
-          modelCount: models.length,
-        });
-        return cachedLmStudioModelId;
-      }
-
-      appendDebugLog("lmstudio:model-list-empty", {
-        modelCount: models.length,
-      });
-    } catch (error) {
-      appendDebugLog("lmstudio:model-detect-error", {
-        error: error.message,
-      });
-    }
-
-    cachedLmStudioModelId = "local-model";
+    cachedLmStudioModelId = String(selectedModel.id);
+    appendDebugLog("lmstudio:model-detected", { model: cachedLmStudioModelId, modelCount: models.length });
     return cachedLmStudioModelId;
+  }
+
+  function isLmStudioBlockingError(error) {
+    return Boolean(error && /^LMSTUDIO_/.test(String(error.code || "")));
+  }
+
+  function createLmStudioServiceError(message) {
+    cachedLmStudioModelId = "";
+    const error = new Error(`LM Studio : ${message}`);
+    error.code = "LMSTUDIO_SERVICE_UNAVAILABLE";
+    return error;
   }
 
   async function requestLmStudioChatCompletion(job, model) {
@@ -13734,6 +13953,71 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       },
       data: JSON.stringify(payload),
     });
+  }
+
+  function shouldRecheckLmStudioAntecedent(job = {}, antecedent = null) {
+    return Boolean(
+      (!antecedent || antecedent.status !== "OUI") &&
+      (getLmStudioPdfPageImages(job).length || normalizePdfText(job.tableText || "").length)
+    );
+  }
+
+  async function recheckLmStudioAntecedent(job, model, previousAntecedent = null) {
+    const images = getLmStudioPdfPageImages(job);
+    const documentText = job.pdfTextExtractionGarbled ? "" : truncateLmStudioDocumentText(job.tableText || "");
+    const instruction = images.length
+      ? "Lis les pages PDF jointes visuellement. Si le texte extrait est partiel ou contradictoire, l'image fait foi."
+      : "Analyse le texte du courrier ci-dessous.";
+    const text = `${LMSTUDIO_ANTECEDENT_RECHECK_PROMPT}\n\n${instruction}\n\nCOURRIER :\n${documentText}`;
+    const content = images.length
+      ? [{ type: "text", text }, ...images.map((image) => ({ type: "image_url", image_url: { url: image.dataUrl } }))]
+      : text;
+
+    appendDebugLog("lmstudio:atcd-recheck-start", {
+      jobId: job.id,
+      previousStatus: previousAntecedent && previousAntecedent.status || "",
+      previousRejectionReason: previousAntecedent && previousAntecedent.rejectionReason || "",
+      sourceType: job.sourceType || "",
+      textLength: documentText.length,
+      imageCount: images.length,
+    });
+
+    const response = await gmJsonRequest({
+      method: "POST",
+      url: LMSTUDIO_CHAT_COMPLETIONS_URL,
+      timeout: LMSTUDIO_REQUEST_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json" },
+      data: JSON.stringify({
+        model,
+        temperature: LMSTUDIO_TEMPERATURE,
+        max_tokens: LMSTUDIO_MAX_TOKENS,
+        stream: false,
+        messages: [
+          { role: "system", content: "Tu analyses un courrier médical. Réponds uniquement avec le bloc <ANTECEDENT_CIM10> demandé, sans texte autour." },
+          { role: "user", content },
+        ],
+      }),
+    });
+    const answer = extractLmStudioAnswer(response);
+    const block = extractTaggedBlock(answer, "ANTECEDENT_CIM10");
+    const candidate = parseLmStudioAntecedentBlock(block);
+    if (!block || !candidate.declaredStatus) {
+      const error = new Error("vérification des antécédents sans bloc exploitable ; courrier conservé pour nouvelle analyse");
+      error.code = "LMSTUDIO_ATCD_RECHECK_UNAVAILABLE";
+      throw error;
+    }
+
+    const usable = candidate.status === "OUI" && Boolean(candidate.certainty && candidate.source);
+    appendDebugLog("lmstudio:atcd-recheck-result", {
+      jobId: job.id,
+      declaredStatus: candidate.declaredStatus,
+      accepted: usable,
+      hasLabel: Boolean(candidate.label),
+      codeValid: isLikelyCim10Code(candidate.code),
+      hasCertainty: Boolean(candidate.certainty),
+      hasSource: Boolean(candidate.source),
+    });
+    return usable ? candidate : previousAntecedent;
   }
 
   function buildLmStudioUserPrompt(job) {
@@ -13859,15 +14143,31 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const choices = Array.isArray(response && response.choices) ? response.choices : [];
     const firstChoice = choices[0] || {};
     const message = firstChoice.message || {};
-    const content = typeof message.content === "string" ? message.content : firstChoice.text || "";
-
+    const rawContent = message.content == null ? firstChoice.text || "" : message.content;
+    const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent)
+      ? rawContent.filter((part) => part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string").map((part) => part.text).join("\n")
+      : "";
+    const finishReason = firstChoice.finish_reason || "unknown";
+    const usage = response && response.usage || {};
+    const reasoningTokens = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+    // Ne jamais utiliser reasoning_content comme résultat médical, même si content est vide.
+    if (finishReason === "length" || !content.trim() || (finishReason !== "stop" && finishReason !== "unknown")) {
+      const reason = finishReason === "length"
+        ? "limite de génération atteinte avant la fin de la réponse ; augmentez le budget de génération"
+        : !content.trim() && (message.reasoning_content || message.reasoning || reasoningTokens > 0)
+          ? "raisonnement reçu sans réponse finale"
+          : "réponse finale absente ou interrompue";
+      const error = new Error(`LM Studio : ${reason} (finish_reason=${finishReason}, completion_tokens=${usage.completion_tokens ?? "?"}, reasoning_tokens=${reasoningTokens ?? "?"}).`);
+      error.code = "LMSTUDIO_INCOMPLETE_RESPONSE";
+      throw error;
+    }
     return normalizeMultilineText(content);
   }
 
   function gmJsonRequest(options) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== "function") {
-        reject(new Error("GM_xmlhttpRequest indisponible : vérifiez les permissions Tampermonkey du script"));
+        reject(createLmStudioServiceError("GM_xmlhttpRequest indisponible : vérifiez les permissions Tampermonkey du script"));
         return;
       }
 
@@ -13882,19 +14182,22 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           const body = response.responseText || "";
 
           if (status < 200 || status >= 300) {
-            reject(new Error(`LM Studio HTTP ${status || "?"} : ${body.slice(0, 500)}`));
+            const detail = /terminated|No models loaded|model.*(?:unloaded|crashed)/i.test(body)
+              ? "moteur interrompu ou modèle déchargé ; vérifiez LM Studio puis relancez ce courrier"
+              : "requête refusée ; vérifiez le journal du serveur local";
+            reject(createLmStudioServiceError(`HTTP ${status || "?"} : ${detail}`));
             return;
           }
 
           try {
             resolve(body ? JSON.parse(body) : {});
           } catch (error) {
-            reject(new Error(`réponse LM Studio non JSON : ${error.message}`));
+            reject(createLmStudioServiceError("réponse du serveur non JSON"));
           }
         },
-        onerror: () => reject(new Error("connexion à LM Studio impossible")),
-        ontimeout: () => reject(new Error("délai dépassé pendant l'appel à LM Studio")),
-        onabort: () => reject(new Error("appel à LM Studio annulé")),
+        onerror: () => reject(createLmStudioServiceError("connexion impossible")),
+        ontimeout: () => reject(createLmStudioServiceError("délai dépassé pendant l'appel")),
+        onabort: () => reject(createLmStudioServiceError("appel annulé")),
       });
     });
   }
@@ -14068,16 +14371,6 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           hasPatientUrl: true,
         });
       } else {
-        if (patientLauncher) {
-          return openWedaAntecedentWorkerViaWedaHelperPatientName(
-            result,
-            title,
-            item,
-            patientLauncher,
-            context
-          );
-        }
-
         const patientIdentity = await resolveWedaAntecedentWorkerPatientIdentity(
           result,
           context,
@@ -14098,6 +14391,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           item,
           context,
           hasWedaHelperPatientName: Boolean(patientLauncher),
+          hasWedaHelperPatientLabel: Boolean(patientLauncher && getWedaHelperPatientNameLabel(patientLauncher)),
           hasPatientIdentity: false,
           hasSourceText: Boolean(normalizePdfText(result && result.sourceText || "")),
           dedicatedTabRequired: true,
@@ -14369,6 +14663,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       insert: false,
       setParent: false,
     });
+    if (!workerTab) {
+      throw new Error("Tampermonkey n'a pas confirmé l'ouverture de l'onglet ATCD dédié");
+    }
     appendDebugLog("weda:atcd-worker-dedicated-tab-created", {
       workerJobId,
       source,
@@ -14626,7 +14923,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
 
   function findWedaHelperPatientNameLauncher() {
     const candidates = Array.from(document.querySelectorAll(SELECTOR_WEDA_HELPER_PATIENT_NAME));
-    return candidates.find((element) => isElementVisible(element)) || candidates[0] || null;
+    return candidates.find((element) => isElementVisible(element) && getWedaHelperPatientNameLabel(element)) || null;
   }
 
   function getWedaHelperPatientNameLabel(element) {
@@ -15384,7 +15681,9 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       throw new Error("champ de recherche patient WEDA introuvable dans l'onglet ATCD");
     }
 
-    setWedaFindPatientSearchInputValue(input, identity.searchLabel);
+    const familySearchLabels = getWedaFindPatientFamilySearchLabels(identity);
+    const initialSearchLabel = familySearchLabels[0] || identity.familyName || identity.searchLabel;
+    setWedaFindPatientSearchInputValue(input, initialSearchLabel);
     const searchButton = findWedaFindPatientSearchButton();
     if (!searchButton) {
       throw new Error("bouton de recherche patient WEDA introuvable dans l'onglet ATCD");
@@ -15393,12 +15692,19 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     appendDebugLog("weda-atcd-worker:patient-search-click", {
       workerJobId: currentJob.id,
       hasBirthDate: Boolean(identity.birthDate),
-      searchLength: identity.searchLabel.length,
+      searchLength: initialSearchLabel.length,
+      queryKind: "family-name",
     });
     const previousGrid = document.querySelector(WEDA_FIND_PATIENT_GRID_SELECTOR);
     clickButtonLikeUser(searchButton);
 
     let selection = await waitForWedaFindPatientSearchSelection(identity, {}, previousGrid);
+    if ((!selection || !selection.link) && familySearchLabels.length > 1) {
+      selection = await searchWedaFindPatientByAlternateFamilyNames(identity, familySearchLabels.slice(1), {
+        jobId: currentJob.id,
+        reason: "atcd-worker-dedicated-patient-search",
+      }, selection);
+    }
     if ((!selection || !selection.link) && identity.birthDate) {
       selection = await searchWedaFindPatientByBirthDate(identity, {
         jobId: currentJob.id,
@@ -19287,8 +19593,25 @@ SOURCE: fragment très court du courrier justifiant l’ajout
       extractUntaggedHeidiSpecialtyCode(raw, titleBlock);
     const title = sanitizeHeidiCourrierTitle(titleBlock, specialtyCode) ||
       sanitizeHeidiCourrierTitle(extractShortHeidiLine(raw), specialtyCode);
+    const antecedent = parseLmStudioAntecedentBlock(atcdBlock);
+
+    return {
+      title,
+      specialtyCode,
+      antecedent,
+      raw,
+    };
+  }
+
+  function parseLmStudioAntecedentBlock(atcdBlock = "") {
     const fields = parseSimpleKeyValueBlock(atcdBlock);
     const status = normalizeHeidiAtcdStatus(fields.STATUT);
+    const rawStatus = normalizeForCompare(fields.STATUT || "");
+    const declaredStatus = /^(?:oui|yes|o|1|true)\b/.test(rawStatus)
+      ? "OUI"
+      : /^(?:non|no|n|0|false)\b/.test(rawStatus)
+        ? "NON"
+        : "";
     const code = normalizeCim10Code(fields.CODE);
     const label = sanitizeAntecedentLabel(fields.LIBELLE);
     const section = normalizeAntecedentSection(fields.SECTION);
@@ -19297,6 +19620,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const source = normalizeText(fields.SOURCE || "");
 
     const antecedent = {
+      declaredStatus,
       status: status === "OUI" && isLikelyCim10Code(code) && label ? "OUI" : "NON",
       section,
       label,
@@ -19315,12 +19639,7 @@ SOURCE: fragment très court du courrier justifiant l’ajout
           : "antécédent inexploitable";
     }
 
-    return {
-      title,
-      specialtyCode,
-      antecedent,
-      raw,
-    };
+    return antecedent;
   }
 
   function extractUntaggedHeidiSpecialtyCode(rawAnswer, title = "") {

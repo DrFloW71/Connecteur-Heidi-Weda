@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Synthese documents uploader LM Studio
 // @namespace    https://secure.weda.fr/
-// @version      0.2.2
+// @version      0.2.3
 // @description  Analyse les PDF de UpLoaderForm.aspx ligne par ligne avec LM Studio local, renseigne une synthese courte et prepare l'ajout ATCD CIM-10 si detecte.
 // @match        https://secure.weda.fr/FolderMedical/UpLoaderForm.aspx*
 // @match        https://secure.weda.fr/FolderMedical/PatientViewForm.aspx*
@@ -22,7 +22,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "0.2.2";
+  const SCRIPT_VERSION = "0.2.3";
   const WEDA_HOST = "secure.weda.fr";
 
   const LMSTUDIO_API_BASE_URL = "http://localhost:1234/v1";
@@ -31,8 +31,9 @@
   const LMSTUDIO_MODEL = "";
   const LMSTUDIO_REQUEST_TIMEOUT_MS = 300000;
   const LMSTUDIO_TEMPERATURE = 0;
-  const LMSTUDIO_MAX_TOKENS = 900;
-  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 220;
+  // max_tokens inclut le raisonnement et la réponse finale des modèles Gemma/Qwen.
+  const LMSTUDIO_MAX_TOKENS = 8192;
+  const LMSTUDIO_PATIENT_IDENTITY_MAX_TOKENS = 4096;
   const LMSTUDIO_MAX_DOCUMENT_TEXT_LENGTH = 45000;
 
   const COURRIER_ATCD_PROMPT = `Tu dois produire deux blocs balisés, et uniquement ces deux blocs.
@@ -3739,7 +3740,24 @@ SOURCE: fragment très court du courrier justifiant l’ajout
     const choices = Array.isArray(response && response.choices) ? response.choices : [];
     const firstChoice = choices[0] || {};
     const message = firstChoice.message || {};
-    const content = typeof message.content === "string" ? message.content : firstChoice.text || "";
+    const rawContent = message.content == null ? firstChoice.text || "" : message.content;
+    const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent)
+      ? rawContent.filter((part) => part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string").map((part) => part.text).join("\n")
+      : "";
+    const finishReason = firstChoice.finish_reason || "unknown";
+    const usage = response && response.usage || {};
+    const reasoningTokens = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+    // Ne jamais utiliser reasoning_content comme résultat médical, même si content est vide.
+    if (finishReason === "length" || !content.trim() || (finishReason !== "stop" && finishReason !== "unknown")) {
+      const reason = finishReason === "length"
+        ? "limite de génération atteinte avant la fin de la réponse ; augmentez le budget de génération"
+        : !content.trim() && (message.reasoning_content || message.reasoning || reasoningTokens > 0)
+          ? "raisonnement reçu sans réponse finale"
+          : "réponse finale absente ou interrompue";
+      const error = new Error(`LM Studio : ${reason} (finish_reason=${finishReason}, completion_tokens=${usage.completion_tokens ?? "?"}, reasoning_tokens=${reasoningTokens ?? "?"}).`);
+      error.code = "LMSTUDIO_INCOMPLETE_RESPONSE";
+      throw error;
+    }
     return normalizeMultilineText(content);
   }
 

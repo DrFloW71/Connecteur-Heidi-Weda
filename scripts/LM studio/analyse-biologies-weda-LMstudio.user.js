@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weda - Analyse biologies avec LM Studio local
 // @namespace    https://secure.weda.fr/
-// @version      0.1.12
+// @version      0.1.13
 // @description  Analyse les résultats HPRIM avec l'API OpenAI-compatible de LM Studio en local. Statut biologique pré-calculé.
 // @match        https://secure.weda.fr/FolderMedical/HprimForm.aspx*
 // @grant        GM_addValueChangeListener
@@ -28,11 +28,12 @@
   const LMSTUDIO_MODEL = "";
   const LMSTUDIO_REQUEST_TIMEOUT_MS = 300000;
   const LMSTUDIO_TEMPERATURE = 0;
-  const LMSTUDIO_MAX_TOKENS = 220;
+  // max_tokens inclut le raisonnement et la réponse finale des modèles Gemma/Qwen.
+  const LMSTUDIO_MAX_TOKENS = 8192;
   const BIOLOGY_SIGNAL = "BIOLOGIE À ANALYSER CI-DESSOUS";
   const ANAPATH_SIGNAL = "ANAPATH À ANALYSER CI-DESSOUS";
   const HPRIM_TABLE_COLUMN_COUNT = 6;
-  const SCRIPT_VERSION = "0.1.12";
+  const SCRIPT_VERSION = "0.1.13";
 
   const STORAGE_PREFIX = "wedaBioLmStudio.";
   const STATE_KEY_BASE = `${STORAGE_PREFIX}state`;
@@ -5511,8 +5512,24 @@ Ne jamais afficher cet auto-contrôle.`;
     const choices = Array.isArray(response && response.choices) ? response.choices : [];
     const firstChoice = choices[0] || {};
     const message = firstChoice.message || {};
-    const content = typeof message.content === "string" ? message.content : firstChoice.text || "";
-
+    const rawContent = message.content == null ? firstChoice.text || "" : message.content;
+    const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent)
+      ? rawContent.filter((part) => part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string").map((part) => part.text).join("\n")
+      : "";
+    const finishReason = firstChoice.finish_reason || "unknown";
+    const usage = response && response.usage || {};
+    const reasoningTokens = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+    // Ne jamais utiliser reasoning_content comme résultat médical, même si content est vide.
+    if (finishReason === "length" || !content.trim() || (finishReason !== "stop" && finishReason !== "unknown")) {
+      const reason = finishReason === "length"
+        ? "limite de génération atteinte avant la fin de la réponse ; augmentez le budget de génération"
+        : !content.trim() && (message.reasoning_content || message.reasoning || reasoningTokens > 0)
+          ? "raisonnement reçu sans réponse finale"
+          : "réponse finale absente ou interrompue";
+      const error = new Error(`LM Studio : ${reason} (finish_reason=${finishReason}, completion_tokens=${usage.completion_tokens ?? "?"}, reasoning_tokens=${reasoningTokens ?? "?"}).`);
+      error.code = "LMSTUDIO_INCOMPLETE_RESPONSE";
+      throw error;
+    }
     return normalizeMultilineText(content);
   }
 

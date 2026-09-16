@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WEDA - Copilote prévention vigilance LM Studio
 // @namespace    https://secure.weda.fr/
-// @version      0.6.7
+// @version      0.6.8
 // @description  Lit la page d'accueil patient WEDA, l'envoie à LM Studio local avec un prompt médical, puis affiche un encart copilote flottant.
 // @author       Florian Ronez + ChatGPT
 // @match        https://secure.weda.fr/FolderMedical/PatientViewForm.aspx*
@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '0.6.7';
+    const SCRIPT_VERSION = '0.6.8';
 
     const CONFIG = {
         LM_STUDIO_BASE_URL: 'http://127.0.0.1:1234/v1',
@@ -32,7 +32,8 @@
 
         REQUEST_TIMEOUT_MS: 180000,
         TEMPERATURE: 0.15,
-        MAX_TOKENS: 2200,
+        // Budget partagé entre raisonnement et réponse finale.
+        MAX_TOKENS: 8192,
 
         MAX_PAGE_CHARS: 180000,
 
@@ -977,16 +978,31 @@ STYLE
             throw new Error('Réponse LM Studio non JSON : ' + String(response.responseText || '').slice(0, 1000));
         }
 
-        const content =
-            json?.choices?.[0]?.message?.content ||
-            json?.choices?.[0]?.text ||
-            json?.output_text ||
-            '';
+        return extractLmStudioAnswer(json);
+    }
 
-        if (!content) {
-            throw new Error('Réponse LM Studio vide ou format inattendu : ' + JSON.stringify(json).slice(0, 1200));
+    function extractLmStudioAnswer(response) {
+        const choices = Array.isArray(response && response.choices) ? response.choices : [];
+        const firstChoice = choices[0] || {};
+        const message = firstChoice.message || {};
+        const rawContent = message.content == null ? firstChoice.text || (response && response.output_text) || "" : message.content;
+        const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent)
+            ? rawContent.filter((part) => part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string").map((part) => part.text).join("\n")
+            : "";
+        const finishReason = firstChoice.finish_reason || "unknown";
+        const usage = response && response.usage || {};
+        const reasoningTokens = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+        // Ne jamais utiliser reasoning_content comme résultat médical, même si content est vide.
+        if (finishReason === "length" || !content.trim() || (finishReason !== "stop" && finishReason !== "unknown")) {
+            const reason = finishReason === "length"
+                ? "limite de génération atteinte avant la fin de la réponse ; augmentez le budget de génération"
+                : !content.trim() && (message.reasoning_content || message.reasoning || reasoningTokens > 0)
+                    ? "raisonnement reçu sans réponse finale"
+                    : "réponse finale absente ou interrompue";
+            const error = new Error(`LM Studio : ${reason} (finish_reason=${finishReason}, completion_tokens=${usage.completion_tokens ?? "?"}, reasoning_tokens=${reasoningTokens ?? "?"}).`);
+            error.code = "LMSTUDIO_INCOMPLETE_RESPONSE";
+            throw error;
         }
-
         return String(content).trim();
     }
 

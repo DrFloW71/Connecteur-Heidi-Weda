@@ -25,29 +25,27 @@ test("aligne les versions Tampermonkey et interne", () => {
   const internalVersion = source.match(/const SCRIPT_VERSION = "([^"]+)"/)?.[1];
 
   assert.equal(metadataVersion, internalVersion);
-  assert.equal(metadataVersion, "0.1.59");
+  assert.equal(metadataVersion, "0.1.64");
 });
 
-test("ouvre les antécédents depuis le raccourci patient de la page source", () => {
+test("sans URL patient, utilise une identité vérifiée et un onglet dédié", () => {
   const body = getFunctionSource(
-    "openWedaAntecedentWorkerViaWedaHelperPatientName",
-    "openWedaAntecedentWorkerViaDedicatedPatientSearch"
+    "openWedaAntecedentWorkerIfNeeded",
+    "resolveWedaAntecedentWorkerPatientIdentity"
   );
 
-  assert.match(body, /openMode: "ctrl-click-antecedents"/);
-  assert.match(body, /clickWedaHelperPatientNameForAntecedents\(patientLauncher\)/);
-  assert.doesNotMatch(body, /buildWedaAtcdWorkerUrl\(location\.href/);
-  assert.doesNotMatch(body, /openDedicatedWedaAtcdWorkerTab/);
+  assert.match(body, /resolveWedaAntecedentWorkerPatientIdentity\(/);
+  assert.match(body, /hasUsableWedaFindPatientIdentity\(patientIdentity\)/);
+  assert.match(body, /openWedaAntecedentWorkerViaDedicatedPatientSearch\(/);
+  assert.doesNotMatch(body, /openWedaAntecedentWorkerViaWedaHelperPatientName\(/);
 });
 
-test("le raccourci Weda-Helper reçoit bien un Ctrl+clic", () => {
+test("un raccourci patient vide n'est jamais considéré comme ouvrable", () => {
   const body = getFunctionSource(
-    "clickWedaHelperPatientNameForAntecedents",
-    "dispatchModifiedMouseEvent"
+    "findWedaHelperPatientNameLauncher",
+    "getWedaHelperPatientNameLabel"
   );
-
-  assert.match(body, /ctrlKey: true/);
-  assert.match(body, /"pointerdown", "mousedown", "pointerup", "mouseup", "click"/);
+  assert.match(body, /isElementVisible\(element\) && getWedaHelperPatientNameLabel\(element\)/);
 });
 
 test("seul l'onglet fraîchement ouvert par Weda-Helper peut adopter le job", () => {
