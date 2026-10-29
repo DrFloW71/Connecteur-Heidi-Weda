@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur Madeformed - WEDA
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.5
 // @description  PageDown : copier/envoyer le SMS vers WEDA ; clic nom patient : ouvrir dossier WEDA ; tâches et prochain RDV sous les messages ; rendez-vous et documents natifs ; regroupement visuel des appels ; Messagerie et compteur dans tous les onglets utilisateurs
 // @match        https://pro.madeformed.com/*
 // @match        https://secure.weda.fr/*
@@ -20,7 +20,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '4.3';
+    const VERSION = '4.5';
 
     const JOB_KEY = 'TM_MADEFORMED_TO_WEDA_JOB_V31';
     const LOG_KEY = 'TM_MADEFORMED_TO_WEDA_LOG_V31';
@@ -268,15 +268,19 @@
 
     function getJob() {
         const job = GM_getValue(JOB_KEY, null);
-        if (!job || job.sensitiveDataExpiredAt) return job;
+        if (!job) return job;
+        // Migrer aussi les ouvertures seules déjà verrouillées par la V4.3.
+        // Elles ne transfèrent aucune réponse et ne créent aucune consultation.
+        const expiredOpenPatient = isOpenPatientOnlyJob(job) && job.status === 'expired_unknown';
+        if (job.sensitiveDataExpiredAt && !expiredOpenPatient) return job;
         const createdAt = Number(job.createdAt);
-        if (Number.isFinite(createdAt) && createdAt > 0 && createdAt <= Date.now() &&
+        if (!expiredOpenPatient && Number.isFinite(createdAt) && createdAt > 0 && createdAt <= Date.now() &&
             Date.now() - createdAt <= JOB_SENSITIVE_TTL_MS) return job;
-        const terminal = ['open_patient_done', 'archived_manually_verified'].includes(job.status);
+        const needsReview = !isOpenPatientOnlyJob(job) && !['open_patient_done', 'archived_manually_verified'].includes(job.status);
         const expired = {id:job.id, action:transferAuditCode(job.action), source:transferAuditCode(job.source),
             createdAt:Number.isFinite(createdAt) && createdAt > 0 && createdAt <= Date.now() ? createdAt : Date.now(),
-            updatedAt:Date.now(), status:terminal ? 'error_transfer_expired' : 'expired_unknown',
-            resultUnknown:!terminal, sensitiveDataExpiredAt:Date.now()};
+            updatedAt:Date.now(), status:needsReview ? 'expired_unknown' : 'error_transfer_expired',
+            resultUnknown:needsReview, sensitiveDataExpiredAt:job.sensitiveDataExpiredAt || Date.now()};
         GM_setValue(JOB_KEY, expired);
         recordTransferAudit(expired);
         return expired;
@@ -296,7 +300,8 @@
             addLog('WARN', 'updateJob appelé sans job');
             return null;
         }
-        if (job.status === 'expired_unknown' && patch.status !== 'archived_manually_verified') return null;
+        if ((job.sensitiveDataExpiredAt || job.status === 'expired_unknown') &&
+            !(job.status === 'expired_unknown' && patch.status === 'archived_manually_verified')) return null;
 
         const next = {
             ...job,
@@ -328,7 +333,7 @@
 
     function resetAll() {
         if (getJob()?.status === 'expired_unknown') {
-            alert('Un ancien transfert reste à vérifier. Contrôlez son résultat puis utilisez « J’ai vérifié le résultat » dans Ruby.');
+            alert('Un ancien transfert reste à vérifier. Contrôlez son résultat puis utilisez « J’ai vérifié le résultat » dans MFM Helper + WEDA.');
             return;
         }
         closeCurrentWedaTabFromMadeformed('reset');
@@ -971,7 +976,7 @@
     }
 
     async function launchFromMadeformed(trigger) {
-        if (getJob()?.status === 'expired_unknown') { alert('Vérifiez le résultat du transfert ancien dans Ruby avant un nouvel envoi.'); return; }
+        if (getJob()?.status === 'expired_unknown') { alert('Vérifiez le résultat du transfert ancien dans MFM Helper + WEDA avant un nouvel envoi.'); return; }
         addLog('INFO', 'Déclenchement Madeformed', { trigger });
 
         const textarea = getVisibleTextarea();
@@ -1187,7 +1192,7 @@
     }
 
     function openWedaPatientJobFromMadeformed(patient, source, logMessage, extraLogData = {}) {
-        if (getJob()?.status === 'expired_unknown') { alert('Vérifiez le résultat du transfert ancien dans Ruby avant une nouvelle ouverture.'); return false; }
+        if (getJob()?.status === 'expired_unknown') { alert('Vérifiez le résultat du transfert ancien dans MFM Helper + WEDA avant une nouvelle ouverture.'); return false; }
         const job = createOpenPatientJob(patient.patientNameRaw, patient.dateOfBirth, source, {
             patientNameForWeda: patient.patientNameForWeda || ''
         });
@@ -2120,7 +2125,7 @@
 
     function wedaPatientRequire(job, patient = false, consultation = false) {
         const latest = getJob();
-        if (!job?.id || latest?.id !== job.id || wedaPatientTabBinding() !== job.id || latest.status === 'expired_unknown') {
+        if (!job?.id || latest?.id !== job.id || wedaPatientTabBinding() !== job.id || latest.sensitiveDataExpiredAt || latest.status === 'expired_unknown') {
             wedaPatientNotice('Le transfert de cet onglet a changé ou est périmé. Aucune écriture automatique ne sera effectuée.');
             const error = new Error('Tâche WEDA ou onglet changé.'); error.code = 'WEDA_PATIENT_GUARD'; throw error;
         }
@@ -2823,8 +2828,8 @@
             let job = getJob();
 
             if (!job) return;
-            if (job.status === 'expired_unknown') {
-                // Conserver le verrou sans afficher de bandeau à l’ouverture de WEDA.
+            if (job.sensitiveDataExpiredAt || job.status === 'expired_unknown') {
+                // Ne jamais reprendre une tâche périmée, même une ouverture seule libérée.
                 return;
             }
             job = wedaPatientRequire(job);
@@ -3238,11 +3243,11 @@
 
         panel.innerHTML = `
             <div id="tm-mf-weda-head">
-                <span id="tm-mf-weda-brand" title="Ruby - connecteur Madeformed WEDA">
+                <span id="tm-mf-weda-brand" title="MFM Helper + WEDA">
                     <span id="tm-mf-weda-ruby-icon" aria-hidden="true">W</span>
-                    <span id="tm-mf-weda-title">Ruby</span>
+                    <span id="tm-mf-weda-title">MFM Helper + WEDA</span>
                 </span>
-                <button id="tm-mf-weda-toggle" type="button" aria-label="Replier Ruby">+</button>
+                <button id="tm-mf-weda-toggle" type="button" aria-label="Replier MFM Helper + WEDA">+</button>
             </div>
             <div id="tm-mf-weda-body">
                 <div id="tm-mf-weda-status"></div>
@@ -3270,10 +3275,10 @@
             panel.classList.toggle('tm-collapsed', collapsed);
             const label = collapsed ? '+' : '−';
             if (toggleButton.textContent !== label) toggleButton.textContent = label;
-            const ariaLabel = collapsed ? 'Ouvrir Ruby' : 'Replier Ruby';
+            const ariaLabel = collapsed ? 'Ouvrir MFM Helper + WEDA' : 'Replier MFM Helper + WEDA';
             if (toggleButton.getAttribute('aria-label') !== ariaLabel) toggleButton.setAttribute('aria-label', ariaLabel);
             if (toggleButton.getAttribute('aria-expanded') !== String(!collapsed)) toggleButton.setAttribute('aria-expanded', String(!collapsed));
-            const title = collapsed ? 'Ouvrir Ruby — glisser pour déplacer' : 'Glisser l’en-tête pour déplacer';
+            const title = collapsed ? 'Ouvrir MFM Helper + WEDA — glisser pour déplacer' : 'Glisser l’en-tête pour déplacer';
             if (panel.title !== title) panel.title = title;
             refreshPosition();
         };
@@ -3334,6 +3339,7 @@
 
     function madeformedJobStatusLabel(job) {
         if (!job) return 'Aucun';
+        if (job.status === 'error_transfer_expired' && isOpenPatientOnlyJob(job)) return 'Ouverture précédente expirée ; vous pouvez ouvrir un dossier';
         const labels = {open_search:'Recherche du patient dans WEDA', search_submitted:'Résultats de recherche WEDA',
             awaiting_patient_selection:'Choisissez le dossier dans WEDA', awaiting_patient_confirmation:'Vérifiez le dossier dans WEDA',
             patient_clicked:'Dossier patient sélectionné', consultation_clicked:'Ouverture de la consultation',

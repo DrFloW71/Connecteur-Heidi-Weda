@@ -1,6 +1,22 @@
-# RDV, documents et appels MadeForMed — version 4.3
+# RDV, documents et appels MadeForMed — version 4.5
 
-Le fichier complet à installer est `scripts/Connecteur-madeformed-vers-weda.user..js`. La version Tampermonkey et la constante interne valent toutes deux `4.3`. La V4.0 reste la référence stable, fonctionnellement identique à la 3.65.
+Le fichier complet à installer est `scripts/Connecteur-madeformed-vers-weda.user..js`. La version Tampermonkey et la constante interne valent toutes deux `4.5`. La V4.0 reste la référence stable, fonctionnellement identique à la 3.65.
+
+## Nom du panneau V4.5 — 29 octobre 2026
+
+Le panneau porte le nom « MFM Helper + WEDA ». Ses infobulles, libellés d’accessibilité et alertes utilisent le même nom. La pastille conserve la lettre W.
+
+## Déblocage des ouvertures périmées V4.4 — 29 octobre 2026
+
+Une simple ouverture de dossier (`action: open_patient`) ne transfère aucune réponse et ne crée aucune consultation. La V4.3 la classait pourtant comme un transfert au résultat inconnu après vingt minutes, puis bloquait les clics patients, les envois et Reset jusqu’à une vérification manuelle.
+
+La V4.4 libère les actions lorsqu’une ouverture seule expire, y compris lorsqu’elle était déjà conservée sous `expired_unknown` par la V4.3. Le panneau affiche « Ouverture précédente expirée ; vous pouvez ouvrir un dossier ». Le contenu sensible reste effacé et la trace technique est conservée. L’ancienne ouverture ne reprend pas ; seul un nouveau clic crée une nouvelle demande. Les anciens callbacks ne peuvent ni réactiver la tâche périmée ni agir sur une nouvelle tâche depuis l’ancien onglet.
+
+Les transferts de réponse dont le résultat est incertain conservent le verrou et le bouton « J’ai vérifié le résultat ». Après contrôle manuel dans MadeForMed et WEDA, ce bouton clôt l’attente sans renvoi ni enregistrement supplémentaire.
+
+Pour appliquer la correction, remplacer le script dans Tampermonkey par le fichier complet V4.4, enregistrer, puis recharger les onglets MadeForMed et WEDA. L’ouverture périmée déjà bloquée est reclassée au chargement ; aucun Reset n’est nécessaire.
+
+Validation locale : 208 tests Node et 29 contrôles dans Edge isolé hors ligne réussis, sans erreur JavaScript ni réseau réel. Ils couvrent la migration d’un état V4.3 au rechargement, le clic patient suivant, l’expiration des ouvertures seules, le refus des callbacks périmés et le maintien du verrou pour les réponses incertaines. Syntaxe et `git diff --check` valides. Aucun test sur le compte authentifié n’a été effectué.
 
 ## Pastille déplaçable V4.3 — 13 octobre 2026
 

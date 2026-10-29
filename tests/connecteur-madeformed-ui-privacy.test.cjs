@@ -10,7 +10,7 @@ const scriptPath = path.join(__dirname,'..','scripts','Connecteur-madeformed-ver
 const source = fs.readFileSync(scriptPath,'utf8');
 
 function harness() {
-    const storage = new Map(), consoleCalls = [], alerts = [];
+    const storage = new Map(), consoleCalls = [], alerts = [], openedTabs = [];
     let now = Date.parse('2026-10-08T16:00:00Z');
     class ClockDate extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
     const document = {readyState:'loading', addEventListener(){}, getElementById:()=>null, querySelector:()=>null, querySelectorAll:()=>[]};
@@ -20,6 +20,7 @@ function harness() {
         setTimeout,clearTimeout,setInterval,clearInterval,
         console:{log:(...a)=>consoleCalls.push(a),warn:(...a)=>consoleCalls.push(a),error:(...a)=>consoleCalls.push(a)},
         alert:message=>alerts.push(message),
+        GM_openInTab:(url,options)=>{openedTabs.push({url,options});return {};},
         GM_getValue:(key,fallback)=>storage.has(key)?storage.get(key):fallback,
         GM_setValue:(key,value)=>storage.set(key,value),GM_deleteValue:key=>storage.delete(key)};
     const exposed = `
@@ -27,12 +28,13 @@ function harness() {
         JOB_SENSITIVE_TTL_MS, TRANSFER_AUDIT_TTL_MS, TRANSFER_AUDIT_LIMIT,
         sanitizeLogData,sanitizeLogMessage,safeJobForLog,getLogs,setLogs,addLog,buildLogText,
         getJob,saveJob,updateJob,clearJob,getTransferAudit,recordTransferAudit,resetAll,madeformedJobStatusLabel,
+        openWedaPatientJobFromMadeformed,
         hooks(hooks){if(hooks.clearMemory)mfmNativeClearGroupMemory=hooks.clearMemory;}};
 `;
     const anchor = "    if (document.readyState === 'loading')";
     assert.ok(source.includes(anchor));
     vm.runInNewContext(source.replace(anchor,()=>exposed+anchor),sandbox,{filename:scriptPath});
-    return {api:sandbox.privacy, storage, sandbox, consoleCalls, alerts, now:()=>now, advance:ms=>{now+=ms;}};
+    return {api:sandbox.privacy, storage, sandbox, consoleCalls, alerts, openedTabs, now:()=>now, advance:ms=>{now+=ms;}};
 }
 
 function job(h, overrides={}) {
@@ -136,6 +138,49 @@ test('un transfert périmé inconnu ne peut être effacé ni remplacé par un an
     assert.equal(h.api.updateJob({status:'patient_clicked',patientName:'PATIENT FICTIF'}),null);
     assert.throws(()=>h.api.saveJob(job(h,{id:`${h.now()}_other`})),/Vérifiez/);
     assert.equal(h.api.getJob().status,'expired_unknown');
+});
+
+test('une ouverture de dossier périmée libère les actions sans reprendre l’ancienne ouverture',()=>{
+    const h=harness();h.api.saveJob(job(h,{action:'open_patient',message:''}));h.advance(h.api.JOB_SENSITIVE_TTL_MS+1);
+    const expired=h.api.getJob();
+    assert.equal(expired.status,'error_transfer_expired');assert.equal(expired.resultUnknown,false);
+    assert.ok(!Object.hasOwn(expired,'patientName'));assert.ok(!Object.hasOwn(expired,'message'));
+    assert.match(h.api.madeformedJobStatusLabel(expired),/vous pouvez ouvrir/);
+    assert.equal(h.api.updateJob({status:'patient_clicked',patientName:'PATIENT FICTIF'}),null);
+    assert.equal(h.openedTabs.length,0);assert.equal(h.alerts.length,0);
+    assert.equal(h.api.openWedaPatientJobFromMadeformed({patientNameRaw:'AUTRE DEMO',dateOfBirth:'02/02/1980'},'madeformed_messages','Ouverture fictive'),true);
+    assert.equal(h.openedTabs.length,1);assert.notEqual(h.api.getJob().id,expired.id);
+    assert.equal(h.api.getJob().status,'open_search');
+    assert.equal(h.api.getTransferAudit().find(item=>item.id===expired.id).resultUnknown,false);
+});
+
+test('le verrou open_patient déjà conservé par la V4.3 est migré une seule fois',()=>{
+    const h=harness(),expiredAt=h.now()-2*24*60*60*1000;
+    h.storage.set(h.api.JOB_KEY,{id:`${expiredAt}_legacy`,action:'open_patient',source:'madeformed_messages',
+        createdAt:expiredAt-h.api.JOB_SENSITIVE_TTL_MS,updatedAt:expiredAt,
+        status:'expired_unknown',resultUnknown:true,sensitiveDataExpiredAt:expiredAt});
+    const migrated=h.api.getJob();
+    assert.equal(migrated.status,'error_transfer_expired');assert.equal(migrated.resultUnknown,false);
+    assert.equal(migrated.sensitiveDataExpiredAt,expiredAt);
+    h.advance(1000);assert.equal(h.api.getJob().updatedAt,migrated.updatedAt);
+    assert.equal(h.api.getTransferAudit().length,1);assert.equal(h.openedTabs.length,0);
+    h.api.saveJob(job(h));assert.equal(h.api.getJob().action,'sms_to_consultation');
+});
+
+test('Reset peut effacer une ouverture seule expirée',()=>{
+    const h=harness();h.api.saveJob(job(h,{action:'open_patient',message:''}));h.advance(h.api.JOB_SENSITIVE_TTL_MS+1);
+    h.api.resetAll();assert.equal(h.api.getJob(),null);assert.equal(h.openedTabs.length,0);
+});
+
+test('les anciens transferts de réponse ou d’action inconnue gardent leur vérification manuelle',()=>{
+    for(const action of ['sms_to_consultation','send_message',undefined]) {
+        const h=harness(),old=job(h,{action,status:'expired_unknown',resultUnknown:true,sensitiveDataExpiredAt:h.now()-1});
+        h.storage.set(h.api.JOB_KEY,old);
+        assert.equal(h.api.openWedaPatientJobFromMadeformed({patientNameRaw:'AUTRE DEMO'},'madeformed_messages','Ouverture fictive'),false);
+        assert.equal(h.api.getJob().status,'expired_unknown');assert.equal(h.api.getJob().resultUnknown,true);
+        assert.equal(h.openedTabs.length,0);assert.equal(h.alerts.length,1);
+        assert.equal(h.api.clearJob(),false);assert.throws(()=>h.api.saveJob(job(h)),/Vérifiez/);
+    }
 });
 
 test('l’archivage manuel libère le transfert sans écriture clinique',()=>{

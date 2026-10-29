@@ -20,7 +20,7 @@ function header() {
 }
 function row(id,hour,{uid='',phone='0102030405',name='PATIENT DEMO',channel='svi'}={}) {
     const href=uid?'/agenda?target=user-detail&uid='+uid:'/agenda?target=user-search&field=tel&value='+phone;
-    return '<tr class="user-message" data-id="'+id+'" data-user_id="'+uid+'" data-name="'+name+'" data-phone="'+phone+'" data-mod="Message"><td><input type="checkbox"></td><td class="expediteur"><span class="name">'+name+'</span></td><td><span class="date">07/10/2026</span><span class="hour">'+hour+'</span></td><td class="content"><span class="msg-canal" data-canal="'+channel+'">'+channel+'</span><div class="transcription">Message de démonstration sans donnée réelle</div></td><td class="action"><div class="flex"><a class="search ds-btn" href="'+escape(href)+'">Fiche native</a></div></td></tr>';
+    return '<tr class="user-message" data-id="'+id+'" data-user_id="'+uid+'" data-name="'+name+'" data-phone="'+phone+'" data-mod="Message"><td><input type="checkbox"></td><td class="expediteur"><span class="name truncate">'+name+'</span></td><td><span class="date">07/10/2026</span><span class="hour">'+hour+'</span></td><td class="content"><span class="msg-canal" data-canal="'+channel+'">'+channel+'</span><div class="transcription">Message de démonstration sans donnée réelle</div></td><td class="action"><div class="flex"><a class="search ds-btn" href="'+escape(href)+'">Fiche native</a></div></td></tr>';
 }
 function shell(body,script='',connector=true) {
     return '<!doctype html><html><head><meta charset="utf-8"><style>body{font:14px Arial;margin:12px}nav ul{display:flex;gap:12px;list-style:none;padding:0}.cab{display:none}table{border-collapse:collapse;width:100%}td{padding:8px;border-bottom:1px solid #ddd}.date,.hour{display:block}.action .ds-btn{display:inline-flex;background-color:rgb(110,70,30);color:rgb(255,250,240);padding:5px}.theme-new .action .ds-btn{background-color:rgb(30,100,160);color:rgb(245,250,255)}.user-detail{padding:12px}.file{display:block;margin:8px}.patient-input{width:160px}</style></head><body>'+header()+body+(script?'<script>'+script+'</script>':'')+(connector?'<script src="/connector.js"></script>':'')+'</body></html>';
@@ -284,13 +284,39 @@ async function madeformedScenarios(browser) {
     assert.equal(JSON.stringify(audit).includes('CONFIDENTIEL'),false);
     checks.push('transfert expiré perd les données sensibles, garde un statut français et ne se libère que par vérification manuelle sans écriture clinique','trace technique sans identité, limitée à 100 éléments et 24 heures');
 
+    const postsBeforeMigration=network.filter(x=>x.method==='POST').length;
+    await page.evaluate(()=>GM_setValue('TM_MADEFORMED_TO_WEDA_JOB_V31',{
+        id:'1791374400000_open',action:'open_patient',source:'madeformed_messages',createdAt:Date.now()-21*60*1000,
+        updatedAt:Date.now()-1000,status:'expired_unknown',resultUnknown:true,sensitiveDataExpiredAt:Date.now()-1000
+    }));
+    await page.reload();
+    await page.waitForFunction(()=>GM_getValue('TM_MADEFORMED_TO_WEDA_JOB_V31',{})?.status==='error_transfer_expired');
+    assert.equal(await page.evaluate(()=>GM_getValue('TM_MADEFORMED_TO_WEDA_JOB_V31',{}).resultUnknown),false);
+    assert.match(await page.locator('#tm-mf-weda-status').innerText(),/vous pouvez ouvrir un dossier/);
+    assert.equal(await page.locator('#tm-mf-weda-review-expired').isVisible(),false);
+    assert.equal(await page.evaluate(()=>window.__fixtureWedaOpens),0);
+    assert.equal(network.filter(x=>x.method==='POST').length,postsBeforeMigration);
+    await page.evaluate(()=>{
+        window.__fixtureBlockedWedaOpen=window.GM_openInTab;
+        window.GM_openInTab=(url,options)=>{window.__fixtureWedaOpens++;window.__fixtureLastOpen={url,options};return {};};
+    });
+    await page.locator('tr[data-id="1201"] .expediteur .name').click();
+    await page.waitForFunction(()=>window.__fixtureWedaOpens===1);
+    const reopened=await page.evaluate(()=>({job:GM_getValue('TM_MADEFORMED_TO_WEDA_JOB_V31',{}),open:window.__fixtureLastOpen}));
+    assert.equal(reopened.job.action,'open_patient');assert.equal(reopened.job.status,'open_search');
+    assert.notEqual(reopened.job.id,'1791374400000_open');assert.equal(reopened.job.patientName,'AUTRE DEMO');
+    assert.equal(new URL(reopened.open.url).searchParams.get('tmJob'),reopened.job.id);
+    assert.equal(network.filter(x=>x.method==='POST').length,postsBeforeMigration);
+    await page.evaluate(()=>{window.GM_openInTab=window.__fixtureBlockedWedaOpen;GM_deleteValue('TM_MADEFORMED_TO_WEDA_JOB_V31');});
+    checks.push('une ouverture seule expirée en V4.3 est libérée au rechargement sans action automatique ; le clic suivant ouvre un nouveau dossier');
+
     if(process.env.MADEFORMED_41_PREVIEW_PATH){
         await page.locator('.tm-mf-call-group-head').waitFor();
         await page.waitForFunction(()=>document.querySelector('tr[data-id="1101"] .tm-mf-native-next')?.textContent==='Prochain RDV : 15/10 à 14:30');
         await page.addStyleTag({content:'.fixture-notice{padding:10px;background:#f3e8ff;color:#581c87;font-weight:bold;border:1px solid #c084fc}.icoformed-calendar-new-line::before{content:"📅"}'});
         await page.locator('main').screenshot({path:process.env.MADEFORMED_41_PREVIEW_PATH});
     }
-    assert.equal(await page.evaluate(()=>window.__fixtureWedaOpens),0);
+    assert.equal(await page.evaluate(()=>window.__fixtureWedaOpens),1);
     await releaseProfiles();await context.close();
 }
 

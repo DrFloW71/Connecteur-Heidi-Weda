@@ -253,6 +253,28 @@ test('trace périmée opaque n’est jamais relancée et n’affiche plus de ban
     assert.equal(h.storage.has('TM_MADEFORMED_TO_WEDA_CLOSE_REQUEST_V31'),false);
 });
 
+test('une ouverture périmée migrée ne relance ni recherche, ni consultation, ni fermeture',async()=>{
+    const h=harness(),link=h.candidate(),initialUrl=h.location.href;
+    h.links([link]);
+    h.setJob({...h.job,action:'open_patient',status:'expired_unknown',resultUnknown:true,
+        createdAt:Date.now()-21*60*1000,sensitiveDataExpiredAt:Date.now()-1000});
+    await h.api.wedaMain();
+    assert.equal(h.getJob().status,'error_transfer_expired');assert.equal(h.getJob().resultUnknown,false);
+    assert.equal(h.getJob().message,undefined);assert.equal(h.location.href,initialUrl);
+    assert.equal(link.clicked,0);assert.equal(h.notices.length,0);
+    assert.equal(h.storage.has('TM_MADEFORMED_TO_WEDA_CLOSE_REQUEST_V31'),false);
+    await assert.rejects(h.api.clickWedaPatient(h.job),{code:'WEDA_PATIENT_GUARD'});
+    assert.equal(link.clicked,0);assert.equal(h.getJob().status,'error_transfer_expired');
+});
+
+test('un ancien onglet ne peut reprendre la nouvelle tâche après migration de son ouverture périmée',async()=>{
+    const h=harness(),link=h.candidate();h.links([link]);h.api.wedaPatientRequire(h.job);
+    h.setJob({...h.job,action:'open_patient',createdAt:Date.now()-21*60*1000});await h.api.wedaMain();
+    h.setJob({...h.job,id:'200_new',status:'open_search'});
+    await assert.rejects(h.api.clickWedaPatient(h.job),{code:'WEDA_PATIENT_GUARD'});
+    assert.equal(link.clicked,0);assert.equal(h.getJob().id,'200_new');assert.equal(h.getJob().status,'open_search');
+});
+
 test('identité de la tâche modifiée après sélection bloque l’écriture malgré le même PatDk',()=>{
     const h=harness(),link=h.candidate();h.links([link]);h.api.wedaPatientRecordSelection(h.job,link,false);
     h.patientPage();const bound=h.api.wedaPatientBind(h.getJob());h.setJob({...bound,dateOfBirth:'03/04/1991'});

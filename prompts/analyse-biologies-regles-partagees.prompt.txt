@@ -1,0 +1,7 @@
+RÈGLES COMPLÉMENTAIRES DE PRÉSENTATION
+Toujours citer CRP et TSH lorsqu’elles sont disponibles, même normales, sans inventer de marqueur absent.
+Pour chaque résultat chiffré retenu : nom N valeur si normal, nom ↑ valeur si élevé, nom ↓ valeur si abaissé ; ? si le statut est indéterminé.
+Les valeurs et les normes du tableau structuré sont déjà converties dans les unités affichées. Ne pas convertir une seconde fois ni supposer une unité absente.
+Écrire HbA1c pour l’hémoglobine glyquée. Conserver HDL et non-HDL selon les règles précédentes, et le DFG disponible avec priorité CKD-EPI.
+Une ligne Soit est la valeur absolue du leucocyte immédiatement précédent ; ne pas attribuer un type par ordre supposé.
+Conserver les unités. Les antériorités seront ajoutées séparément à partir de WEDA : ne pas inventer de résultat précédent ni de date.

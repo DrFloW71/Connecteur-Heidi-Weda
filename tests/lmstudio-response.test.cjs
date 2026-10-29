@@ -98,7 +98,8 @@ test('LM Studio local: prompt complet de biologie et transport du script', {
   const constants = ['LMSTUDIO_API_BASE_URL', 'LMSTUDIO_CHAT_COMPLETIONS_URL', 'LMSTUDIO_REQUEST_TIMEOUT_MS', 'LMSTUDIO_TEMPERATURE', 'LMSTUDIO_MAX_TOKENS', 'BIOLOGY_SIGNAL']
     .map(name => source.match(new RegExp(`  const ${name} = [^\\n]+`))[0]).join('\n');
   const functions = ['requestLmStudioChatCompletion', 'buildLmStudioUserPrompt', 'stripTrailingBiologySignal', 'buildHeidiContextText', 'gmJsonRequest'];
-  const api = vm.runInNewContext(`${constants}\n${source.slice(promptStart, promptEnd)}\n${functions.map(name => functionSource(source, name)).join('\n')}\n({ requestLmStudioChatCompletion, prompt: LMSTUDIO_PROMPT_ACTIVE })`, {
+  const api = vm.runInNewContext(`let activeBiologyRequest = null;\n${constants}\n${source.slice(promptStart, promptEnd)}\n${functions.map(name => functionSource(source, name)).join('\n')}\n({ requestLmStudioChatCompletion, prompt: LMSTUDIO_PROMPT_ACTIVE })`, {
+    biologyEnhancements: require("../scripts/lib/biologie-weda").createWedaBiologyEnhancements(),
     isAnapathJob: () => false,
     escapeRegExp: text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
     appendDebugLog: () => {},
